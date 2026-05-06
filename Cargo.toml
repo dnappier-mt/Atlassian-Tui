@@ -1,0 +1,30 @@
+[workspace]
+members = ["crates/jui-core", "crates/jui-daemon", "crates/jui-tui"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["dougnappier"]
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+toml = "0.8"
+directories = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+ratatui = "0.29"
+crossterm = "0.28"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+notify-rust = "4"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures = "0.3"
+bytes = "1"
+pulldown-cmark = { version = "0.13", default-features = false }
