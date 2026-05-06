@@ -1,0 +1,188 @@
+use crate::jira_api::{MyselfInfo, TransitionOption, UserInfo};
+use crate::scm::RepoEntry;
+use crate::ticket::{Comment, Ticket};
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
+
+/// Length-prefixed JSON: 4-byte big-endian length, then JSON body.
+const MAX_FRAME: u32 = 4 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Request {
+    Ping,
+    ListTickets { jql: Option<String>, limit: u32 },
+    GetTicket { key: String },
+    Refresh { jql: Option<String> },
+    StartWork { key: String, cwd: PathBuf },
+    AddComment { key: String, body: String },
+    ListComments { key: String },
+    DeleteComment { key: String, comment_id: String },
+    Myself,
+    ListProjects,
+    AddProject { path: PathBuf, nickname: Option<String> },
+    RemoveProject { path: PathBuf },
+    /// Recursively scan `root` for git/svn repos. Limited depth.
+    ScanRepos { root: PathBuf, max_depth: u32 },
+    /// Local-only ticket↔project link. Stored in SQLite, never sent to Jira.
+    LinkProject { ticket_key: String, project_path: PathBuf },
+    UnlinkProject { ticket_key: String, project_path: PathBuf },
+    /// Returns every configured project plus a `linked` flag for this ticket.
+    ListTicketProjects { ticket_key: String },
+    /// Promote a 'suggested' link to 'confirmed'.
+    ConfirmSuggestion { ticket_key: String, project_path: PathBuf },
+    /// Mark as 'rejected' so we never re-suggest it.
+    RejectSuggestion { ticket_key: String, project_path: PathBuf },
+    /// Manually trigger the suggestion worker for a ticket (mostly for testing).
+    SuggestProject { ticket_key: String },
+    /// Returns the cached implementation suggestion for a ticket, if any.
+    GetImplementation { ticket_key: String },
+    /// Force regeneration of the implementation suggestion.
+    GenerateImplementation { ticket_key: String },
+    GetClaudeSession { ticket_key: String },
+    SaveClaudeSession { ticket_key: String, session_id: String },
+    Transition { key: String, to: String },
+    ListTransitions { key: String },
+    CreateTicket {
+        project: String,
+        issue_type: String,
+        summary: String,
+        body: Option<String>,
+        /// When Some, jira-cli is invoked with `-P <parent>` so the new issue is created
+        /// as a child (typically a sub-task or a story under an epic).
+        #[serde(default)]
+        parent: Option<String>,
+    },
+    EditSummary { key: String, summary: String },
+    EditPriority { key: String, priority: String },
+    ListPriorities,
+    SetEstimate { key: String, original: Option<String>, remaining: Option<String> },
+    LogWork { key: String, time_spent: String, comment: Option<String>, new_estimate: Option<String> },
+    PendingNotifications,
+    Status,
+    Shutdown,
+    SearchUsers { query: String },
+    SaveTeam { name: String, members: Vec<String> },
+    ListTeams,
+    DeleteTeam { name: String },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum Response {
+    Pong,
+    Tickets { items: Vec<Ticket> },
+    Ticket { ticket: Ticket },
+    StartWork { reply: StartWorkReply },
+    Created { key: String },
+    Notifications { items: Vec<NotificationItem> },
+    Status { status: DaemonStatus },
+    Transitions { items: Vec<TransitionOption> },
+    Comments { items: Vec<Comment> },
+    Priorities { items: Vec<String> },
+    Implementation { markdown: String, project_paths: Vec<String>, updated_at: String },
+    /// Sent immediately when a generation request was queued; the markdown shows up on
+    /// a subsequent GetImplementation call.
+    Queued,
+    ClaudeSession { session_id: Option<String> },
+    Myself { info: MyselfInfo },
+    Projects { items: Vec<ProjectStatus> },
+    Repos { items: Vec<RepoEntry> },
+    /// Each entry's `linked` field tells whether it's currently tied to the ticket.
+    TicketProjects { items: Vec<TicketProjectEntry> },
+    Ok,
+    Err { message: String },
+    /// `from_cache` = true means results came from ticket assignees (users table empty).
+    Users { items: Vec<UserInfo>, from_cache: bool },
+    Teams { items: Vec<TeamEntry> },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TeamEntry {
+    pub name: String,
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum StartWorkReply {
+    GitSwitched { branch: String, created: bool },
+    SvnExport { value: String },
+    NoScm,
+    StagedChanges,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationItem {
+    pub kind: String,
+    pub ticket_key: String,
+    pub message: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectStatus {
+    pub path: PathBuf,
+    pub nickname: Option<String>,
+    pub available: bool,
+    /// "git", "svn", or "missing".
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TicketProjectEntry {
+    pub project: ProjectStatus,
+    /// Whether the project is linked at all (state != "rejected").
+    pub linked: bool,
+    /// "confirmed" | "suggested" | "none" (none = not linked / never suggested).
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonStatus {
+    pub pid: u32,
+    pub started_at: String,
+    pub last_poll_at: Option<String>,
+    pub cached_tickets: usize,
+}
+
+pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) -> Result<()> {
+    let len = payload.len();
+    if len as u32 > MAX_FRAME {
+        return Err(anyhow!("frame too large ({len} bytes)"));
+    }
+    w.write_all(&(len as u32).to_be_bytes()).await?;
+    w.write_all(payload).await?;
+    w.flush().await?;
+    Ok(())
+}
+
+pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>> {
+    let mut len_buf = [0u8; 4];
+    r.read_exact(&mut len_buf).await.context("reading frame length")?;
+    let len = u32::from_be_bytes(len_buf);
+    if len > MAX_FRAME {
+        return Err(anyhow!("frame too large ({len} bytes)"));
+    }
+    let mut buf = vec![0u8; len as usize];
+    r.read_exact(&mut buf).await.context("reading frame body")?;
+    Ok(buf)
+}
+
+pub async fn send_request(stream: &mut UnixStream, req: &Request) -> Result<Response> {
+    let raw = serde_json::to_vec(req)?;
+    write_frame(stream, &raw).await?;
+    let resp_raw = read_frame(stream).await?;
+    let resp: Response = serde_json::from_slice(&resp_raw)?;
+    Ok(resp)
+}
+
+pub async fn connect() -> Result<UnixStream> {
+    let path = crate::paths::socket_path()?;
+    UnixStream::connect(&path)
+        .await
+        .with_context(|| format!("connecting to daemon at {}", path.display()))
+}
