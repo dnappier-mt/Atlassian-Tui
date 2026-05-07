@@ -53,6 +53,10 @@ impl ConfluenceApi {
             .context("CONFLUENCE_API_TOKEN or JIRA_API_TOKEN not set")
     }
 
+    pub fn api_token() -> Result<String> {
+        Self::token()
+    }
+
     pub async fn list_spaces(&self) -> Result<Vec<ConfluenceSpace>> {
         let token = Self::token()?;
         let url = format!("{}/wiki/rest/api/space?limit=50&type=global", self.server);
@@ -162,6 +166,33 @@ impl ConfluenceApi {
             .collect())
     }
 
+    /// Search pages using CQL, scoped to a space and optionally an ancestor page.
+    pub async fn search_pages(
+        &self,
+        space_key: &str,
+        ancestor_id: Option<&str>,
+        query: &str,
+    ) -> Result<Vec<ConfluencePage>> {
+        let token = Self::token()?;
+        let cql = if let Some(ancestor) = ancestor_id {
+            format!(
+                r#"type=page AND space="{}" AND ancestor="{}" AND title~"{}""#,
+                space_key, ancestor, query
+            )
+        } else {
+            format!(
+                r#"type=page AND space="{}" AND title~"{}""#,
+                space_key, query
+            )
+        };
+        let url = format!(
+            "{}/wiki/rest/api/content/search?cql={}&limit=30&expand=children.page",
+            self.server,
+            urlenccode(&cql),
+        );
+        self.fetch_pages(&url, &token).await
+    }
+
     /// Returns (title, html_body).
     pub async fn get_page_html(&self, page_id: &str) -> Result<(String, String)> {
         let token = Self::token()?;
@@ -204,6 +235,18 @@ impl ConfluenceApi {
             .to_string();
         Ok((title, html))
     }
+}
+
+fn urlenccode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() * 2);
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9'
+            | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
 }
 
 fn unquote(s: &str) -> String {

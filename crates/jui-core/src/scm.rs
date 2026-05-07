@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -31,8 +31,17 @@ pub fn detect(start: &Path) -> ScmRepo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StartWorkOutcome {
-    /// Switched to (or created) the branch.
-    GitSwitched { branch: String, created: bool },
+    /// Worktree ready. `branch` is the branch checked out in `path`.
+    /// `created_branch` is true when no existing branch matched the ticket key
+    /// and a new one was created from HEAD.
+    /// `attached_existing_worktree` is true when the worktree path already existed
+    /// before the request (we did not run `git worktree add`).
+    GitWorktree {
+        branch: String,
+        path: PathBuf,
+        created_branch: bool,
+        attached_existing_worktree: bool,
+    },
     /// Caller is in an SVN repo. Shell needs to export the env var.
     SvnExport { value: String },
     /// No SCM detected — caller can record the association anyway.
@@ -41,57 +50,122 @@ pub enum StartWorkOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartWorkError {
-    #[error("git has staged changes; commit or stash them before starting work")]
-    StagedChanges,
     #[error("git command failed: {0}")]
     Git(String),
 }
 
-pub fn start_work(repo: &ScmRepo, slug: &str) -> Result<StartWorkOutcome> {
+pub fn start_work(repo: &ScmRepo, key: &str, slug: &str) -> Result<StartWorkOutcome> {
     match repo.kind {
-        ScmKind::Git => git_start_work(&repo.root, slug),
+        ScmKind::Git => git_start_work(&repo.root, key, slug),
         ScmKind::Svn => Ok(StartWorkOutcome::SvnExport { value: slug.to_string() }),
         ScmKind::None => Ok(StartWorkOutcome::NoScm),
     }
 }
 
-fn git_start_work(root: &Path, slug: &str) -> Result<StartWorkOutcome> {
-    if has_staged_changes(root)? {
-        return Err(StartWorkError::StagedChanges.into());
+/// Worktree-based start-work:
+///   1. Search local branches for one whose name contains the (lowercased) ticket key.
+///   2. If a branch is found, attach a worktree to it; otherwise create a new branch
+///      named `slug` from HEAD and attach a worktree to it.
+///   3. Worktree path is `<repo>/../<repo-name>-worktrees/<slug>`.
+fn git_start_work(root: &Path, key: &str, slug: &str) -> Result<StartWorkOutcome> {
+    let repo_name = root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo")
+        .to_string();
+    let parent = root.parent().unwrap_or(root);
+    let worktrees_root = parent.join(format!("{}-worktrees", repo_name));
+    let path = worktrees_root.join(slug);
+
+    // If the target path already exists, leave it alone — assume previous run.
+    if path.exists() {
+        let branch = current_git_branch(&path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| slug.to_string());
+        return Ok(StartWorkOutcome::GitWorktree {
+            branch,
+            path,
+            created_branch: false,
+            attached_existing_worktree: true,
+        });
     }
-    let exists = git_branch_exists(root, slug)?;
-    let args: Vec<&str> =
-        if exists { vec!["switch", slug] } else { vec!["switch", "-c", slug] };
-    let out = Command::new("git").current_dir(root).args(&args).output().context("running git switch")?;
+
+    std::fs::create_dir_all(&worktrees_root)
+        .with_context(|| format!("creating {}", worktrees_root.display()))?;
+
+    let existing_branch = find_branch_for_key(root, key)?;
+    let (branch, created) = match existing_branch {
+        Some(b) => (b, false),
+        None => (slug.to_string(), true),
+    };
+
+    let mut args: Vec<String> = vec!["worktree".into(), "add".into()];
+    if created {
+        args.push("-b".into());
+        args.push(branch.clone());
+    }
+    args.push(path.to_string_lossy().into_owned());
+    if !created {
+        args.push(branch.clone());
+    }
+
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(args.iter().map(|s| s.as_str()))
+        .output()
+        .context("running git worktree add")?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         return Err(StartWorkError::Git(err).into());
     }
-    Ok(StartWorkOutcome::GitSwitched { branch: slug.to_string(), created: !exists })
+    Ok(StartWorkOutcome::GitWorktree {
+        branch,
+        path,
+        created_branch: created,
+        attached_existing_worktree: false,
+    })
 }
 
-fn has_staged_changes(root: &Path) -> Result<bool> {
+/// Search local branches for one whose name contains the (lowercased) ticket key.
+/// Returns the first match. Branch comparison is case-insensitive.
+pub fn find_branch_for_key(root: &Path, key: &str) -> Result<Option<String>> {
     let out = Command::new("git")
         .current_dir(root)
-        .args(["diff", "--cached", "--name-only"])
+        .args(["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
         .output()
-        .context("running git diff --cached")?;
+        .context("running git for-each-ref")?;
     if !out.status.success() {
-        return Err(anyhow!(
-            "git diff --cached failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
+        return Ok(None);
     }
-    Ok(!out.stdout.is_empty())
+    let needle = key.to_ascii_lowercase();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if line.to_ascii_lowercase().contains(&needle) {
+            return Ok(Some(line.to_string()));
+        }
+    }
+    Ok(None)
 }
 
-fn git_branch_exists(root: &Path, branch: &str) -> Result<bool> {
+/// Remove a worktree at `path`. Equivalent to `git worktree remove <path>`.
+/// `force` adds `--force` (needed if working tree has untracked / dirty files).
+pub fn git_worktree_remove(root: &Path, path: &Path, force: bool) -> Result<()> {
+    let mut args: Vec<&str> = vec!["worktree", "remove"];
+    if force {
+        args.push("--force");
+    }
+    let path_str = path.to_string_lossy();
+    args.push(&path_str);
     let out = Command::new("git")
         .current_dir(root)
-        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])
+        .args(&args)
         .output()
-        .context("running git rev-parse")?;
-    Ok(out.status.success())
+        .context("running git worktree remove")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(StartWorkError::Git(err).into());
+    }
+    Ok(())
 }
 
 pub fn current_git_branch(root: &Path) -> Result<Option<String>> {

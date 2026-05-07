@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use jui_core::cache::Cache;
+use jui_core::confluence_api::ConfluenceApi;
 use jui_core::config::GlobalConfig;
 use jui_core::ipc::{
     read_frame, write_frame, DaemonStatus, NotificationItem, ProjectStatus, Request, Response,
@@ -126,6 +127,15 @@ async fn main() -> Result<()> {
                     Err(e) => warn!("fetching users failed (non-fatal): {e:#}"),
                 }
             }
+        });
+    }
+
+    // Confluence cache warmup — runs after a short delay to not block startup.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            warm_confluence_cache(&state).await;
         });
     }
 
@@ -296,23 +306,23 @@ async fn dispatch(
             };
             let slug = ticket.branch_slug();
             let repo = scm::detect(&cwd);
-            match scm::start_work(&repo, &slug) {
-                Ok(scm::StartWorkOutcome::GitSwitched { branch, created }) => {
-                    Ok(Response::StartWork { reply: StartWorkReply::GitSwitched { branch, created } })
-                }
-                Ok(scm::StartWorkOutcome::SvnExport { value }) => {
-                    Ok(Response::StartWork { reply: StartWorkReply::SvnExport { value } })
-                }
-                Ok(scm::StartWorkOutcome::NoScm) => {
-                    Ok(Response::StartWork { reply: StartWorkReply::NoScm })
-                }
-                Err(e) => match e.downcast_ref::<scm::StartWorkError>() {
-                    Some(scm::StartWorkError::StagedChanges) => {
-                        Ok(Response::StartWork { reply: StartWorkReply::StagedChanges })
-                    }
-                    _ => Err(e),
+            let outcome = scm::start_work(&repo, &key, &slug)?;
+            let reply = match outcome {
+                scm::StartWorkOutcome::GitWorktree {
+                    branch,
+                    path,
+                    created_branch,
+                    attached_existing_worktree,
+                } => StartWorkReply::GitWorktree {
+                    branch,
+                    path,
+                    created_branch,
+                    attached_existing_worktree,
                 },
-            }
+                scm::StartWorkOutcome::SvnExport { value } => StartWorkReply::SvnExport { value },
+                scm::StartWorkOutcome::NoScm => StartWorkReply::NoScm,
+            };
+            Ok(Response::StartWork { reply })
         }
 
         Request::AddComment { key, body } => {
@@ -595,6 +605,98 @@ async fn dispatch(
             state.cache.lock().await.delete_team(&name)?;
             Ok(Response::Ok)
         }
+
+        Request::ConfluenceListSpaces => {
+            const STALE_SECS: u64 = 900; // 15 minutes
+            let cached = state.cache.lock().await.get_confluence_spaces()?;
+            let age = state.cache.lock().await.confluence_spaces_age_secs()?;
+
+            if cached.is_empty() {
+                // Cache cold — must fetch now (user waits once).
+                let api = ConfluenceApi::from_jira_config()?;
+                let spaces = api.list_spaces().await?;
+                state.cache.lock().await.upsert_confluence_spaces(&spaces)?;
+                return Ok(Response::ConfluenceSpaces { items: spaces, from_cache: false });
+            }
+
+            // Serve cache immediately; refresh in background if stale.
+            if age.map(|a| a > STALE_SECS).unwrap_or(true) {
+                let state2 = state.clone();
+                tokio::spawn(async move {
+                    if let Ok(api) = ConfluenceApi::from_jira_config() {
+                        if let Ok(spaces) = api.list_spaces().await {
+                            let _ = state2.cache.lock().await.upsert_confluence_spaces(&spaces);
+                        }
+                    }
+                });
+            }
+            Ok(Response::ConfluenceSpaces { items: cached, from_cache: true })
+        }
+
+        Request::ConfluenceListPages { space_key, parent_id } => {
+            const STALE_SECS: u64 = 900;
+            let pid = parent_id.as_deref();
+            let cached = state.cache.lock().await.get_confluence_pages(&space_key, pid)?;
+            let age = state.cache.lock().await.confluence_pages_age_secs(&space_key, pid)?;
+
+            if cached.is_empty() {
+                let api = ConfluenceApi::from_jira_config()?;
+                let pages = match pid {
+                    Some(id) => api.get_children(id).await?,
+                    None => api.list_pages(&space_key).await?,
+                };
+                state.cache.lock().await.upsert_confluence_pages(&space_key, pid, &pages)?;
+                return Ok(Response::ConfluencePages { items: pages, from_cache: false });
+            }
+
+            if age.map(|a| a > STALE_SECS).unwrap_or(true) {
+                let state2 = state.clone();
+                let sk = space_key.clone();
+                let pi = parent_id.clone();
+                tokio::spawn(async move {
+                    if let Ok(api) = ConfluenceApi::from_jira_config() {
+                        let pid2 = pi.as_deref();
+                        let result = match pid2 {
+                            Some(id) => api.get_children(id).await,
+                            None => api.list_pages(&sk).await,
+                        };
+                        if let Ok(pages) = result {
+                            let _ = state2.cache.lock().await.upsert_confluence_pages(&sk, pid2, &pages);
+                        }
+                    }
+                });
+            }
+            Ok(Response::ConfluencePages { items: cached, from_cache: true })
+        }
+    }
+}
+
+async fn warm_confluence_cache(state: &State) {
+    let api = match ConfluenceApi::from_jira_config() {
+        Ok(a) => a,
+        Err(e) => { warn!("confluence config missing, skipping warmup: {e:#}"); return; }
+    };
+    let spaces = match api.list_spaces().await {
+        Ok(s) => s,
+        Err(e) => { warn!("confluence spaces warmup failed: {e:#}"); return; }
+    };
+    if let Err(e) = state.cache.lock().await.upsert_confluence_spaces(&spaces) {
+        warn!("storing confluence spaces: {e:#}");
+        return;
+    }
+    info!(count = spaces.len(), "confluence spaces cached");
+    for space in &spaces {
+        match api.list_pages(&space.key).await {
+            Ok(pages) => {
+                if let Err(e) = state.cache.lock().await.upsert_confluence_pages(&space.key, None, &pages) {
+                    warn!(space = %space.key, "storing confluence pages: {e:#}");
+                } else {
+                    info!(space = %space.key, count = pages.len(), "confluence root pages cached");
+                }
+            }
+            Err(e) => warn!(space = %space.key, "confluence pages warmup failed: {e:#}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 

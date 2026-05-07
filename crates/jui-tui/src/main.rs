@@ -156,8 +156,11 @@ async fn cmd_start(key: String) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let mut s = ensure_daemon().await?;
     match ipc::send_request(&mut s, &Request::StartWork { key, cwd }).await? {
-        Response::StartWork { reply: StartWorkReply::GitSwitched { branch, created } } => {
-            println!("{} branch {branch}", if created { "created" } else { "switched to" });
+        Response::StartWork { reply: StartWorkReply::GitWorktree { branch, path, created_branch, attached_existing_worktree } } => {
+            let action = if attached_existing_worktree { "reusing existing worktree" }
+                else if created_branch { "created new branch + worktree" }
+                else { "attached worktree to existing branch" };
+            println!("{action}\n  branch: {branch}\n  path:   {}", path.display());
             Ok(())
         }
         Response::StartWork { reply: StartWorkReply::SvnExport { value } } => {
@@ -165,9 +168,6 @@ async fn cmd_start(key: String) -> Result<()> {
             Ok(())
         }
         Response::StartWork { reply: StartWorkReply::NoScm } => { println!("no SCM detected"); Ok(()) }
-        Response::StartWork { reply: StartWorkReply::StagedChanges } => {
-            Err(anyhow::anyhow!("git has staged changes; commit or stash first"))
-        }
         Response::Err { message } => Err(anyhow::anyhow!(message)),
         other => Err(anyhow::anyhow!("unexpected: {other:?}")),
     }
@@ -178,12 +178,11 @@ async fn cmd_start_machine(key: String) -> Result<()> {
     let mut s = ensure_daemon().await?;
     let resp = ipc::send_request(&mut s, &Request::StartWork { key, cwd }).await?;
     match resp {
-        Response::StartWork { reply: StartWorkReply::GitSwitched { branch, .. } } => {
-            println!("git {branch}");
+        Response::StartWork { reply: StartWorkReply::GitWorktree { path, .. } } => {
+            println!("worktree {}", path.display());
         }
         Response::StartWork { reply: StartWorkReply::SvnExport { value } } => println!("svn {value}"),
         Response::StartWork { reply: StartWorkReply::NoScm } => println!("none"),
-        Response::StartWork { reply: StartWorkReply::StagedChanges } => println!("staged"),
         Response::Err { message } => println!("error {message}"),
         other => println!("error unexpected:{other:?}"),
     }

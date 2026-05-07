@@ -22,3 +22,5 @@ ratatui.workspace = true
 crossterm.workspace = true
 chrono.workspace = true
 pulldown-cmark.workspace = true
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+ratatui-image = "8.1"

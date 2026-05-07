@@ -1,4 +1,4 @@
-use crate::app::{App, DetailFocus, DetailLinkedProject, Mode, PendingDelete};
+use crate::app::{App, DetailFocus, DetailLinkedProject, Mode, PageLine, PendingDelete, TreeForm, TreeNode};
 use jui_core::ticket::{fmt_date, fmt_seconds, parse_reply, priority_rank, Comment};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -7,7 +7,7 @@ use ratatui::layout::Alignment;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
-pub fn draw(f: &mut Frame, app: &App) {
+pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(2)])
@@ -36,8 +36,15 @@ pub fn draw(f: &mut Frame, app: &App) {
         Mode::TicketProjects(_) => draw_ticket_projects(f, chunks[1], app),
         Mode::ConfluenceSpaces(_) => draw_confluence_spaces(f, chunks[1], app),
         Mode::ConfluencePages(_) => draw_confluence_pages(f, chunks[1], app),
+        Mode::PageView(_) => {
+            let area = f.area();
+            draw_page_view(f, area, app);
+        }
+        Mode::Tree(_) => draw_tree(f, chunks[1], app),
     }
-    draw_footer(f, chunks[2], app);
+    if !matches!(&app.mode, Mode::PageView(_)) {
+        draw_footer(f, chunks[2], app);
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -58,7 +65,12 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Mode::Projects(_) => "projects",
         Mode::ProjectsAdd(_) => "projects/add",
         Mode::TicketProjects(_) => "ticket projects",
+        Mode::PageView(form) => {
+            conf_pages_label = format!("confluence / {}", form.title);
+            &conf_pages_label
+        }
         Mode::ConfluenceSpaces(_) => "confluence",
+        Mode::Tree(_) => "tree",
         Mode::ConfluencePages(form) => {
             conf_pages_label = if form.breadcrumb.is_empty() {
                 format!("confluence / {}", form.space_name)
@@ -1814,11 +1826,31 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ("r", "reload"),
             ("esc/q", "back"),
         ],
-        Mode::ConfluencePages(_) => vec![
+        Mode::ConfluencePages(form) => if form.search_active {
+            vec![
+                ("type", "filter"),
+                ("enter", "search"),
+                ("j/k", "move results"),
+                ("esc", "cancel"),
+            ]
+        } else {
+            vec![
+                ("j/k", "move"),
+                ("/", "search"),
+                ("enter", "view page"),
+                ("l/→", "drill into children"),
+                ("h/←/esc", "back"),
+            ]
+        },
+        Mode::PageView(_) => vec![],  // PageView draws its own footer
+        Mode::Tree(_) => vec![
             ("j/k", "move"),
-            ("enter", "open in $EDITOR"),
-            ("l/→", "drill into children"),
-            ("h/←/esc", "back"),
+            ("o/Tab", "toggle"),
+            ("O/C", "expand/collapse all"),
+            ("c", "create child"),
+            ("v", "two-col"),
+            ("Enter", "detail"),
+            ("q", "back"),
         ],
     };
     let p = Paragraph::new(render_hints(&hints));
@@ -2003,12 +2035,84 @@ fn draw_confluence_pages(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(p, inner);
         return;
     }
+
+    if form.search_active {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(2), Constraint::Min(1)])
+            .split(inner);
+
+        // Search bar.
+        let search_line = Line::from(vec![
+            Span::styled("/", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!(" {}▏", form.search_query),
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  (enter to search, esc to cancel)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        f.render_widget(Paragraph::new(search_line), chunks[0]);
+
+        // Results area.
+        if form.search_loading {
+            f.render_widget(
+                Paragraph::new("searching…").style(Style::default().fg(Color::DarkGray)),
+                chunks[1],
+            );
+        } else if let Some(err) = &form.search_error {
+            f.render_widget(
+                Paragraph::new(format!("error: {err}")).style(Style::default().fg(Color::Red)),
+                chunks[1],
+            );
+        } else if form.search_results.is_empty() && !form.search_query.is_empty() {
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "no results — press enter to search",
+                    Style::default().fg(Color::DarkGray),
+                )),
+                chunks[1],
+            );
+        } else {
+            let items: Vec<ListItem> = form
+                .search_results
+                .iter()
+                .map(|p| {
+                    let marker = if p.has_children {
+                        Span::styled(" ▸", Style::default().fg(Color::DarkGray))
+                    } else {
+                        Span::raw("  ")
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(" "),
+                        Span::raw(p.title.clone()),
+                        marker,
+                    ]))
+                })
+                .collect();
+            let sel = if items.is_empty() {
+                None
+            } else {
+                Some(form.search_selected.min(items.len() - 1))
+            };
+            let mut state = ListState::default();
+            state.select(sel);
+            let list = List::new(items)
+                .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                .highlight_symbol("▶ ");
+            f.render_stateful_widget(list, chunks[1], &mut state);
+        }
+        return;
+    }
+
+    // Normal page list.
     if form.pages.is_empty() {
-        let p = Paragraph::new(Span::styled(
-            "no pages",
-            Style::default().fg(Color::DarkGray),
-        ));
-        f.render_widget(p, inner);
+        f.render_widget(
+            Paragraph::new(Span::styled("no pages", Style::default().fg(Color::DarkGray))),
+            inner,
+        );
         return;
     }
     let items: Vec<ListItem> = form
@@ -2033,4 +2137,330 @@ fn draw_confluence_pages(f: &mut Frame, area: Rect, app: &App) {
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
+}
+
+fn draw_page_view(f: &mut Frame, area: Rect, app: &mut App) {
+    use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
+    use ratatui_image::StatefulImage;
+    let Mode::PageView(form) = &mut app.mode else { return };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(area);
+
+    // Header
+    let hdr = Paragraph::new(Line::from(vec![
+        Span::styled(" ", Style::default()),
+        Span::styled(form.title.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            format!("  [{}/{}]", form.scroll + 1, form.lines.len().max(1)),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    f.render_widget(hdr, chunks[0]);
+
+    // Content
+    let content_area = chunks[1];
+    let viewport_h = content_area.height as usize;
+    let max_scroll = form.lines.len().saturating_sub(viewport_h);
+    let scroll = form.scroll.min(max_scroll);
+    let end = (scroll + viewport_h).min(form.lines.len());
+
+    let visible_count = end - scroll;
+    let visible: Vec<(usize, PageLine)> = (scroll..end)
+        .map(|i| (i, match &form.lines[i] {
+            PageLine::Spans(s) => PageLine::Spans(s.clone()),
+            PageLine::Blank => PageLine::Blank,
+            PageLine::Image { id, row, height } => PageLine::Image { id: *id, row: *row, height: *height },
+        }))
+        .collect();
+
+    for row_idx in 0..visible_count {
+        let (global_idx, line) = &visible[row_idx];
+        let y = content_area.y + row_idx as u16;
+        if y >= content_area.y + content_area.height { break; }
+        let line_area = Rect::new(content_area.x, y, content_area.width.saturating_sub(1), 1);
+        let is_cursor = form.search_matches.get(form.search_cursor) == Some(global_idx);
+        let is_match = !is_cursor && form.search_matches.binary_search(global_idx).is_ok();
+
+        match line {
+            PageLine::Spans(spans) => {
+                let styled: Vec<Span<'static>> = if is_cursor {
+                    spans.iter().map(|s| Span::styled(s.content.clone(), s.style.bg(Color::Rgb(80, 60, 0)))).collect()
+                } else if is_match {
+                    spans.iter().map(|s| Span::styled(s.content.clone(), s.style.bg(Color::Rgb(40, 40, 40)))).collect()
+                } else {
+                    spans.clone()
+                };
+                f.render_widget(Paragraph::new(Line::from(styled)), line_area);
+            }
+            PageLine::Image { id, row, height } if *row == 0 => {
+                let img_height = (*height).min(content_area.height.saturating_sub(row_idx as u16));
+                if img_height > 0 {
+                    let img_area = Rect::new(
+                        content_area.x,
+                        y,
+                        content_area.width.saturating_sub(1),
+                        img_height,
+                    );
+                    if let Some(pi) = form.images.get_mut(*id) {
+                        f.render_stateful_widget(StatefulImage::default(), img_area, &mut pi.proto);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Scrollbar
+    if form.lines.len() > viewport_h {
+        let sb_area = Rect::new(
+            content_area.x + content_area.width.saturating_sub(1),
+            content_area.y, 1, content_area.height,
+        );
+        let mut sb_state = ScrollbarState::new(max_scroll).position(scroll);
+        f.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None),
+            sb_area, &mut sb_state,
+        );
+    }
+
+    // Footer
+    let footer_area = chunks[2];
+    let block = Block::default().borders(Borders::TOP);
+    let inner = block.inner(footer_area);
+    f.render_widget(block, footer_area);
+
+    if form.search_active {
+        let match_info = if form.search_matches.is_empty() {
+            if form.search_query.is_empty() { String::new() } else { "no matches".to_string() }
+        } else {
+            format!("{}/{}", form.search_cursor + 1, form.search_matches.len())
+        };
+        let search_line = Line::from(vec![
+            Span::styled("/ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(form.search_query.clone(), Style::default()),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                if match_info.is_empty() { String::new() } else { format!("  {}", match_info) },
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        let hint_line = Line::from(vec![
+            Span::styled("n/N", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" next/prev  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Esc", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" close", Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(vec![search_line, hint_line]), inner);
+    } else {
+        let pct = if form.lines.is_empty() { 100 } else { (scroll * 100 / form.lines.len()).min(100) };
+        let hints = Line::from(vec![
+            Span::styled("j/k", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("d/u", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" ½pg  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("/", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" search  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("e", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" edit  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("S", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" sync  ", Style::default().fg(Color::DarkGray)),
+            Span::styled("q", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" back  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(format!("{}%", pct), Style::default().fg(Color::DarkGray)),
+        ]);
+        f.render_widget(Paragraph::new(hints), inner);
+    }
+}
+
+fn type_color(issue_type: Option<&str>) -> Color {
+    match issue_type.unwrap_or("") {
+        t if t.eq_ignore_ascii_case("epic") => Color::Magenta,
+        t if t.eq_ignore_ascii_case("story") => Color::Green,
+        t if t.eq_ignore_ascii_case("task") => Color::Blue,
+        t if t.eq_ignore_ascii_case("bug") => Color::Red,
+        t if t.eq_ignore_ascii_case("sub-task") || t.eq_ignore_ascii_case("subtask") => Color::DarkGray,
+        _ => Color::White,
+    }
+}
+
+fn type_glyph(issue_type: Option<&str>) -> &'static str {
+    match issue_type.unwrap_or("") {
+        t if t.eq_ignore_ascii_case("epic") => "◆",
+        t if t.eq_ignore_ascii_case("story") => "●",
+        t if t.eq_ignore_ascii_case("task") => "■",
+        t if t.eq_ignore_ascii_case("bug") => "▲",
+        t if t.eq_ignore_ascii_case("sub-task") | t.eq_ignore_ascii_case("subtask") => "·",
+        _ => "○",
+    }
+}
+
+fn tree_node_line(node: &TreeNode, selected: bool) -> Line<'static> {
+    let indent = "  ".repeat(node.depth as usize);
+    let arrow = if !node.children.is_empty() {
+        if node.expanded { "▼ " } else { "▶ " }
+    } else {
+        "  "
+    };
+    let glyph = type_glyph(node.issue_type.as_deref());
+    let key_style = Style::default()
+        .fg(type_color(node.issue_type.as_deref()))
+        .add_modifier(Modifier::BOLD);
+    let summary_style = if node.is_mine {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+    };
+    let bg = if selected {
+        Style::default().bg(Color::Rgb(60, 60, 80))
+    } else {
+        Style::default()
+    };
+    let summary = if node.summary.is_empty() { "—".to_string() } else { node.summary.clone() };
+    Line::from(vec![
+        Span::styled(format!("{indent}{arrow}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{glyph} "), Style::default().fg(type_color(node.issue_type.as_deref()))),
+        Span::styled(node.key.clone(), key_style),
+        Span::styled("  ", Style::default()),
+        Span::styled(summary, summary_style),
+        Span::styled(format!("  [{}]", node.status), Style::default().fg(Color::DarkGray)),
+    ])
+    .style(bg)
+}
+
+fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::Tree(form) = &app.mode else { return };
+    if form.two_column {
+        draw_tree_two_column(f, area, form);
+    } else {
+        draw_tree_single(f, area, form);
+    }
+}
+
+fn draw_tree_single(f: &mut Frame, area: Rect, form: &TreeForm) {
+    let inner = Block::default()
+        .borders(Borders::ALL)
+        .title(" tickets — tree (T) ")
+        .inner(area);
+    f.render_widget(
+        Block::default().borders(Borders::ALL).title(" tickets — tree (T) "),
+        area,
+    );
+    if form.visible.is_empty() {
+        f.render_widget(
+            Paragraph::new("no tickets").style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    }
+    let viewport_h = inner.height as usize;
+    let scroll = form.selected.saturating_sub(viewport_h.saturating_sub(1) / 2);
+    let scroll = scroll.min(form.visible.len().saturating_sub(viewport_h).max(0));
+    let end = (scroll + viewport_h).min(form.visible.len());
+    let lines: Vec<Line> = (scroll..end)
+        .map(|i| {
+            let node_idx = form.visible[i];
+            tree_node_line(&form.nodes[node_idx], i == form.selected)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_tree_two_column(f: &mut Frame, area: Rect, form: &TreeForm) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(35), Constraint::Min(0)])
+        .split(area);
+
+    // Left: roots only.
+    let left_block = Block::default().borders(Borders::ALL).title(" roots ");
+    let left_inner = left_block.inner(chunks[0]);
+    f.render_widget(left_block, chunks[0]);
+
+    // Find which root contains the current selection.
+    let mut selected_root_idx: usize = 0;
+    if let Some(&sel_node) = form.visible.get(form.selected) {
+        let mut cur = sel_node;
+        loop {
+            if let Some(pos) = form.roots.iter().position(|&r| r == cur) {
+                selected_root_idx = pos;
+                break;
+            }
+            // Walk up via parent_key (could refactor by storing parent index, but cheap).
+            let parent_key = form.nodes[cur].parent_key.clone();
+            let Some(pk) = parent_key else { break };
+            let Some(p_idx) = form.nodes.iter().position(|n| n.key == pk) else { break };
+            cur = p_idx;
+        }
+    }
+    let root_lines: Vec<Line> = form
+        .roots
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| {
+            let n = &form.nodes[r];
+            let style = if i == selected_root_idx {
+                Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(format!("{} ", type_glyph(n.issue_type.as_deref())),
+                    Style::default().fg(type_color(n.issue_type.as_deref()))),
+                Span::styled(n.key.clone(), Style::default().fg(type_color(n.issue_type.as_deref())).add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::styled(n.summary.clone(), Style::default()),
+            ])
+            .style(style)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(root_lines), left_inner);
+
+    // Right: subtree of selected root.
+    let right_block = Block::default().borders(Borders::ALL).title(" subtree ");
+    let right_inner = right_block.inner(chunks[1]);
+    f.render_widget(right_block, chunks[1]);
+
+    let Some(&root_idx) = form.roots.get(selected_root_idx) else { return };
+    let mut subtree_visible: Vec<usize> = Vec::new();
+    push_subtree(&form.nodes, root_idx, &mut subtree_visible);
+    let viewport_h = right_inner.height as usize;
+    // selected position within subtree_visible (if applicable)
+    let sel_in_sub = subtree_visible
+        .iter()
+        .position(|&n| Some(&n) == form.visible.get(form.selected))
+        .unwrap_or(0);
+    let scroll = sel_in_sub.saturating_sub(viewport_h.saturating_sub(1) / 2);
+    let scroll = scroll.min(subtree_visible.len().saturating_sub(viewport_h).max(0));
+    let end = (scroll + viewport_h).min(subtree_visible.len());
+    let lines: Vec<Line> = (scroll..end)
+        .map(|i| {
+            let node_idx = subtree_visible[i];
+            let is_sel = Some(&node_idx) == form.visible.get(form.selected);
+            tree_node_line(&form.nodes[node_idx], is_sel)
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), right_inner);
+}
+
+fn push_subtree(nodes: &[TreeNode], idx: usize, out: &mut Vec<usize>) {
+    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut stack: Vec<usize> = vec![idx];
+    while let Some(i) = stack.pop() {
+        if !visited.insert(i) { continue; }
+        out.push(i);
+        if nodes[i].expanded {
+            // push children in reverse so visual order is preserved when popping
+            for &c in nodes[i].children.iter().rev() {
+                if !visited.contains(&c) { stack.push(c); }
+            }
+        }
+    }
 }

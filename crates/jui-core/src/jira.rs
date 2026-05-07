@@ -333,9 +333,15 @@ fn parse_issue(v: &Value) -> Option<Ticket> {
             .or_else(|| f.get(flat).and_then(|x| x.as_i64()))
     };
     // Parent — list responses only give `parent.key`. View responses include the parent's
-    // summary and issue_type and that parent's own parent. We pull whatever's there.
+    // summary and issue_type and that parent's own parent. Classic Jira projects don't
+    // expose Story→Epic via `parent` — they use the Epic Link custom field
+    // (`customfield_10014` on Cloud; sometimes `customfield_10008`/`customfield_10006`
+    // elsewhere). Fall back to those when `parent` is absent.
     let parent = f.get("parent");
-    let parent_key = parent.and_then(|p| p.get("key")).and_then(|x| x.as_str()).map(str::to_string);
+    let mut parent_key = parent
+        .and_then(|p| p.get("key"))
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
     let parent_fields = parent.and_then(|p| p.get("fields"));
     let parent_summary = parent_fields
         .and_then(|pf| pf.get("summary"))
@@ -346,6 +352,16 @@ fn parse_issue(v: &Value) -> Option<Ticket> {
         .and_then(|x| x.get("name"))
         .and_then(|x| x.as_str())
         .map(str::to_string);
+    if parent_key.is_none() {
+        for cf in &["customfield_10014", "customfield_10008", "customfield_10006"] {
+            if let Some(v) = f.get(*cf).and_then(|x| x.as_str()) {
+                if !v.is_empty() {
+                    parent_key = Some(v.to_string());
+                    break;
+                }
+            }
+        }
+    }
 
     // Subtasks: typically empty array; on `view` responses each item has key + fields.
     let subtasks: Vec<crate::ticket::SubtaskRef> = f

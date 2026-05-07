@@ -68,6 +68,9 @@ pub enum Request {
     SaveTeam { name: String, members: Vec<String> },
     ListTeams,
     DeleteTeam { name: String },
+    ConfluenceListSpaces,
+    /// `parent_id = None` → root pages of space; `Some(id)` → children of that page.
+    ConfluenceListPages { space_key: String, parent_id: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,6 +96,15 @@ pub enum Response {
     Repos { items: Vec<RepoEntry> },
     /// Each entry's `linked` field tells whether it's currently tied to the ticket.
     TicketProjects { items: Vec<TicketProjectEntry> },
+    ConfluenceSpaces {
+        items: Vec<crate::confluence_api::ConfluenceSpace>,
+        /// True when served from SQLite cache without a live API call.
+        from_cache: bool,
+    },
+    ConfluencePages {
+        items: Vec<crate::confluence_api::ConfluencePage>,
+        from_cache: bool,
+    },
     Ok,
     Err { message: String },
     /// `from_cache` = true means results came from ticket assignees (users table empty).
@@ -109,10 +121,14 @@ pub struct TeamEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum StartWorkReply {
-    GitSwitched { branch: String, created: bool },
+    GitWorktree {
+        branch: String,
+        path: std::path::PathBuf,
+        created_branch: bool,
+        attached_existing_worktree: bool,
+    },
     SvnExport { value: String },
     NoScm,
-    StagedChanges,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -103,6 +103,64 @@ pub enum Mode {
     TicketProjects(TicketProjectsForm),
     ConfluenceSpaces(ConfluenceSpacesForm),
     ConfluencePages(ConfluencePagesForm),
+    PageView(PageViewForm),
+    Tree(TreeForm),
+}
+
+/// One node in the ticket tree. Stored flat with children referenced by index
+/// into `TreeForm.nodes`.
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    pub key: String,
+    pub summary: String,
+    pub status: String,
+    pub issue_type: Option<String>,
+    pub parent_key: Option<String>,
+    pub children: Vec<usize>,
+    pub depth: u16,
+    pub expanded: bool,
+    /// True for a ticket the user owns (i.e. came from `app.tickets`).
+    /// False for ancestors fetched purely to give context.
+    pub is_mine: bool,
+}
+
+pub struct TreeForm {
+    pub nodes: Vec<TreeNode>,
+    pub roots: Vec<usize>,
+    /// Flat list of node indices currently visible (after expand/collapse).
+    /// Rebuilt by `recompute_visible`.
+    pub visible: Vec<usize>,
+    pub selected: usize,
+    pub two_column: bool,
+}
+
+/// One display row in the page viewer.
+pub enum PageLine {
+    Spans(Vec<ratatui::text::Span<'static>>),
+    Blank,
+    /// One row inside an image. `id` indexes into PageViewForm.images, `row` is 0..height.
+    Image { id: usize, row: u16, height: u16 },
+}
+
+pub struct PageImage {
+    pub proto: ratatui_image::protocol::StatefulProtocol,
+}
+
+pub struct PageViewForm {
+    pub page_id: String,
+    pub space_key: String,
+    pub title: String,
+    pub markdown: String,
+    pub lines: Vec<PageLine>,
+    pub images: Vec<PageImage>,
+    pub scroll: usize,
+    pub viewport_height: usize,
+    pub search_active: bool,
+    pub search_query: String,
+    pub search_matches: Vec<usize>,
+    pub search_cursor: usize,
+    /// Restore this when user presses q/Esc.
+    pub prev_pages: Box<ConfluencePagesForm>,
 }
 
 pub struct ConfluenceSpacesForm {
@@ -112,6 +170,7 @@ pub struct ConfluenceSpacesForm {
     pub error: Option<String>,
 }
 
+#[derive(Clone)]
 pub struct ConfluencePagesForm {
     pub space_key: String,
     pub space_name: String,
@@ -122,6 +181,15 @@ pub struct ConfluencePagesForm {
     pub selected: usize,
     pub loading: bool,
     pub error: Option<String>,
+    /// When true, the search bar is active and results replace the page list.
+    pub search_active: bool,
+    pub search_query: String,
+    pub search_results: Vec<jui_core::confluence_api::ConfluencePage>,
+    pub search_selected: usize,
+    pub search_loading: bool,
+    pub search_error: Option<String>,
+    /// True after a search has been submitted; Enter navigates to page instead of re-searching.
+    pub search_submitted: bool,
 }
 
 pub struct TicketProjectsForm {
@@ -415,6 +483,9 @@ pub struct App {
     /// Set after leaving/re-entering alternate screen (e.g. editor launch) so
     /// main_loop clears ratatui's internal buffer before the next draw.
     pub needs_clear: bool,
+    /// Image protocol picker. Init lazily before the first PageView open so the
+    /// terminal-capability query happens after raw mode is set up.
+    pub picker: Option<ratatui_image::picker::Picker>,
 }
 
 /// Sentinel offset separating `kanban_extra` indices from `tickets` indices in
@@ -453,6 +524,7 @@ impl App {
             kanban_expanded_col: None,
             should_quit: false,
             needs_clear: false,
+            picker: None,
         }
     }
 
@@ -1024,22 +1096,39 @@ impl App {
             &Request::StartWork { key: key.clone(), cwd },
         )
         .await?;
+        let mut worktree_path: Option<std::path::PathBuf> = None;
         if let Response::StartWork { reply } = &resp {
             let part = match reply {
-                StartWorkReply::GitSwitched { branch, created } => {
-                    format!("{} {branch}", if *created { "created" } else { "switched" })
+                StartWorkReply::GitWorktree { branch, path, created_branch, attached_existing_worktree } => {
+                    worktree_path = Some(path.clone());
+                    let action = if *attached_existing_worktree { "reused" }
+                        else if *created_branch { "created" }
+                        else { "attached" };
+                    format!("worktree {action} {branch} → {}", path.display())
                 }
                 StartWorkReply::SvnExport { value } => format!("svn export {value}"),
                 StartWorkReply::NoScm => "no SCM".into(),
-                StartWorkReply::StagedChanges => {
-                    self.status = "git has staged changes — commit or stash first".into();
-                    return Ok(());
-                }
             };
             status_parts.push(part);
         } else if let Response::Err { message } = resp {
             self.status = format!("scm err: {message}");
             return Ok(());
+        }
+
+        // 2b. Open a tmux pane in the worktree dir, if we got one and we're inside tmux.
+        if let Some(path) = worktree_path {
+            if std::env::var("TMUX").is_ok() {
+                let st = std::process::Command::new("tmux")
+                    .args(["split-window", "-h", "-c", &path.to_string_lossy()])
+                    .status();
+                match st {
+                    Ok(s) if s.success() => status_parts.push("pane opened".into()),
+                    Ok(_) => status_parts.push("tmux split failed".into()),
+                    Err(e) => status_parts.push(format!("tmux err: {e}")),
+                }
+            } else {
+                status_parts.push("not in tmux — cd manually".into());
+            }
         }
 
         // 3. Find a linked project to cd into.
@@ -1593,6 +1682,127 @@ impl App {
         Ok(())
     }
 
+    /// Build a tree of the user's tickets walking up parent_key chains. Every ticket in
+    /// the tree is freshly fetched via `Request::GetTicket` so parent links and Epic-Link
+    /// custom fields come from the live API, not the (possibly stale) list response.
+    /// Roots are sorted with Epics first, then by key.
+    pub async fn open_tree(&mut self) -> Result<()> {
+        use std::collections::HashMap;
+        use std::collections::HashSet;
+
+        let mine: HashSet<String> = self.tickets.iter().map(|t| t.key.clone()).collect();
+        let mut by_key: HashMap<String, TreeNode> = HashMap::new();
+        let mut queue: Vec<String> = mine.iter().cloned().collect();
+        let mut seen: HashSet<String> = mine.clone();
+        // Status counter so the user knows the tree is working through ancestors.
+        let total_mine = mine.len();
+        self.status = format!("building tree (0/{total_mine})…");
+
+        let mut fetched = 0usize;
+        while let Some(key) = queue.pop() {
+            if by_key.contains_key(&key) { continue; }
+            // Daemon serves one request per connection — open a fresh socket each time.
+            let mut s = match ipc::connect().await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.status = format!("tree: daemon unavailable: {e}");
+                    return Ok(());
+                }
+            };
+            let resp = match ipc::send_request(&mut s, &Request::GetTicket { key: key.clone() }).await {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            let t = match resp {
+                Response::Ticket { ticket } => ticket,
+                _ => continue,
+            };
+            let next_pk = match t.parent_key.clone() {
+                Some(np) if np != key => Some(np),
+                _ => None,
+            };
+            let is_mine = mine.contains(&key);
+            by_key.insert(
+                key.clone(),
+                TreeNode {
+                    key: t.key,
+                    summary: t.summary,
+                    status: t.status,
+                    issue_type: t.issue_type,
+                    parent_key: next_pk.clone(),
+                    children: Vec::new(),
+                    depth: 0,
+                    expanded: true,
+                    is_mine,
+                },
+            );
+            if let Some(n) = next_pk {
+                if seen.insert(n.clone()) { queue.push(n); }
+            }
+            if is_mine {
+                fetched += 1;
+                self.status = format!("building tree ({fetched}/{total_mine})…");
+            }
+        }
+
+        // Materialize a stable ordering: indices in by_key insertion order won't be
+        // deterministic, so collect-and-sort by key.
+        let mut keys: Vec<String> = by_key.keys().cloned().collect();
+        keys.sort();
+        let key_to_idx: HashMap<String, usize> = keys
+            .iter().enumerate().map(|(i, k)| (k.clone(), i)).collect();
+        let mut nodes: Vec<TreeNode> = keys
+            .iter().map(|k| by_key.remove(k).unwrap()).collect();
+
+        // Wire parent → children, identify roots. Skip self-parent (would loop).
+        let mut roots: Vec<usize> = Vec::new();
+        for i in 0..nodes.len() {
+            if let Some(pk) = nodes[i].parent_key.clone() {
+                if let Some(&pi) = key_to_idx.get(&pk) {
+                    if pi != i {
+                        nodes[pi].children.push(i);
+                        continue;
+                    }
+                }
+            }
+            roots.push(i);
+        }
+
+        // Sort roots: Epics first, then by key.
+        roots.sort_by(|&a, &b| {
+            let aep = is_epic(&nodes[a]);
+            let bep = is_epic(&nodes[b]);
+            bep.cmp(&aep).then_with(|| nodes[a].key.cmp(&nodes[b].key))
+        });
+        // Sort each node's children by issue type weight (Story < Task < Sub-task)
+        // then by key, so the visual tree is stable.
+        for i in 0..nodes.len() {
+            let mut ch = std::mem::take(&mut nodes[i].children);
+            ch.sort_by(|&a, &b| {
+                let wa = type_weight(&nodes[a]);
+                let wb = type_weight(&nodes[b]);
+                wa.cmp(&wb).then_with(|| nodes[a].key.cmp(&nodes[b].key))
+            });
+            nodes[i].children = ch;
+        }
+        // Compute depth via BFS from roots.
+        for &r in &roots {
+            walk_depth(&mut nodes, r, 0);
+        }
+
+        let mut form = TreeForm {
+            nodes,
+            roots,
+            visible: Vec::new(),
+            selected: 0,
+            two_column: false,
+        };
+        recompute_tree_visible(&mut form);
+        self.mode = Mode::Tree(form);
+        self.status = "tree".into();
+        Ok(())
+    }
+
     pub async fn open_projects(&mut self) -> Result<()> {
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(&mut s, &Request::ListProjects).await?;
@@ -1768,17 +1978,15 @@ impl App {
             loading: true,
             error: None,
         });
-        let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
-            Ok(a) => a,
-            Err(e) => {
-                if let Mode::ConfluenceSpaces(form) = &mut self.mode {
-                    form.loading = false;
-                    form.error = Some(format!("{e:#}"));
+        let result: Result<Vec<_>> = match try_ipc_for_confluence(&ipc::Request::ConfluenceListSpaces).await {
+            Some(ConfluenceData::Spaces(s)) => Ok(s),
+            Some(_) | None => {
+                match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+                    Ok(api) => api.list_spaces().await,
+                    Err(e) => Err(e),
                 }
-                return Ok(());
             }
         };
-        let result = api.list_spaces().await;
         if let Mode::ConfluenceSpaces(form) = &mut self.mode {
             form.loading = false;
             match result {
@@ -1798,18 +2006,24 @@ impl App {
             selected: 0,
             loading: true,
             error: None,
+            search_active: false,
+            search_query: String::new(),
+            search_results: vec![],
+            search_selected: 0,
+            search_loading: false,
+            search_error: None,
+            search_submitted: false,
         });
-        let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
-            Ok(a) => a,
-            Err(e) => {
-                if let Mode::ConfluencePages(form) = &mut self.mode {
-                    form.loading = false;
-                    form.error = Some(format!("{e:#}"));
+        let req = ipc::Request::ConfluenceListPages { space_key: space_key.clone(), parent_id: None };
+        let result: Result<Vec<_>> = match try_ipc_for_confluence(&req).await {
+            Some(ConfluenceData::Pages(p)) => Ok(p),
+            Some(_) | None => {
+                match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+                    Ok(api) => api.list_pages(&space_key).await,
+                    Err(e) => Err(e),
                 }
-                return Ok(());
             }
         };
-        let result = api.list_pages(&space_key).await;
         if let Mode::ConfluencePages(form) = &mut self.mode {
             form.loading = false;
             match result {
@@ -1820,8 +2034,142 @@ impl App {
         Ok(())
     }
 
+    pub async fn open_page_view(&mut self) -> Result<()> {
+        let (page_id, space_key, prev_pages) = {
+            let Mode::ConfluencePages(form) = &self.mode else { return Ok(()) };
+            let page = if form.search_active {
+                form.search_results.get(form.search_selected)
+            } else {
+                form.pages.get(form.selected)
+            };
+            let Some(page) = page else { return Ok(()) };
+            let prev = Box::new(ConfluencePagesForm {
+                space_key: form.space_key.clone(),
+                space_name: form.space_name.clone(),
+                breadcrumb: form.breadcrumb.clone(),
+                pages: form.pages.clone(),
+                selected: form.selected,
+                loading: false,
+                error: None,
+                search_active: form.search_active,
+                search_query: form.search_query.clone(),
+                search_results: form.search_results.clone(),
+                search_selected: form.search_selected,
+                search_loading: false,
+                search_error: None,
+                search_submitted: form.search_submitted,
+            });
+            (page.id.clone(), form.space_key.clone(), prev)
+        };
+        self.status = "fetching…".into();
+        let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+            Ok(a) => a,
+            Err(e) => { self.status = format!("config error: {e:#}"); return Ok(()); }
+        };
+        let (title, html) = match api.get_page_html(&page_id).await {
+            Ok(r) => r,
+            Err(e) => { self.status = format!("fetch error: {e:#}"); return Ok(()); }
+        };
+        let token = jui_core::confluence_api::ConfluenceApi::api_token().unwrap_or_default();
+        let html = download_confluence_images(&html, &api.server, &api.login, &token, &page_id).await;
+        let markdown = html_to_markdown(&html);
+        let term_cols = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
+        let img_cols = term_cols.saturating_sub(4).max(40);
+        if self.picker.is_none() {
+            let mut p = match ratatui_image::picker::Picker::from_query_stdio() {
+                Ok(p) => p,
+                Err(_) => ratatui_image::picker::Picker::from_fontsize((10, 20)),
+            };
+            // Allow user override: JUI_IMAGE_PROTOCOL=halfblocks|kitty|sixel|iterm2
+            if let Ok(name) = std::env::var("JUI_IMAGE_PROTOCOL") {
+                use ratatui_image::picker::ProtocolType;
+                let t = match name.to_ascii_lowercase().as_str() {
+                    "halfblocks" => ProtocolType::Halfblocks,
+                    "kitty" => ProtocolType::Kitty,
+                    "sixel" => ProtocolType::Sixel,
+                    "iterm2" => ProtocolType::Iterm2,
+                    _ => p.protocol_type(),
+                };
+                p.set_protocol_type(t);
+            }
+            self.picker = Some(p);
+        }
+        let picker = self.picker.as_mut().expect("picker initialized above");
+        let proto = format!("{:?}", picker.protocol_type());
+        let (lines, images) = markdown_to_page_lines(&markdown, img_cols, picker);
+        self.status = format!("viewing: {} [proto: {}]", title, proto);
+        self.mode = Mode::PageView(PageViewForm {
+            page_id,
+            space_key,
+            title,
+            markdown,
+            lines,
+            images,
+            scroll: 0,
+            viewport_height: 20,
+            search_active: false,
+            search_query: String::new(),
+            search_matches: vec![],
+            search_cursor: 0,
+            prev_pages,
+        });
+        Ok(())
+    }
+
+    pub async fn page_view_open_editor(&mut self) -> Result<()> {
+        let Mode::PageView(form) = &self.mode else { return Ok(()) };
+        if std::env::var("TMUX").is_err() {
+            self.status = "not in tmux — start jui inside a tmux session".into();
+            return Ok(());
+        }
+        let path = format!("/tmp/confluence-{}.md", form.page_id);
+        let content = format!(
+            "<!-- Space: {} -->\n<!-- Title: {} -->\n\n# {}\n\n{}",
+            form.space_key, form.title, form.title, form.markdown
+        );
+        std::fs::write(&path, &content)?;
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        let cmd = format!("{} {}", editor, shell_escape(&path));
+        let st = std::process::Command::new("tmux")
+            .args(["split-window", "-h", &format!("sh -lc {}", shell_escape(&cmd))])
+            .status()?;
+        if st.success() {
+            self.status = format!("'{}' open in pane — S to sync back", form.title);
+        } else {
+            self.status = "tmux split-window failed".into();
+        }
+        Ok(())
+    }
+
+    pub async fn page_view_sync(&mut self) -> Result<()> {
+        let (page_id, title) = {
+            let Mode::PageView(form) = &self.mode else { return Ok(()) };
+            (form.page_id.clone(), form.title.clone())
+        };
+        let path = format!("/tmp/confluence-{}.md", page_id);
+        if !std::path::Path::new(&path).exists() {
+            self.status = "no local file — open with e first, then save".into();
+            return Ok(());
+        }
+        let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+            Ok(a) => a,
+            Err(e) => { self.status = format!("config error: {e:#}"); return Ok(()); }
+        };
+        let token = jui_core::confluence_api::ConfluenceApi::api_token().unwrap_or_default();
+        let out = std::process::Command::new("mark")
+            .args(["-u", &api.login, "-p", &token, "-b", &api.server, "-f", &path, "--minor-edit"])
+            .output()?;
+        if out.status.success() {
+            self.status = format!("synced '{}' to Confluence", title);
+        } else {
+            let err = String::from_utf8_lossy(&out.stderr);
+            self.status = format!("sync failed: {}", err.trim());
+        }
+        Ok(())
+    }
+
     pub async fn confluence_drill_down(&mut self) -> Result<()> {
-        let page_id = {
+        let (page_id, space_key) = {
             let Mode::ConfluencePages(form) = &mut self.mode else { return Ok(()) };
             let Some(page) = form.pages.get(form.selected) else { return Ok(()) };
             let id = page.id.clone();
@@ -1829,20 +2177,18 @@ impl App {
             form.breadcrumb.push((id.clone(), title));
             form.loading = true;
             form.error = None;
-            id
+            (id, form.space_key.clone())
         };
-        let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
-            Ok(a) => a,
-            Err(e) => {
-                if let Mode::ConfluencePages(form) = &mut self.mode {
-                    form.loading = false;
-                    form.error = Some(format!("{e:#}"));
-                    form.breadcrumb.pop();
+        let req = ipc::Request::ConfluenceListPages { space_key, parent_id: Some(page_id.clone()) };
+        let result: Result<Vec<_>> = match try_ipc_for_confluence(&req).await {
+            Some(ConfluenceData::Pages(p)) => Ok(p),
+            Some(_) | None => {
+                match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+                    Ok(api) => api.get_children(&page_id).await,
+                    Err(e) => Err(e),
                 }
-                return Ok(());
             }
         };
-        let result = api.get_children(&page_id).await;
         if let Mode::ConfluencePages(form) = &mut self.mode {
             form.loading = false;
             form.selected = 0;
@@ -1866,23 +2212,26 @@ impl App {
             form.error = None;
             (form.space_key.clone(), parent_id)
         };
-        let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
-            Ok(a) => a,
-            Err(e) => {
-                if let Mode::ConfluencePages(form) = &mut self.mode {
-                    form.loading = false;
-                    form.error = Some(format!("{e:#}"));
+        let req = ipc::Request::ConfluenceListPages { space_key: space_key.clone(), parent_id: parent_id.clone() };
+        let result: Result<Vec<_>> = match try_ipc_for_confluence(&req).await {
+            Some(ConfluenceData::Pages(p)) => Ok(p),
+            Some(_) | None => {
+                match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+                    Ok(api) => match parent_id {
+                        Some(ref id) => api.get_children(id).await,
+                        None => api.list_pages(&space_key).await,
+                    },
+                    Err(e) => Err(e),
                 }
-                return Ok(());
             }
-        };
-        let result = match parent_id {
-            Some(ref id) => api.get_children(id).await,
-            None => api.list_pages(&space_key).await,
         };
         if let Mode::ConfluencePages(form) = &mut self.mode {
             form.loading = false;
             form.selected = 0;
+            form.search_active = false;
+            form.search_query = String::new();
+            form.search_results = vec![];
+            form.search_submitted = false;
             match result {
                 Ok(pages) => form.pages = pages,
                 Err(e) => form.error = Some(format!("{e:#}")),
@@ -1891,13 +2240,58 @@ impl App {
         Ok(())
     }
 
-    pub async fn confluence_open_in_editor(&mut self) -> Result<()> {
+    pub async fn confluence_search(&mut self) -> Result<()> {
+        let (space_key, ancestor_id, query) = {
+            let Mode::ConfluencePages(form) = &mut self.mode else { return Ok(()) };
+            if form.search_query.trim().is_empty() {
+                return Ok(());
+            }
+            form.search_loading = true;
+            form.search_error = None;
+            let ancestor = form.breadcrumb.last().map(|(id, _)| id.clone());
+            (form.space_key.clone(), ancestor, form.search_query.clone())
+        };
+        let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+            Ok(a) => a,
+            Err(e) => {
+                if let Mode::ConfluencePages(form) = &mut self.mode {
+                    form.search_loading = false;
+                    form.search_error = Some(format!("{e:#}"));
+                }
+                return Ok(());
+            }
+        };
+        let result = api.search_pages(&space_key, ancestor_id.as_deref(), &query).await;
+        if let Mode::ConfluencePages(form) = &mut self.mode {
+            form.search_loading = false;
+            form.search_selected = 0;
+            match result {
+                Ok(pages) => {
+                    form.search_results = pages;
+                    form.search_submitted = true;
+                }
+                Err(e) => form.search_error = Some(format!("{e:#}")),
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn confluence_sync(&mut self) -> Result<()> {
         let page_id = {
             let Mode::ConfluencePages(form) = &self.mode else { return Ok(()) };
-            let Some(page) = form.pages.get(form.selected) else { return Ok(()) };
+            let page = if form.search_active {
+                form.search_results.get(form.search_selected)
+            } else {
+                form.pages.get(form.selected)
+            };
+            let Some(page) = page else { return Ok(()) };
             page.id.clone()
         };
-        self.status = "fetching page…".into();
+        let path = format!("/tmp/confluence-{}.md", page_id);
+        if !std::path::Path::new(&path).exists() {
+            self.status = "no local file — press enter to open the page first".into();
+            return Ok(());
+        }
         let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
             Ok(a) => a,
             Err(e) => {
@@ -1905,33 +2299,387 @@ impl App {
                 return Ok(());
             }
         };
-        match api.get_page_html(&page_id).await {
-            Err(e) => {
-                self.status = format!("fetch error: {e:#}");
-            }
-            Ok((title, html)) => {
-                let markdown = html_to_markdown(&html);
-                let path = format!("/tmp/confluence-{}.md", page_id);
-                let content = format!("# {}\n\n{}", title, markdown);
-                std::fs::write(&path, &content)?;
-                let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-                crossterm::terminal::disable_raw_mode()?;
-                crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::LeaveAlternateScreen
-                )?;
-                let _ = std::process::Command::new(&editor).arg(&path).status();
-                crossterm::terminal::enable_raw_mode()?;
-                crossterm::execute!(
-                    std::io::stdout(),
-                    crossterm::terminal::EnterAlternateScreen
-                )?;
-                self.needs_clear = true;
-                self.status = format!("opened '{}' in {}", title, editor);
-            }
-        }
+        let token = std::env::var("CONFLUENCE_API_TOKEN")
+            .or_else(|_| std::env::var("JIRA_API_TOKEN"))
+            .unwrap_or_default();
+        self.status = "syncing…".into();
+        let result = tokio::process::Command::new("mark")
+            .args([
+                "-u", &api.login,
+                "-p", &token,
+                "-b", &api.server,
+                "-f", &path,
+                "--minor-edit",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        self.status = match result {
+            Ok(s) if s.success() => "synced to Confluence".into(),
+            Ok(_) => "sync failed — check mark config / credentials".into(),
+            Err(_) => "mark not found in PATH — install mark for sync".into(),
+        };
         Ok(())
     }
+}
+
+// ── Page viewer rendering ────────────────────────────────────────────────────
+
+fn md_flush(result: &mut Vec<PageLine>, current: &mut Vec<ratatui::text::Span<'static>>) {
+    if !current.is_empty() {
+        result.push(PageLine::Spans(std::mem::take(current)));
+    }
+}
+
+fn md_style(
+    base: ratatui::style::Style,
+    bold: bool,
+    italic: bool,
+    link: bool,
+) -> ratatui::style::Style {
+    use ratatui::style::{Color, Modifier};
+    let mut s = base;
+    if bold  { s = s.add_modifier(Modifier::BOLD); }
+    if italic { s = s.add_modifier(Modifier::ITALIC); }
+    if link  { s = s.fg(Color::Blue).add_modifier(Modifier::UNDERLINED); }
+    s
+}
+
+fn is_epic(n: &TreeNode) -> bool {
+    n.issue_type.as_deref().map(|t| t.eq_ignore_ascii_case("epic")).unwrap_or(false)
+}
+
+/// Lower number = sorted earlier (closer to top of children list).
+fn type_weight(n: &TreeNode) -> u8 {
+    match n.issue_type.as_deref().unwrap_or("") {
+        t if t.eq_ignore_ascii_case("epic") => 0,
+        t if t.eq_ignore_ascii_case("story") => 1,
+        t if t.eq_ignore_ascii_case("task") => 2,
+        t if t.eq_ignore_ascii_case("bug") => 3,
+        t if t.eq_ignore_ascii_case("sub-task") || t.eq_ignore_ascii_case("subtask") => 4,
+        _ => 5,
+    }
+}
+
+fn walk_depth(nodes: &mut [TreeNode], root: usize, root_depth: u16) {
+    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut stack: Vec<(usize, u16)> = vec![(root, root_depth)];
+    while let Some((idx, depth)) = stack.pop() {
+        if !visited.insert(idx) { continue; }
+        nodes[idx].depth = depth;
+        for &c in &nodes[idx].children.clone() {
+            if !visited.contains(&c) { stack.push((c, depth + 1)); }
+        }
+    }
+}
+
+/// Rebuild the flat `visible` list by walking roots and following expanded children.
+pub fn recompute_tree_visible(form: &mut TreeForm) {
+    let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let roots = form.roots.clone();
+    for r in roots { push_visible(&form.nodes, r, &mut out, &mut visited); }
+    if form.selected >= out.len() && !out.is_empty() {
+        form.selected = out.len() - 1;
+    }
+    form.visible = out;
+}
+
+fn push_visible(
+    nodes: &[TreeNode],
+    idx: usize,
+    out: &mut Vec<usize>,
+    visited: &mut std::collections::HashSet<usize>,
+) {
+    if !visited.insert(idx) { return; }
+    out.push(idx);
+    if nodes[idx].expanded {
+        for &c in &nodes[idx].children { push_visible(nodes, c, out, visited); }
+    }
+}
+
+/// Convert markdown string to display lines + images for the page viewer.
+pub fn markdown_to_page_lines(
+    markdown: &str,
+    max_img_cols: u16,
+    picker: &mut ratatui_image::picker::Picker,
+) -> (Vec<PageLine>, Vec<PageImage>) {
+    use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+    use ratatui::style::{Color, Modifier, Style};
+    use ratatui::text::Span;
+
+    let mut result: Vec<PageLine> = Vec::new();
+    let mut current: Vec<Span<'static>> = Vec::new();
+    let mut images: Vec<PageImage> = Vec::new();
+
+    let mut bold = false;
+    let mut italic = false;
+    let mut in_link = false;
+    let mut base_style = Style::default();
+    let mut in_code_block = false;
+    let mut in_blockquote = false;
+    let mut in_image = false;
+    let mut image_url = String::new();
+    // Stack: None = unordered, Some(counter) = ordered
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
+
+    let opts = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
+    for event in Parser::new_ext(markdown, opts) {
+        match event {
+            Event::Start(Tag::Heading { level, .. }) => {
+                md_flush(&mut result, &mut current);
+                base_style = match level {
+                    HeadingLevel::H1 => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    HeadingLevel::H2 => Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
+                    HeadingLevel::H3 => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                    _ => Style::default().add_modifier(Modifier::BOLD),
+                };
+                let hashes = "#".repeat(level as usize) + " ";
+                current.push(Span::styled(hashes, base_style));
+            }
+            Event::End(TagEnd::Heading(_)) => {
+                md_flush(&mut result, &mut current);
+                base_style = Style::default();
+                result.push(PageLine::Blank);
+            }
+            Event::Start(Tag::Paragraph) => {}
+            Event::End(TagEnd::Paragraph) => {
+                md_flush(&mut result, &mut current);
+                if list_stack.is_empty() && !in_blockquote {
+                    result.push(PageLine::Blank);
+                }
+            }
+            Event::Start(Tag::CodeBlock(kind)) => {
+                md_flush(&mut result, &mut current);
+                let lang = match kind {
+                    CodeBlockKind::Fenced(l) if !l.is_empty() => format!(" {}", l),
+                    _ => String::new(),
+                };
+                result.push(PageLine::Spans(vec![Span::styled(
+                    format!("┄┄┄┄┄{}", lang),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+                in_code_block = true;
+                base_style = Style::default().fg(Color::Yellow);
+            }
+            Event::End(TagEnd::CodeBlock) => {
+                md_flush(&mut result, &mut current);
+                result.push(PageLine::Spans(vec![Span::styled(
+                    "┄┄┄┄┄┄┄┄┄┄".to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+                in_code_block = false;
+                base_style = Style::default();
+                result.push(PageLine::Blank);
+            }
+            Event::Start(Tag::BlockQuote(_)) => { in_blockquote = true; }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                md_flush(&mut result, &mut current);
+                in_blockquote = false;
+                result.push(PageLine::Blank);
+            }
+            Event::Start(Tag::List(start)) => {
+                list_stack.push(start.map(|n| n.saturating_sub(1)));
+            }
+            Event::End(TagEnd::List(_)) => {
+                list_stack.pop();
+                if list_stack.is_empty() { result.push(PageLine::Blank); }
+            }
+            Event::Start(Tag::Item) => {
+                md_flush(&mut result, &mut current);
+                let depth = list_stack.len().saturating_sub(1);
+                let indent = "  ".repeat(depth);
+                if in_blockquote { current.push(Span::styled("│ ".to_string(), Style::default().fg(Color::DarkGray))); }
+                if let Some(counter) = list_stack.last_mut() {
+                    match counter {
+                        Some(n) => {
+                            *n += 1;
+                            let num = *n;
+                            current.push(Span::raw(indent));
+                            current.push(Span::styled(format!("{}. ", num), Style::default().fg(Color::Yellow)));
+                        }
+                        None => {
+                            current.push(Span::raw(indent));
+                            current.push(Span::styled("• ".to_string(), Style::default().fg(Color::Yellow)));
+                        }
+                    }
+                }
+            }
+            Event::End(TagEnd::Item) => { md_flush(&mut result, &mut current); }
+            Event::Start(Tag::Strong) => { bold = true; }
+            Event::End(TagEnd::Strong) => { bold = false; }
+            Event::Start(Tag::Emphasis) => { italic = true; }
+            Event::End(TagEnd::Emphasis) => { italic = false; }
+            Event::Start(Tag::Link { .. }) => { in_link = true; }
+            Event::End(TagEnd::Link) => { in_link = false; }
+            Event::Start(Tag::Image { dest_url, .. }) => {
+                in_image = true;
+                image_url = dest_url.to_string();
+            }
+            Event::End(TagEnd::Image) => {
+                in_image = false;
+                md_flush(&mut result, &mut current);
+                let url = std::mem::take(&mut image_url);
+                let path = url.strip_prefix("file://").unwrap_or(&url);
+                let decoded = image::ImageReader::open(path)
+                    .ok()
+                    .and_then(|r| r.with_guessed_format().ok())
+                    .and_then(|r| r.decode().ok());
+                if let Some(img) = decoded {
+                    let (orig_w, orig_h) = (img.width().max(1), img.height().max(1));
+                    let (cell_w, cell_h) = picker.font_size();
+                    let max_w_px = (max_img_cols as u32) * (cell_w as u32);
+                    let target_w_px = max_w_px.min(orig_w);
+                    let target_h_px = orig_h * target_w_px / orig_w;
+                    let h_cells = ((target_h_px as f32) / (cell_h as f32)).ceil() as u16;
+                    let height = h_cells.max(1);
+                    let proto = picker.new_resize_protocol(img);
+                    let id = images.len();
+                    images.push(PageImage { proto });
+                    for r in 0..height {
+                        result.push(PageLine::Image { id, row: r, height });
+                    }
+                } else {
+                    result.push(PageLine::Spans(vec![
+                        Span::styled("[img] ".to_string(), Style::default().fg(Color::DarkGray)),
+                        Span::styled(url, Style::default().fg(Color::Blue)),
+                    ]));
+                }
+                result.push(PageLine::Blank);
+            }
+            Event::Code(text) => {
+                current.push(Span::styled(
+                    format!("`{}`", text),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            Event::Text(text) => {
+                if in_image { continue; }
+                if in_code_block {
+                    for (i, line) in text.split('\n').enumerate() {
+                        if i > 0 { md_flush(&mut result, &mut current); }
+                        current.push(Span::styled("  ".to_string(), Style::default()));
+                        current.push(Span::styled(line.to_string(), base_style));
+                    }
+                } else {
+                    if in_blockquote && current.is_empty() {
+                        current.push(Span::styled("│ ".to_string(), Style::default().fg(Color::DarkGray)));
+                    }
+                    current.push(Span::styled(text.to_string(), md_style(base_style, bold, italic, in_link)));
+                }
+            }
+            Event::SoftBreak => {
+                if !in_code_block { current.push(Span::raw(" ")); }
+            }
+            Event::HardBreak => { md_flush(&mut result, &mut current); }
+            Event::Rule => {
+                md_flush(&mut result, &mut current);
+                result.push(PageLine::Spans(vec![Span::styled(
+                    "─".repeat(60),
+                    Style::default().fg(Color::DarkGray),
+                )]));
+                result.push(PageLine::Blank);
+            }
+            _ => {}
+        }
+    }
+    md_flush(&mut result, &mut current);
+    (result, images)
+}
+
+pub fn page_line_plain_text(line: &PageLine) -> String {
+    match line {
+        PageLine::Spans(spans) => spans.iter().map(|s| s.content.as_ref()).collect(),
+        PageLine::Blank => String::new(),
+        PageLine::Image { .. } => String::new(),
+    }
+}
+
+pub fn find_page_search_matches(lines: &[PageLine], query: &str) -> Vec<usize> {
+    if query.is_empty() { return vec![]; }
+    let q = query.to_ascii_lowercase();
+    lines.iter().enumerate()
+        .filter(|(_, l)| page_line_plain_text(l).to_ascii_lowercase().contains(&q))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+enum ConfluenceData {
+    Spaces(Vec<jui_core::confluence_api::ConfluenceSpace>),
+    Pages(Vec<jui_core::confluence_api::ConfluencePage>),
+}
+
+/// Hit the daemon IPC; return `None` if daemon is unavailable or returns unexpected response.
+async fn try_ipc_for_confluence(req: &ipc::Request) -> Option<ConfluenceData> {
+    use jui_core::ipc::Response;
+    let mut stream = ipc::connect().await.ok()?;
+    match ipc::send_request(&mut stream, req).await.ok()? {
+        Response::ConfluenceSpaces { items, .. } => Some(ConfluenceData::Spaces(items)),
+        Response::ConfluencePages { items, .. } => Some(ConfluenceData::Pages(items)),
+        _ => None,
+    }
+}
+
+async fn download_confluence_images(
+    html: &str,
+    server: &str,
+    login: &str,
+    token: &str,
+    page_id: &str,
+) -> String {
+    let dir = format!("/tmp/confluence-assets/{}", page_id);
+    let _ = std::fs::create_dir_all(&dir);
+
+    let mut replacements: Vec<(String, String)> = Vec::new();
+    let lower = html.to_ascii_lowercase();
+    let mut pos = 0;
+
+    while pos < lower.len() {
+        let Some(rel) = lower[pos..].find("<img") else { break };
+        let abs = pos + rel;
+        let after = abs + 4;
+        let tag_end = lower[after..].find('>').map(|e| after + e + 1).unwrap_or(lower.len());
+        let tag = &html[abs..tag_end];
+
+        if let Some(src) = extract_attr(tag.trim_start_matches('<').trim_start_matches("img").trim_start_matches("IMG"), "src") {
+            let is_relative = src.starts_with("/wiki/") || src.starts_with("/download/");
+            let is_absolute = src.starts_with(server) && (
+                src[server.len()..].starts_with("/wiki/") || src[server.len()..].starts_with("/download/")
+            );
+            if (is_relative || is_absolute) && !replacements.iter().any(|(o, _)| o == &src) {
+                let full_url = if is_absolute { src.clone() } else { format!("{}{}", server, src) };
+                let filename = src.split('/').last()
+                    .and_then(|f| f.split('?').next())
+                    .filter(|f| !f.is_empty())
+                    .unwrap_or("image.png");
+                let local_path = format!("{}/{}", dir, filename);
+
+                let ok = tokio::process::Command::new("curl")
+                    .args([
+                        "-sS", "-L", "--fail-with-body",
+                        "-u", &format!("{}:{}", login, token),
+                        "-o", &local_path,
+                        &full_url,
+                    ])
+                    .output()
+                    .await
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+
+                if ok {
+                    replacements.push((src, format!("file://{}", local_path)));
+                }
+            }
+        }
+        pos = tag_end;
+    }
+
+    let mut result = html.to_string();
+    for (original, local) in replacements {
+        result = result.replace(&original, &local);
+    }
+    result
 }
 
 fn html_to_markdown(html: &str) -> String {
@@ -1953,7 +2701,7 @@ fn html_to_markdown(html: &str) -> String {
             }
         }
     }
-    // Try python3 html2text.
+    // Try python3 html2text (third-party package).
     if let Ok(mut child) = std::process::Command::new("python3")
         .args(["-c", "import sys,html2text; print(html2text.html2text(sys.stdin.read()))"])
         .stdin(std::process::Stdio::piped())
@@ -1970,18 +2718,289 @@ fn html_to_markdown(html: &str) -> String {
             }
         }
     }
-    // Fallback: strip tags.
-    let mut result = String::with_capacity(html.len());
-    let mut in_tag = false;
-    for ch in html.chars() {
-        match ch {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => result.push(ch),
-            _ => {}
+    // Built-in converter: handles Confluence export_view HTML well enough.
+    html_to_md_builtin(html)
+}
+
+fn html_to_md_builtin(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut i = 0;
+    let chars: Vec<char> = html.chars().collect();
+    let len = chars.len();
+
+    // Ordered-list counter stack: each entry is Some(n) for <ol> or None for <ul>.
+    let mut list_stack: Vec<Option<usize>> = Vec::new();
+    let mut href_stack: Vec<String> = Vec::new();
+    let mut in_pre = false;
+    let mut skip = false; // inside <script>/<style>
+
+    while i < len {
+        if chars[i] == '<' {
+            // Collect the tag.
+            let start = i + 1;
+            i += 1;
+            while i < len && chars[i] != '>' {
+                i += 1;
+            }
+            let raw_tag: String = chars[start..i].iter().collect();
+            i += 1; // skip '>'
+
+            let closing = raw_tag.starts_with('/');
+            let tag_body = raw_tag.trim_start_matches('/').trim();
+            let tag_name = tag_body
+                .split(|c: char| c.is_whitespace())
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+
+            // skip script / style content
+            if tag_name == "script" || tag_name == "style" {
+                skip = !closing;
+                continue;
+            }
+            if skip {
+                continue;
+            }
+
+            match tag_name.as_str() {
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" if !closing => {
+                    let level = tag_name[1..].parse::<usize>().unwrap_or(1);
+                    ensure_blank_line(&mut out);
+                    out.push_str(&"#".repeat(level));
+                    out.push(' ');
+                }
+                "h1" | "h2" | "h3" | "h4" | "h5" | "h6" if closing => {
+                    out.push('\n');
+                }
+                "p" | "div" | "section" | "article" | "header" | "footer" if !closing => {
+                    ensure_blank_line(&mut out);
+                }
+                "p" | "div" | "section" | "article" | "header" | "footer" if closing => {
+                    if !out.ends_with('\n') {
+                        out.push('\n');
+                    }
+                }
+                "br" => {
+                    out.push('\n');
+                }
+                "hr" => {
+                    ensure_blank_line(&mut out);
+                    out.push_str("---\n");
+                }
+                "ul" if !closing => {
+                    list_stack.push(None);
+                    ensure_newline(&mut out);
+                }
+                "ol" if !closing => {
+                    list_stack.push(Some(0));
+                    ensure_newline(&mut out);
+                }
+                "ul" | "ol" if closing => {
+                    list_stack.pop();
+                    ensure_newline(&mut out);
+                }
+                "li" if !closing => {
+                    ensure_newline(&mut out);
+                    let depth = list_stack.len().saturating_sub(1);
+                    out.push_str(&"  ".repeat(depth));
+                    if let Some(Some(n)) = list_stack.last_mut() {
+                        *n += 1;
+                        out.push_str(&format!("{}. ", n));
+                    } else {
+                        out.push_str("- ");
+                    }
+                }
+                "li" if closing => {
+                    ensure_newline(&mut out);
+                }
+                "strong" | "b" => {
+                    out.push_str("**");
+                }
+                "em" | "i" => {
+                    out.push('*');
+                }
+                "code" if !in_pre => {
+                    out.push('`');
+                }
+                "pre" if !closing => {
+                    ensure_blank_line(&mut out);
+                    out.push_str("```\n");
+                    in_pre = true;
+                }
+                "pre" if closing => {
+                    ensure_newline(&mut out);
+                    out.push_str("```\n");
+                    in_pre = false;
+                }
+                "a" if !closing => {
+                    if let Some(href) = extract_attr(tag_body, "href") {
+                        out.push('[');
+                        href_stack.push(href);
+                    }
+                }
+                "a" if closing => {
+                    if let Some(href) = href_stack.pop() {
+                        out.push_str(&format!("]({})", href));
+                    }
+                }
+                "img" => {
+                    let src = extract_attr(tag_body, "src").unwrap_or_default();
+                    let alt = extract_attr(tag_body, "alt").unwrap_or_default();
+                    if !src.is_empty() {
+                        ensure_blank_line(&mut out);
+                        out.push_str(&format!("![{}]({})\n", alt, src));
+                    }
+                }
+                "blockquote" if !closing => {
+                    ensure_blank_line(&mut out);
+                    out.push_str("> ");
+                }
+                "table" | "tbody" | "thead" if !closing => {
+                    ensure_blank_line(&mut out);
+                }
+                "tr" if closing => {
+                    out.push_str(" |\n");
+                }
+                "td" | "th" if !closing => {
+                    out.push_str("| ");
+                }
+                _ => {}
+            }
+        } else {
+            // Text node.
+            if skip {
+                i += 1;
+                continue;
+            }
+            let mut text = String::new();
+            while i < len && chars[i] != '<' {
+                text.push(chars[i]);
+                i += 1;
+            }
+            let decoded = decode_entities(&text);
+            if in_pre {
+                out.push_str(&decoded);
+            } else {
+                // Collapse whitespace, but preserve newlines after block starts.
+                let collapsed = decoded
+                    .split(|c: char| c == '\n' || c == '\r')
+                    .flat_map(|line| {
+                        let t = line.split_whitespace().collect::<Vec<_>>().join(" ");
+                        std::iter::once(t)
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !collapsed.is_empty() {
+                    // Add space between last text and new text if needed.
+                    if !out.is_empty()
+                        && !out.ends_with('\n')
+                        && !out.ends_with(' ')
+                        && !out.ends_with('#')
+                        && !out.ends_with('-')
+                        && !out.ends_with('>')
+                        && !out.ends_with('`')
+                        && !out.ends_with('[')
+                        && !out.ends_with('*')
+                    {
+                        out.push(' ');
+                    }
+                    out.push_str(&collapsed);
+                }
+            }
         }
     }
-    result
+
+    // Collapse 3+ consecutive newlines to 2.
+    let mut result = String::with_capacity(out.len());
+    let mut newline_count = 0usize;
+    for ch in out.chars() {
+        if ch == '\n' {
+            newline_count += 1;
+            if newline_count <= 2 {
+                result.push(ch);
+            }
+        } else {
+            newline_count = 0;
+            result.push(ch);
+        }
+    }
+    result.trim().to_string()
+}
+
+fn ensure_blank_line(out: &mut String) {
+    if out.is_empty() {
+        return;
+    }
+    if !out.ends_with("\n\n") {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+}
+
+fn ensure_newline(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn decode_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    let bytes = s.as_bytes();
+    while i < bytes.len() {
+        if bytes[i] == b'&' {
+            if let Some(semi) = s[i..].find(';') {
+                let entity = &s[i + 1..i + semi];
+                let replacement = match entity {
+                    "lt" => "<",
+                    "gt" => ">",
+                    "amp" => "&",
+                    "nbsp" | "#160" => " ",
+                    "quot" => "\"",
+                    "apos" => "'",
+                    "mdash" | "#8212" => "—",
+                    "ndash" | "#8211" => "–",
+                    "hellip" | "#8230" => "…",
+                    "laquo" | "#171" => "«",
+                    "raquo" | "#187" => "»",
+                    e if e.starts_with('#') => {
+                        let n: u32 = e[1..].parse().unwrap_or(0);
+                        let ch = char::from_u32(n).unwrap_or(' ');
+                        out.push(ch);
+                        i += semi + 1;
+                        continue;
+                    }
+                    _ => {
+                        out.push('&');
+                        i += 1;
+                        continue;
+                    }
+                };
+                out.push_str(replacement);
+                i += semi + 1;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn extract_attr<'a>(tag_body: &'a str, attr: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("{}={}", attr, quote);
+        if let Some(pos) = tag_body.find(&needle) {
+            let start = pos + needle.len();
+            if let Some(end_rel) = tag_body[start..].find(quote) {
+                return Some(tag_body[start..start + end_rel].to_string());
+            }
+        }
+    }
+    None
 }
 
 pub async fn run() -> Result<()> {
@@ -2015,6 +3034,12 @@ async fn main_loop<B: ratatui::backend::Backend>(
         if app.needs_clear {
             term.clear()?;
             app.needs_clear = false;
+        }
+        // Keep page viewer viewport in sync with actual terminal height.
+        if let Mode::PageView(ref mut form) = app.mode {
+            if let Ok(sz) = term.size() {
+                form.viewport_height = sz.height.saturating_sub(5) as usize;
+            }
         }
         term.draw(|f| ui::draw(f, app))?;
         if event::poll(Duration::from_millis(200))? {
@@ -2279,6 +3304,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             KeyCode::Char('p') => { app.open_projects().await?; }
             KeyCode::Char('f') => { app.open_confluence_spaces().await?; }
+            KeyCode::Char('T') => { app.open_tree().await?; }
             KeyCode::Tab => {
                 if let Some(&t_idx) = app.active_idxs.get(app.list_selected) {
                     let key = app.tickets[t_idx].key.clone();
@@ -2977,7 +4003,44 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             _ => {}
         },
-        Mode::ConfluencePages(form) => match code {
+        Mode::ConfluencePages(form) => {
+            // Search mode intercepts most keys.
+            if form.search_active {
+                match code {
+                    KeyCode::Esc => {
+                        form.search_active = false;
+                        form.search_query = String::new();
+                        form.search_results = vec![];
+                        form.search_error = None;
+                        form.search_submitted = false;
+                    }
+                    KeyCode::Enter if form.search_submitted => {
+                        app.open_page_view().await?;
+                    }
+                    KeyCode::Enter => {
+                        app.confluence_search().await?;
+                    }
+                    KeyCode::Backspace => {
+                        form.search_query.pop();
+                        form.search_submitted = false;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        let n = form.search_results.len();
+                        if n > 0 { form.search_selected = (form.search_selected + 1).min(n - 1); }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        form.search_selected = form.search_selected.saturating_sub(1);
+                    }
+                    KeyCode::Char(c) => {
+                        form.search_query.push(c);
+                        form.search_submitted = false;
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            // Normal (non-search) navigation.
+            match code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 let has_crumb = !form.breadcrumb.is_empty();
                 if has_crumb {
@@ -2986,7 +4049,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.open_confluence_spaces().await?;
                 }
             }
-            KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+            KeyCode::Char('h') | KeyCode::Left => {
                 let has_crumb = !form.breadcrumb.is_empty();
                 if has_crumb {
                     app.confluence_go_back().await?;
@@ -3005,8 +4068,225 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             KeyCode::Char('l') | KeyCode::Right => {
                 app.confluence_drill_down().await?;
             }
+            KeyCode::Char('/') => {
+                if let Mode::ConfluencePages(f) = &mut app.mode {
+                    f.search_active = true;
+                    f.search_query = String::new();
+                    f.search_results = vec![];
+                    f.search_error = None;
+                    f.search_submitted = false;
+                }
+            }
+            KeyCode::Enter => { app.open_page_view().await?; }
+            KeyCode::Char('S') => { app.confluence_sync().await?; }
+            _ => {}
+            }
+        },
+
+        Mode::PageView(form) => {
+            if form.search_active {
+                match code {
+                    KeyCode::Esc => {
+                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        form.search_active = false;
+                        form.search_query.clear();
+                        form.search_matches.clear();
+                    }
+                    KeyCode::Backspace => {
+                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        form.search_query.pop();
+                        form.search_matches = find_page_search_matches(&form.lines, &form.search_query);
+                        form.search_cursor = 0;
+                    }
+                    KeyCode::Enter | KeyCode::Char('n') => {
+                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        if !form.search_matches.is_empty() {
+                            form.search_cursor = (form.search_cursor + 1) % form.search_matches.len();
+                            let target = form.search_matches[form.search_cursor];
+                            form.scroll = target.saturating_sub(form.viewport_height / 2);
+                        }
+                    }
+                    KeyCode::Char('N') => {
+                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        if !form.search_matches.is_empty() {
+                            form.search_cursor = form.search_cursor
+                                .checked_sub(1)
+                                .unwrap_or(form.search_matches.len() - 1);
+                            let target = form.search_matches[form.search_cursor];
+                            form.scroll = target.saturating_sub(form.viewport_height / 2);
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        form.search_query.push(c);
+                        form.search_matches = find_page_search_matches(&form.lines, &form.search_query);
+                        form.search_cursor = 0;
+                        if let Some(&first) = form.search_matches.first() {
+                            form.scroll = first.saturating_sub(form.viewport_height / 2);
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            // Normal page-view navigation.
+            let max_scroll = |form: &PageViewForm| form.lines.len().saturating_sub(form.viewport_height);
+            match code {
+                KeyCode::Char('q') | KeyCode::Esc => {
+                    // Restore previous ConfluencePages mode.
+                    let prev = match app.mode {
+                        Mode::PageView(ref f) => *f.prev_pages.clone(),
+                        _ => return Ok(()),
+                    };
+                    app.mode = Mode::ConfluencePages(prev);
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Mode::PageView(f) = &mut app.mode {
+                        let m = max_scroll(f);
+                        f.scroll = (f.scroll + 1).min(m);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Mode::PageView(f) = &mut app.mode { f.scroll = f.scroll.saturating_sub(1); }
+                }
+                KeyCode::Char('d') | KeyCode::PageDown => {
+                    if let Mode::PageView(f) = &mut app.mode {
+                        let step = f.viewport_height / 2;
+                        let m = max_scroll(f);
+                        f.scroll = (f.scroll + step).min(m);
+                    }
+                }
+                KeyCode::Char('u') | KeyCode::PageUp => {
+                    if let Mode::PageView(f) = &mut app.mode {
+                        let step = f.viewport_height / 2;
+                        f.scroll = f.scroll.saturating_sub(step);
+                    }
+                }
+                KeyCode::Char('g') | KeyCode::Home => {
+                    if let Mode::PageView(f) = &mut app.mode { f.scroll = 0; }
+                }
+                KeyCode::Char('G') | KeyCode::End => {
+                    if let Mode::PageView(f) = &mut app.mode {
+                        let m = max_scroll(f);
+                        f.scroll = m;
+                    }
+                }
+                KeyCode::Char('/') => {
+                    if let Mode::PageView(f) = &mut app.mode {
+                        f.search_active = true;
+                        f.search_query.clear();
+                        f.search_matches.clear();
+                    }
+                }
+                KeyCode::Char('n') => {
+                    if let Mode::PageView(f) = &mut app.mode {
+                        if !f.search_matches.is_empty() {
+                            f.search_cursor = (f.search_cursor + 1) % f.search_matches.len();
+                            let t = f.search_matches[f.search_cursor];
+                            let m = max_scroll(f);
+                            f.scroll = t.saturating_sub(f.viewport_height / 2).min(m);
+                        }
+                    }
+                }
+                KeyCode::Char('N') => {
+                    if let Mode::PageView(f) = &mut app.mode {
+                        if !f.search_matches.is_empty() {
+                            f.search_cursor = f.search_cursor
+                                .checked_sub(1)
+                                .unwrap_or(f.search_matches.len() - 1);
+                            let t = f.search_matches[f.search_cursor];
+                            let m = max_scroll(f);
+                            f.scroll = t.saturating_sub(f.viewport_height / 2).min(m);
+                        }
+                    }
+                }
+                KeyCode::Char('e') => { app.page_view_open_editor().await?; }
+                KeyCode::Char('S') => { app.page_view_sync().await?; }
+                _ => {}
+            }
+        },
+        Mode::Tree(_) => match code {
+            KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::List; }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Mode::Tree(f) = &mut app.mode {
+                    if !f.visible.is_empty() {
+                        f.selected = (f.selected + 1).min(f.visible.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Mode::Tree(f) = &mut app.mode {
+                    f.selected = f.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Char('g') => {
+                if let Mode::Tree(f) = &mut app.mode { f.selected = 0; }
+            }
+            KeyCode::Char('G') => {
+                if let Mode::Tree(f) = &mut app.mode {
+                    if !f.visible.is_empty() { f.selected = f.visible.len() - 1; }
+                }
+            }
+            KeyCode::Char('o') | KeyCode::Tab => {
+                if let Mode::Tree(f) = &mut app.mode {
+                    if let Some(&idx) = f.visible.get(f.selected) {
+                        f.nodes[idx].expanded = !f.nodes[idx].expanded;
+                        recompute_tree_visible(f);
+                    }
+                }
+            }
+            KeyCode::Char('O') => {
+                if let Mode::Tree(f) = &mut app.mode {
+                    for n in &mut f.nodes { n.expanded = true; }
+                    recompute_tree_visible(f);
+                }
+            }
+            KeyCode::Char('C') => {
+                if let Mode::Tree(f) = &mut app.mode {
+                    for n in &mut f.nodes { n.expanded = false; }
+                    recompute_tree_visible(f);
+                }
+            }
+            KeyCode::Char('v') => {
+                if let Mode::Tree(f) = &mut app.mode { f.two_column = !f.two_column; }
+            }
+            KeyCode::Char('c') => {
+                let parent = if let Mode::Tree(f) = &app.mode {
+                    f.visible.get(f.selected).map(|&i| f.nodes[i].key.clone())
+                } else { None };
+                if let Some(parent_key) = parent {
+                    let project_key = parent_key.split('-').next().unwrap_or("").to_string();
+                    app.mode = Mode::Create(CreateForm {
+                        project: project_key,
+                        issue_type: "Task".into(),
+                        summary: String::new(),
+                        description: String::new(),
+                        time_estimate: String::new(),
+                        priority: String::new(),
+                        field: 2, // jump to summary
+                        parent: Some(parent_key),
+                        error: None,
+                    });
+                }
+            }
             KeyCode::Enter => {
-                app.confluence_open_in_editor().await?;
+                let key_opt = if let Mode::Tree(f) = &app.mode {
+                    f.visible.get(f.selected).map(|&i| f.nodes[i].key.clone())
+                } else { None };
+                if let Some(key) = key_opt {
+                    app.detail_origin = DetailOrigin::List;
+                    if let Some(pos) = app.active_idxs.iter().position(|&i| app.tickets[i].key == key) {
+                        app.list_selected = pos;
+                    }
+                    // Seed detail stub unconditionally — load_detail uses self.detail as a
+                    // fallback when current_ticket() is None (Tree mode is one of those).
+                    let mut stub = Ticket::new_stub();
+                    stub.key = key.clone();
+                    app.detail = Some(stub);
+                    app.status = format!("loading {key}…");
+                    app.mode = Mode::Detail;
+                    app.load_detail().await?;
+                }
             }
             _ => {}
         },

@@ -92,6 +92,26 @@ impl Cache {
             );
             "#,
         )?;
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS confluence_spaces (
+                key         TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                description TEXT NOT NULL,
+                cached_at   INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS confluence_pages (
+                id           TEXT PRIMARY KEY,
+                title        TEXT NOT NULL,
+                has_children INTEGER NOT NULL,
+                space_key    TEXT NOT NULL,
+                parent_id    TEXT,
+                cached_at    INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS confluence_pages_parent
+                ON confluence_pages(space_key, parent_id);
+            "#,
+        )?;
         // Idempotent additive migrations — `ALTER TABLE ADD COLUMN` errors if column
         // already exists, which we ignore.
         for col in [
@@ -498,6 +518,172 @@ impl Cache {
     pub fn delete_team(&self, name: &str) -> Result<()> {
         self.conn.execute("DELETE FROM teams WHERE name = ?1", [name])?;
         Ok(())
+    }
+
+    // ── Confluence cache ─────────────────────────────────────────────────────
+
+    pub fn upsert_confluence_spaces(
+        &mut self,
+        spaces: &[crate::confluence_api::ConfluenceSpace],
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO confluence_spaces (key, name, description, cached_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(key) DO UPDATE SET
+                   name=excluded.name,
+                   description=excluded.description,
+                   cached_at=excluded.cached_at",
+            )?;
+            for s in spaces {
+                stmt.execute(params![s.key, s.name, s.description, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_confluence_spaces(
+        &self,
+    ) -> Result<Vec<crate::confluence_api::ConfluenceSpace>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, name, description FROM confluence_spaces ORDER BY name",
+        )?;
+        let rows: Vec<_> = stmt
+            .query_map([], |r| {
+                Ok(crate::confluence_api::ConfluenceSpace {
+                    key: r.get(0)?,
+                    name: r.get(1)?,
+                    description: r.get(2)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
+    }
+
+    /// Seconds since the oldest confluence_spaces row was cached. None = table empty.
+    pub fn confluence_spaces_age_secs(&self) -> Result<Option<u64>> {
+        let oldest: Option<i64> = self
+            .conn
+            .query_row("SELECT MIN(cached_at) FROM confluence_spaces", [], |r| r.get(0))
+            .ok()
+            .flatten();
+        Ok(oldest.map(|t| (chrono::Utc::now().timestamp() - t).max(0) as u64))
+    }
+
+    pub fn upsert_confluence_pages(
+        &mut self,
+        space_key: &str,
+        parent_id: Option<&str>,
+        pages: &[crate::confluence_api::ConfluencePage],
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction()?;
+        {
+            // Replace the entire list for this (space, parent) slot so deletions propagate.
+            match parent_id {
+                Some(pid) => tx.execute(
+                    "DELETE FROM confluence_pages WHERE parent_id = ?1",
+                    params![pid],
+                )?,
+                None => tx.execute(
+                    "DELETE FROM confluence_pages WHERE space_key = ?1 AND parent_id IS NULL",
+                    params![space_key],
+                )?,
+            };
+            let mut stmt = tx.prepare(
+                "INSERT INTO confluence_pages (id, title, has_children, space_key, parent_id, cached_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                 ON CONFLICT(id) DO UPDATE SET
+                   title=excluded.title,
+                   has_children=excluded.has_children,
+                   space_key=excluded.space_key,
+                   parent_id=excluded.parent_id,
+                   cached_at=excluded.cached_at",
+            )?;
+            for p in pages {
+                stmt.execute(params![
+                    p.id, p.title, p.has_children as i64,
+                    space_key, parent_id, now
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_confluence_pages(
+        &self,
+        space_key: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<crate::confluence_api::ConfluencePage>> {
+        let rows: Vec<crate::confluence_api::ConfluencePage> = match parent_id {
+            Some(pid) => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, title, has_children FROM confluence_pages
+                     WHERE parent_id = ?1 ORDER BY title",
+                )?;
+                let v: Vec<_> = stmt.query_map(params![pid], |r| {
+                    Ok(crate::confluence_api::ConfluencePage {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        has_children: r.get::<_, i64>(2)? != 0,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+                v
+            }
+            None => {
+                let mut stmt = self.conn.prepare(
+                    "SELECT id, title, has_children FROM confluence_pages
+                     WHERE space_key = ?1 AND parent_id IS NULL ORDER BY title",
+                )?;
+                let v: Vec<_> = stmt.query_map(params![space_key], |r| {
+                    Ok(crate::confluence_api::ConfluencePage {
+                        id: r.get(0)?,
+                        title: r.get(1)?,
+                        has_children: r.get::<_, i64>(2)? != 0,
+                    })
+                })?
+                .filter_map(|r| r.ok())
+                .collect();
+                v
+            }
+        };
+        Ok(rows)
+    }
+
+    /// Seconds since the oldest cached row for this (space, parent) slot. None = not cached.
+    pub fn confluence_pages_age_secs(
+        &self,
+        space_key: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Option<u64>> {
+        let oldest: Option<i64> = match parent_id {
+            Some(pid) => self
+                .conn
+                .query_row(
+                    "SELECT MIN(cached_at) FROM confluence_pages WHERE parent_id = ?1",
+                    params![pid],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten(),
+            None => self
+                .conn
+                .query_row(
+                    "SELECT MIN(cached_at) FROM confluence_pages WHERE space_key = ?1 AND parent_id IS NULL",
+                    params![space_key],
+                    |r| r.get(0),
+                )
+                .ok()
+                .flatten(),
+        };
+        Ok(oldest.map(|t| (chrono::Utc::now().timestamp() - t).max(0) as u64))
     }
 
     pub fn record_notification(&self, kind: &str, key: &str, msg: &str) -> Result<()> {
