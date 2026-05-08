@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 use clap::Parser;
 use jui_core::cache::Cache;
 use jui_core::confluence_api::ConfluenceApi;
@@ -64,10 +65,20 @@ impl State {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Append to /tmp/jui.log alongside stderr. The non-blocking writer needs its
+    // _guard to live for the program's lifetime to flush on shutdown.
+    let file = tracing_appender::rolling::never("/tmp", "jui.log");
+    let (file_writer, _guard) = tracing_appender::non_blocking(file);
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,jui_daemon=debug,jui_core=debug")),
+        )
+        .with_writer(file_writer.and(std::io::stderr))
+        .with_ansi(false)
         .init();
+    // Keep the guard alive for the lifetime of the process.
+    Box::leak(Box::new(_guard));
     let _args = Args::parse();
     paths::ensure_dirs()?;
 
@@ -143,6 +154,12 @@ async fn main() -> Result<()> {
     {
         let state = state.clone();
         tokio::spawn(async move { poll_loop(state).await });
+    }
+
+    // Background warmup of ticket parent chains for Tree mode (every hour).
+    {
+        let state = state.clone();
+        tokio::spawn(async move { ancestor_warmup_loop(state).await });
     }
 
     // Tmux status writer.
@@ -261,6 +278,12 @@ async fn dispatch(
                 }
             }
             Ok(Response::Tickets { items: tickets })
+        }
+
+        Request::GetTicketsWithAncestors { keys } => {
+            let cache = state.cache.lock().await;
+            let items = cache.tickets_with_ancestors(&keys)?;
+            Ok(Response::Tickets { items })
         }
 
         Request::GetTicket { key } => {
@@ -533,6 +556,68 @@ async fn dispatch(
             Ok(Response::Created { key })
         }
 
+        Request::DeleteTicket { key } => {
+            // jira-cli's `issue delete` is interactive and rejects --no-input, so
+            // use the REST endpoint directly.
+            let api = JiraApi::from_jira_cli_config()?;
+            api.delete_issue(&key).await?;
+            let _ = state.cache.lock().await.delete_ticket(&key);
+            tracing::info!(%key, "deleted ticket");
+            Ok(Response::Ok)
+        }
+
+        Request::ArchiveTicket { key } => {
+            // List the ticket's transitions, pick the first archive-like one, fire it.
+            let api = JiraApi::from_jira_cli_config()?;
+            let items = api.list_transitions(&key).await?;
+            let prefs = ["archive", "won't do", "wont do", "cancelled", "canceled", "closed", "done"];
+            let target = prefs.iter().find_map(|want| {
+                items.iter().find(|tr| {
+                    tr.to_status
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case(want))
+                        .unwrap_or(false)
+                        || tr.name.to_ascii_lowercase().contains(want)
+                })
+            });
+            let Some(tr) = target else {
+                let names: Vec<String> = items.iter().map(|t| {
+                    format!("{} → {}", t.name, t.to_status.clone().unwrap_or_default())
+                }).collect();
+                return Ok(Response::Err {
+                    message: format!(
+                        "no archive-like transition for {key}. available: {}",
+                        names.join(", ")
+                    ),
+                });
+            };
+            state.jira.transition(&key, &tr.name).await?;
+            tracing::info!(%key, transition = %tr.name, "archived ticket");
+            // Drop from local cache; refresh will re-add if it still appears in JQL.
+            let _ = state.cache.lock().await.delete_ticket(&key);
+            Ok(Response::Ok)
+        }
+
+        Request::AssignTicket { key, assignee } => {
+            // The picker hands us a Jira account id, which jira-cli's `issue assign`
+            // rejects on Cloud. Use the REST endpoint instead. Falls back to jira-cli
+            // if the value doesn't look like an account id (e.g. user typed an email).
+            let looks_like_account_id = assignee.contains(':') || assignee.len() >= 24;
+            if looks_like_account_id {
+                let api = JiraApi::from_jira_cli_config()?;
+                api.set_assignee(&key, &assignee).await?;
+            } else {
+                state.jira.assign(&key, &assignee).await?;
+            }
+            Ok(Response::Ok)
+        }
+
+        Request::SetReviewer { key, assignee_id } => {
+            let api = JiraApi::from_jira_cli_config()?;
+            api.set_reviewer(&key, &assignee_id, &state.config.jira.reviewer_customfield).await?;
+            Ok(Response::Ok)
+        }
+
         Request::EditSummary { key, summary } => {
             state.jira.edit_summary(&key, &summary).await?;
             Ok(Response::Ok)
@@ -685,18 +770,95 @@ async fn warm_confluence_cache(state: &State) {
         return;
     }
     info!(count = spaces.len(), "confluence spaces cached");
+    // Recursive walk: for each space, fetch root pages → for each, fetch children
+    // → repeat until depth cap. Uses a BFS so we can rate-limit between API calls.
+    const MAX_DEPTH: usize = 4;
     for space in &spaces {
-        match api.list_pages(&space.key).await {
-            Ok(pages) => {
-                if let Err(e) = state.cache.lock().await.upsert_confluence_pages(&space.key, None, &pages) {
-                    warn!(space = %space.key, "storing confluence pages: {e:#}");
-                } else {
-                    info!(space = %space.key, count = pages.len(), "confluence root pages cached");
+        let roots = match api.list_pages(&space.key).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(space = %space.key, "confluence pages warmup failed: {e:#}");
+                continue;
+            }
+        };
+        if let Err(e) = state.cache.lock().await.upsert_confluence_pages(&space.key, None, &roots) {
+            warn!(space = %space.key, "storing root pages: {e:#}");
+            continue;
+        }
+        let mut total = roots.len();
+        let mut frontier: Vec<(String, usize)> =
+            roots.iter().filter(|p| p.has_children).map(|p| (p.id.clone(), 1)).collect();
+        while let Some((pid, depth)) = frontier.pop() {
+            if depth > MAX_DEPTH { continue; }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            match api.get_children(&pid).await {
+                Ok(children) => {
+                    if let Err(e) = state.cache.lock().await
+                        .upsert_confluence_pages(&space.key, Some(&pid), &children)
+                    {
+                        warn!(parent = %pid, "storing children: {e:#}");
+                        continue;
+                    }
+                    total += children.len();
+                    for c in &children {
+                        if c.has_children { frontier.push((c.id.clone(), depth + 1)); }
+                    }
+                }
+                Err(e) => warn!(parent = %pid, "fetching children failed: {e:#}"),
+            }
+        }
+        info!(space = %space.key, total, "confluence pages cached (recursive)");
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Walk parent_key chains for every cached ticket and store the ancestors in cache,
+/// so that Tree mode can read everything from SQLite without hitting Jira live.
+async fn warm_ticket_ancestors(state: &State) {
+    use std::collections::HashSet;
+    // Pull every cached ticket and ALSO replace its row with the rich `view`
+    // payload (description, subtasks, time tracking, custom fields) so detail-open
+    // is a cache hit. Then walk parent chains for ancestors.
+    let initial = match state.cache.lock().await.list_tickets(10_000) {
+        Ok(t) => t,
+        Err(e) => { warn!("ancestor warmup: list_tickets failed: {e:#}"); return; }
+    };
+    let initial_keys: Vec<String> = initial.iter().map(|t| t.key.clone()).collect();
+    let mut seen: HashSet<String> = initial_keys.iter().cloned().collect();
+    let mut queue: Vec<String> = initial_keys.clone();
+    let mut fetched = 0usize;
+    let mut ancestors_added = 0usize;
+    while let Some(key) = queue.pop() {
+        let was_initial = initial_keys.iter().any(|k| k == &key);
+        match state.jira.view(&key).await {
+            Ok(t) => {
+                let next = t.parent_key.clone();
+                if let Err(e) = state.cache.lock().await.upsert_tickets(std::slice::from_ref(&t)) {
+                    warn!(key = %key, "cache upsert failed: {e:#}");
+                }
+                fetched += 1;
+                if !was_initial { ancestors_added += 1; }
+                if let Some(n) = next {
+                    if seen.insert(n.clone()) { queue.push(n); }
                 }
             }
-            Err(e) => warn!(space = %space.key, "confluence pages warmup failed: {e:#}"),
+            Err(e) => warn!(key = %key, "view failed: {e:#}"),
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        // Be polite to the Jira API.
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    info!(fetched, ancestors_added, "ticket warmup complete");
+}
+
+async fn ancestor_warmup_loop(state: Arc<State>) {
+    // Initial run after a small delay so login / refresh have happened.
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    warm_ticket_ancestors(&state).await;
+    let mut iv = interval(Duration::from_secs(3600)); // 1 hour
+    iv.tick().await; // skip the immediate tick — we just ran above.
+    loop {
+        iv.tick().await;
+        warm_ticket_ancestors(&state).await;
     }
 }
 
