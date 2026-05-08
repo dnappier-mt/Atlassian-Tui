@@ -16,6 +16,17 @@ pub enum Request {
     Ping,
     ListTickets { jql: Option<String>, limit: u32 },
     GetTicket { key: String },
+    /// Cache-only batch fetch + ancestor walk. Used by Tree mode to avoid N
+    /// individual round-trips. Daemon's hourly warmup task keeps the cache
+    /// populated with parents.
+    GetTicketsWithAncestors { keys: Vec<String> },
+    DeleteTicket { key: String },
+    /// Transition the ticket to a "closed" state. Daemon picks the first available
+    /// transition matching (case-insensitive): Won't Do, Cancelled, Closed, Done.
+    /// Used by the TUI's archive flow when the user lacks delete permission on Jira.
+    ArchiveTicket { key: String },
+    AssignTicket { key: String, assignee: String },
+    SetReviewer { key: String, assignee_id: String },
     Refresh { jql: Option<String> },
     StartWork { key: String, cwd: PathBuf },
     AddComment { key: String, body: String },

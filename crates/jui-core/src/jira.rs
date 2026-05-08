@@ -102,6 +102,11 @@ impl JiraCli {
         Ok(())
     }
 
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        self.run_ok(&["issue", "delete", key, "--no-input"]).await?;
+        Ok(())
+    }
+
     pub async fn create(
         &self,
         project: &str,
@@ -128,7 +133,13 @@ impl JiraCli {
         let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
         let stdout = self.run_ok(&arg_refs).await?;
         // jira-cli prints a confirmation line containing the new key.
-        Ok(crate::scm::extract_ticket_key(&stdout).unwrap_or_default())
+        match crate::scm::extract_ticket_key(&stdout) {
+            Some(k) if !k.is_empty() => Ok(k),
+            _ => Err(anyhow!(
+                "jira-cli reported success but no ticket key found in output:\n{}",
+                stdout.trim()
+            )),
+        }
     }
 
     pub async fn edit_summary(&self, key: &str, summary: &str) -> Result<()> {

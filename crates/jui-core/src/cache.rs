@@ -200,6 +200,32 @@ impl Cache {
         }
     }
 
+    /// For each key in `keys`, return the ticket plus every ancestor reachable via
+    /// `parent_key`, transitively. Cache-only: missing tickets are silently skipped
+    /// so the caller (TUI) shows a partial tree until the daemon's warmup task fills
+    /// the gap. Cycle-safe via a `seen` set.
+    pub fn tickets_with_ancestors(&self, keys: &[String]) -> Result<Vec<Ticket>> {
+        use std::collections::HashSet;
+        let mut out: Vec<Ticket> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = keys.to_vec();
+        while let Some(k) = queue.pop() {
+            if !seen.insert(k.clone()) { continue; }
+            if let Some(t) = self.get_ticket(&k)? {
+                if let Some(pk) = t.parent_key.clone() {
+                    if !seen.contains(&pk) { queue.push(pk); }
+                }
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn delete_ticket(&self, key: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM tickets WHERE key = ?1", [key])?;
+        Ok(())
+    }
+
     pub fn known_keys(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT key FROM tickets")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;

@@ -231,6 +231,114 @@ impl JiraApi {
         ))
     }
 
+    /// Delete an issue via REST. `jira-cli`'s `issue delete` is interactive and
+    /// rejects `--no-input`, so we go straight to the API.
+    pub async fn delete_issue(&self, key: &str) -> Result<()> {
+        let token = std::env::var("JIRA_API_TOKEN")
+            .context("JIRA_API_TOKEN not set; needed to delete")?;
+        let url = format!("{}/rest/api/3/issue/{}", self.server, key);
+        let out = Command::new("curl")
+            .args([
+                "-sS", "--fail-with-body",
+                "-X", "DELETE",
+                "-H", "Accept: application/json",
+                "-u", &format!("{}:{}", self.login, token),
+                &url,
+            ])
+            .output()
+            .await
+            .context("invoking curl")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "DELETE /issue/{key} failed: {}{}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Assign `key` to `account_id` via REST. jira-cli's `issue assign` expects a
+    /// display name / email and rejects account IDs on Cloud, so we go straight to
+    /// `PUT /rest/api/3/issue/{key}/assignee`.
+    pub async fn set_assignee(&self, key: &str, account_id: &str) -> Result<()> {
+        let token = std::env::var("JIRA_API_TOKEN")
+            .context("JIRA_API_TOKEN not set; needed to assign")?;
+        let url = format!("{}/rest/api/3/issue/{}/assignee", self.server, key);
+        let body = serde_json::json!({ "accountId": account_id }).to_string();
+        let out = Command::new("curl")
+            .args([
+                "-sS", "--fail-with-body",
+                "-X", "PUT",
+                "-H", "Accept: application/json",
+                "-H", "Content-Type: application/json",
+                "-u", &format!("{}:{}", self.login, token),
+                "--data", &body,
+                &url,
+            ])
+            .output()
+            .await
+            .context("invoking curl")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "PUT /assignee failed: {}{}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Set a "reviewer" custom field on `key` to `account_id`.
+    /// Reviewer fields vary per site (single-user, multi-user, server-style with name)
+    /// — try the three most common shapes and return on the first success.
+    pub async fn set_reviewer(&self, key: &str, account_id: &str, field_id: &str) -> Result<()> {
+        let token = std::env::var("JIRA_API_TOKEN")
+            .context("JIRA_API_TOKEN not set; needed to set reviewer")?;
+        let url = format!("{}/rest/api/3/issue/{}", self.server, key);
+        let bodies = [
+            // Bare-string accountId (legacy userpicker custom fields on Cloud)
+            serde_json::json!({ "fields": { field_id: account_id } }),
+            // Single-user picker, accountId object
+            serde_json::json!({ "fields": { field_id: { "accountId": account_id } } }),
+            // Multi-user picker
+            serde_json::json!({ "fields": { field_id: [{ "accountId": account_id }] } }),
+            // Server-style (name = username)
+            serde_json::json!({ "fields": { field_id: { "name": account_id } } }),
+            // "update" wrapper, occasionally required
+            serde_json::json!({ "update": { field_id: [{ "set": { "accountId": account_id } }] } }),
+        ];
+        let mut last_err: Option<String> = None;
+        for body in &bodies {
+            let body_str = serde_json::to_string(body)?;
+            let out = Command::new("curl")
+                .args([
+                    "-sS", "--fail-with-body",
+                    "-X", "PUT",
+                    "-H", "Accept: application/json",
+                    "-H", "Content-Type: application/json",
+                    "-u", &format!("{}:{}", self.login, token),
+                    "--data", &body_str,
+                    &url,
+                ])
+                .output()
+                .await
+                .context("invoking curl")?;
+            if out.status.success() {
+                return Ok(());
+            }
+            last_err = Some(format!(
+                "shape {body_str}: {}{}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+            ));
+        }
+        Err(anyhow!(
+            "all reviewer PUT shapes rejected (field={field_id}) — {}",
+            last_err.unwrap_or_default()
+        ))
+    }
+
     /// Set the original (and optionally remaining) estimate via REST PUT.
     /// Values are Jira-style strings like "8h" or "2d 4h".
     pub async fn set_estimate(

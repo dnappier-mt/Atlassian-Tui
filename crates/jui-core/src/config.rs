@@ -31,11 +31,21 @@ pub struct JiraConfig {
     /// Default JQL filter for "my work" view.
     #[serde(default = "default_my_jql")]
     pub my_jql: String,
+    /// Custom-field id for the "reviewer" field. Varies per Jira instance —
+    /// `customfield_10015` ("Code Reviewer") is the default on Atlassian Cloud.
+    /// Override per site in `~/.config/jui/config.toml`:
+    /// `[jira] reviewer_customfield = "customfield_10100"`.
+    #[serde(default = "default_reviewer_field")]
+    pub reviewer_customfield: String,
 }
 
 impl Default for JiraConfig {
     fn default() -> Self {
-        Self { binary: None, my_jql: default_my_jql() }
+        Self {
+            binary: None,
+            my_jql: default_my_jql(),
+            reviewer_customfield: default_reviewer_field(),
+        }
     }
 }
 
@@ -43,6 +53,10 @@ fn default_my_jql() -> String {
     // No ORDER BY here — jira-cli's `--paginate` flag rejects it. Sorting is requested
     // separately via `--order-by` / `--reverse` in the search call.
     "assignee = currentUser() AND statusCategory != Done".to_string()
+}
+
+fn default_reviewer_field() -> String {
+    "customfield_10015".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
