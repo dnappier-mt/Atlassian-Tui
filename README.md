@@ -4,7 +4,7 @@ A keyboard-driven Jira + Confluence client that lives in your terminal. `jui`
 ties tickets to your local git checkouts, runs Claude Code with a per-ticket
 session, and keeps a hot SQLite cache so navigation feels instant.
 
-> Setup, install, and configuration live in a separate doc (link TBD).
+> **Setup, install, and configuration** live in [docs/setup.md](docs/setup.md).
 > This README focuses on **what jui does** and **how to drive it**.
 
 ---
