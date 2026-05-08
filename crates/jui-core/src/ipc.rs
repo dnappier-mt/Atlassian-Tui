@@ -25,6 +25,28 @@ pub enum Request {
     /// comments — and is *not* the assignee. Daemon issues both queries and
     /// returns them tagged so the TUI can render `[R]` vs `[@]` badges.
     ListMyMentions,
+    /// Open a GitHub PR for the worktree associated with `ticket_key`.
+    /// Reviewer + DevQA are Jira account ids; daemon resolves them to GitHub
+    /// handles via the persistent users map. Submits the PR, requests the
+    /// reviewer on GitHub, posts a Jira comment, and transitions the ticket
+    /// to "Code Review".
+    CreatePullRequest {
+        ticket_key: String,
+        title: String,
+        body: String,
+        reviewer_account_id: Option<String>,
+        devqa_account_id: Option<String>,
+    },
+    /// Persist a Jira `account_id` → GitHub handle mapping. Used when the user
+    /// picks a teammate in the PR-create modal who isn't yet in the map.
+    SetGithubHandle { account_id: String, handle: String },
+    /// Lookup a single mapping. Returns `Response::GithubHandle { handle }` —
+    /// `handle` empty when not in the map.
+    GetGithubHandle { account_id: String },
+    /// Cached PR comments for the given Jira ticket (only present when the
+    /// ticket is associated with an open PR — daemon populates during the
+    /// github-mentions refresh).
+    ListPrComments { ticket_key: String },
     DeleteTicket { key: String },
     /// Transition the ticket to a "closed" state. Daemon picks the first available
     /// transition matching (case-insensitive): Won't Do, Cancelled, Closed, Done.
@@ -94,9 +116,19 @@ pub enum Request {
 pub enum Response {
     Pong,
     Tickets { items: Vec<Ticket> },
-    /// Pair of result lists for `ListMyMentions`. Reviewer takes precedence on
-    /// overlap; daemon dedupes by key before returning.
-    MyMentions { reviewing: Vec<Ticket>, mentioned: Vec<Ticket> },
+    /// Result lists for `ListMyMentions`. Reviewer wins over GitHub wins over
+    /// Mentioned on overlap; daemon dedupes by key before returning.
+    MyMentions {
+        reviewing: Vec<Ticket>,
+        mentioned: Vec<Ticket>,
+        github: Vec<Ticket>,
+    },
+    /// Reply for `CreatePullRequest`.
+    PullRequestCreated { url: String, number: u64 },
+    /// Reply for `GetGithubHandle`. Empty string == no mapping.
+    GithubHandle { handle: String },
+    /// Reply for `ListPrComments`.
+    PrComments { items: Vec<crate::github::PrComment> },
     Ticket { ticket: Ticket },
     StartWork { reply: StartWorkReply },
     Created { key: String },

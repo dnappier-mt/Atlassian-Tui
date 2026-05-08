@@ -111,6 +111,45 @@ pub enum Mode {
     /// Done — daemon picks the first available). Replaces an earlier delete flow
     /// that was rejected by Jira with HTTP 403 on most accounts.
     ArchiveConfirm(ArchiveConfirmForm),
+    /// Open a GitHub PR for the current ticket: title + body + Reviewer + DevQA
+    /// pickers + a final `gh pr create` step that comments back on the Jira
+    /// ticket and transitions it to Code Review.
+    PrCreate(PrCreateForm),
+}
+
+pub struct PrCreateForm {
+    pub key: String,
+    pub title: String,
+    pub body: String,
+    /// Reviewer picker state.
+    pub reviewer_query: String,
+    pub reviewer_results: Vec<(String, String)>,
+    pub reviewer: Option<(String, String)>,
+    pub reviewer_picker_selected: usize,
+    /// DevQA picker state.
+    pub devqa_query: String,
+    pub devqa_results: Vec<(String, String)>,
+    pub devqa: Option<(String, String)>,
+    pub devqa_picker_selected: usize,
+    /// 0=title, 1=body, 2=reviewer, 3=devqa
+    pub field: u8,
+    pub busy: bool,
+    pub error: Option<String>,
+    /// Set when the daemon needs a github handle for a picked Jira user.
+    /// While `Some`, the modal collects the handle and submits via
+    /// `Request::SetGithubHandle`, then re-tries.
+    pub pending_handle: Option<PendingHandle>,
+}
+
+#[derive(Clone)]
+pub struct PendingHandle {
+    pub account_id: String,
+    pub display_name: String,
+    pub handle: String,
+}
+
+impl PrCreateForm {
+    pub const FIELD_COUNT: u8 = 4;
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -351,11 +390,12 @@ pub enum DetailOrigin {
 
 /// Why a ticket is showing in the bottom List section / has a non-default badge
 /// in Tree mode. Order matters: when a ticket would qualify for multiple roles,
-/// prefer the more specific one (`Assigned` > `Reviewer` > `Mentioned`).
+/// prefer the more specific one (`Assigned` > `Reviewer` > `Github` > `Mentioned`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum MentionRole {
     Assigned,
     Reviewer,
+    Github,
     Mentioned,
 }
 
@@ -374,6 +414,7 @@ pub enum DetailFocus {
     Projects,
     Subtasks,
     Comments,
+    PrComments,
 }
 
 impl DetailFocus {
@@ -382,15 +423,17 @@ impl DetailFocus {
             Self::Info => Self::Projects,
             Self::Projects => Self::Subtasks,
             Self::Subtasks => Self::Comments,
-            Self::Comments => Self::Info,
+            Self::Comments => Self::PrComments,
+            Self::PrComments => Self::Info,
         }
     }
     pub fn prev(self) -> Self {
         match self {
-            Self::Info => Self::Comments,
+            Self::Info => Self::PrComments,
             Self::Projects => Self::Info,
             Self::Subtasks => Self::Projects,
             Self::Comments => Self::Subtasks,
+            Self::PrComments => Self::Comments,
         }
     }
 }
@@ -530,8 +573,15 @@ pub struct App {
     pub my_display_name: Option<String>,
     /// Tickets where the user is the reviewer (configured custom field).
     pub reviewing_tickets: Vec<Ticket>,
-    /// Tickets where the user has been @-mentioned (text-indexed). Disjoint
-    /// from `reviewing_tickets`; daemon dedupes.
+    /// Tickets associated with PRs the user has been requested to review on
+    /// GitHub (or @-mentioned on a PR). Sourced via the `gh` CLI.
+    pub github_tickets: Vec<Ticket>,
+    /// PR comments for the currently-displayed Detail ticket. Empty unless the
+    /// ticket is tied to a GitHub PR.
+    pub pr_comments: Vec<jui_core::github::PrComment>,
+    pub pr_comment_selected: usize,
+    /// Tickets where the user has been @-mentioned in Jira text (description /
+    /// comments). Disjoint from `reviewing_tickets` and `github_tickets`.
     pub mentioned_tickets: Vec<Ticket>,
     /// Selection index across the **combined** Reviewer + Mentioned list when
     /// the bottom section of the List view is focused.
@@ -621,6 +671,9 @@ impl App {
             my_account_id: None,
             my_display_name: None,
             reviewing_tickets: Vec::new(),
+            github_tickets: Vec::new(),
+            pr_comments: Vec::new(),
+            pr_comment_selected: 0,
             mentioned_tickets: Vec::new(),
             mentioned_selected: 0,
             list_focus: ListFocus::Active,
@@ -673,10 +726,13 @@ impl App {
     pub async fn refresh_mentioned(&mut self) -> Result<()> {
         let mut s = ipc::connect().await?;
         match ipc::send_request(&mut s, &Request::ListMyMentions).await? {
-            Response::MyMentions { reviewing, mentioned } => {
+            Response::MyMentions { reviewing, mentioned, github } => {
                 self.reviewing_tickets = reviewing;
+                self.github_tickets = github;
                 self.mentioned_tickets = mentioned;
-                let total = self.reviewing_tickets.len() + self.mentioned_tickets.len();
+                let total = self.reviewing_tickets.len()
+                    + self.github_tickets.len()
+                    + self.mentioned_tickets.len();
                 if self.mentioned_selected >= total {
                     self.mentioned_selected = total.saturating_sub(1);
                 }
@@ -690,9 +746,13 @@ impl App {
     /// Combined reviewer + mentioned list, in the order the bottom List section
     /// renders them (reviewer rows first). `(role, ticket)` tuples.
     pub fn combined_mentions(&self) -> Vec<(MentionRole, &Ticket)> {
-        let mut out: Vec<(MentionRole, &Ticket)> =
-            Vec::with_capacity(self.reviewing_tickets.len() + self.mentioned_tickets.len());
+        let mut out: Vec<(MentionRole, &Ticket)> = Vec::with_capacity(
+            self.reviewing_tickets.len()
+                + self.github_tickets.len()
+                + self.mentioned_tickets.len(),
+        );
         for t in &self.reviewing_tickets { out.push((MentionRole::Reviewer, t)); }
+        for t in &self.github_tickets { out.push((MentionRole::Github, t)); }
         for t in &self.mentioned_tickets  { out.push((MentionRole::Mentioned, t)); }
         out
     }
@@ -890,13 +950,16 @@ impl App {
             Mode::List => match self.list_focus {
                 ListFocus::Active => (&self.active_idxs, self.list_selected),
                 ListFocus::Mentioned => {
-                    // Reviewer rows come first, then mentioned. Index across both.
+                    // Reviewer → GitHub → Mentioned. Index across all three.
                     let r = self.reviewing_tickets.len();
+                    let g = self.github_tickets.len();
                     let i = self.mentioned_selected;
                     return if i < r {
                         self.reviewing_tickets.get(i)
+                    } else if i < r + g {
+                        self.github_tickets.get(i - r)
                     } else {
-                        self.mentioned_tickets.get(i - r)
+                        self.mentioned_tickets.get(i - r - g)
                     };
                 }
             },
@@ -1093,7 +1156,7 @@ impl App {
         let mut s = ipc::connect().await?;
         if let Response::TicketProjects { items } = ipc::send_request(
             &mut s,
-            &Request::ListTicketProjects { ticket_key: key },
+            &Request::ListTicketProjects { ticket_key: key.clone() },
         )
         .await?
         {
@@ -1105,6 +1168,19 @@ impl App {
             self.linked_project_selected = self
                 .linked_project_selected
                 .min(self.detail_linked_projects.len().saturating_sub(1));
+        }
+        // PR comments — only present when the daemon's github-mentions refresh
+        // has tied this ticket to a PR. Empty otherwise.
+        let mut s = ipc::connect().await?;
+        if let Ok(Response::PrComments { items }) =
+            ipc::send_request(&mut s, &Request::ListPrComments { ticket_key: key }).await
+        {
+            self.pr_comments = items;
+            self.pr_comment_selected =
+                self.pr_comment_selected.min(self.pr_comments.len().saturating_sub(1));
+        } else {
+            self.pr_comments.clear();
+            self.pr_comment_selected = 0;
         }
         Ok(())
     }
@@ -2066,6 +2142,179 @@ impl App {
         Ok(())
     }
 
+    pub async fn open_pr_create(&mut self) -> Result<()> {
+        let Some(t) = self.detail.as_ref() else { return Ok(()) };
+        let title = format!("{}: {}", t.key, t.summary);
+        let body = String::from(
+            "## Summary\n\n- \n\n## Test plan\n\n- [ ] \n",
+        );
+        self.mode = Mode::PrCreate(PrCreateForm {
+            key: t.key.clone(),
+            title,
+            body,
+            reviewer_query: String::new(),
+            reviewer_results: Vec::new(),
+            reviewer: None,
+            reviewer_picker_selected: 0,
+            devqa_query: String::new(),
+            devqa_results: Vec::new(),
+            devqa: None,
+            devqa_picker_selected: 0,
+            field: 0,
+            busy: false,
+            error: None,
+            pending_handle: None,
+        });
+        Ok(())
+    }
+
+    pub async fn refresh_pr_picker(&mut self, target_reviewer: bool) -> Result<()> {
+        let q = if let Mode::PrCreate(f) = &self.mode {
+            if target_reviewer { f.reviewer_query.clone() } else { f.devqa_query.clone() }
+        } else { return Ok(()); };
+        let mut s = ipc::connect().await?;
+        if let Ok(Response::Users { items, .. }) =
+            ipc::send_request(&mut s, &Request::SearchUsers { query: q }).await
+        {
+            if let Mode::PrCreate(f) = &mut self.mode {
+                let results: Vec<(String, String)> =
+                    items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+                if target_reviewer {
+                    f.reviewer_results = results;
+                    f.reviewer_picker_selected = 0;
+                } else {
+                    f.devqa_results = results;
+                    f.devqa_picker_selected = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn submit_pr_create(&mut self) -> Result<()> {
+        // Snapshot all the form data we need so we can hold a `&mut self`
+        // borrow during the async call without colliding with reads of
+        // `self.mode`.
+        let snapshot = if let Mode::PrCreate(form) = &self.mode {
+            Some((
+                form.key.clone(),
+                form.title.clone(),
+                form.body.clone(),
+                form.reviewer.as_ref().map(|(_, id)| id.clone()),
+                form.devqa.as_ref().map(|(_, id)| id.clone()),
+            ))
+        } else { None };
+        let Some((key, title, body, reviewer_id, devqa_id)) = snapshot else { return Ok(()) };
+        if title.trim().is_empty() {
+            if let Mode::PrCreate(f) = &mut self.mode {
+                f.error = Some("title is required".into());
+            }
+            return Ok(());
+        }
+        if let Mode::PrCreate(f) = &mut self.mode {
+            f.busy = true;
+            f.error = None;
+        }
+        let req = Request::CreatePullRequest {
+            ticket_key: key,
+            title,
+            body,
+            reviewer_account_id: reviewer_id,
+            devqa_account_id: devqa_id,
+        };
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(&mut s, &req).await;
+        match resp {
+            Ok(Response::PullRequestCreated { url, number }) => {
+                self.status = format!("PR #{number} opened: {url}");
+                self.mode = Mode::Detail;
+                self.load_detail().await?;
+            }
+            Ok(Response::Err { message }) => {
+                // Detect "no GitHub handle mapped" and offer to set it inline.
+                let needs_handle = message.contains("no GitHub handle mapped");
+                if needs_handle {
+                    // Re-borrow the form to pick the right user.
+                    let target = if let Mode::PrCreate(f) = &self.mode {
+                        if message.contains("reviewer") { f.reviewer.clone() }
+                        else if message.contains("DevQA") { f.devqa.clone() }
+                        else { None }
+                    } else { None };
+                    if let Some((display, id)) = target {
+                        if let Mode::PrCreate(f) = &mut self.mode {
+                            f.pending_handle = Some(PendingHandle {
+                                account_id: id,
+                                display_name: display,
+                                handle: String::new(),
+                            });
+                            f.busy = false;
+                            f.error = None;
+                            return Ok(());
+                        }
+                    }
+                }
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.error = Some(message);
+                    f.busy = false;
+                }
+            }
+            Ok(_) => {
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.error = Some("unexpected daemon response".into());
+                    f.busy = false;
+                }
+            }
+            Err(e) => {
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.error = Some(format!("{e:#}"));
+                    f.busy = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist the just-typed GitHub handle for the pending Jira user, then
+    /// retry the PR submission.
+    pub async fn submit_pending_handle(&mut self) -> Result<()> {
+        let pending = if let Mode::PrCreate(f) = &self.mode {
+            f.pending_handle.clone()
+        } else { return Ok(()); };
+        let Some(p) = pending else { return Ok(()) };
+        if p.handle.trim().is_empty() {
+            if let Mode::PrCreate(f) = &mut self.mode {
+                f.error = Some("enter a GitHub handle (no leading @)".into());
+            }
+            return Ok(());
+        }
+        let mut s = ipc::connect().await?;
+        match ipc::send_request(
+            &mut s,
+            &Request::SetGithubHandle {
+                account_id: p.account_id.clone(),
+                handle: p.handle.clone(),
+            },
+        )
+        .await?
+        {
+            Response::Ok => {
+                if let Mode::PrCreate(f) = &mut self.mode { f.pending_handle = None; }
+                self.submit_pr_create().await?;
+            }
+            Response::Err { message } => {
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.error = Some(format!("set handle: {message}"));
+                }
+            }
+            _ => {
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.error = Some("unexpected response".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Build a tree of the user's tickets walking up parent_key chains. The daemon
     /// serves the full set (mine + ancestors) from its SQLite cache in a single IPC
     /// call — the daemon's hourly warmup task keeps the cache populated.
@@ -2083,22 +2332,30 @@ impl App {
             .map(|t| t.key.clone())
             .filter(|k| !assigned.contains(k))
             .collect();
-        let mentioned: HashSet<String> = self
-            .mentioned_tickets
+        let github: HashSet<String> = self
+            .github_tickets
             .iter()
             .map(|t| t.key.clone())
             .filter(|k| !assigned.contains(k) && !reviewer.contains(k))
             .collect();
+        let mentioned: HashSet<String> = self
+            .mentioned_tickets
+            .iter()
+            .map(|t| t.key.clone())
+            .filter(|k| !assigned.contains(k) && !reviewer.contains(k) && !github.contains(k))
+            .collect();
         let role_for = |k: &str| -> Option<MentionRole> {
             if assigned.contains(k) { Some(MentionRole::Assigned) }
             else if reviewer.contains(k) { Some(MentionRole::Reviewer) }
+            else if github.contains(k) { Some(MentionRole::Github) }
             else if mentioned.contains(k) { Some(MentionRole::Mentioned) }
             else { None }
         };
-        // Union seed: every ticket from any of the three sources.
+        // Union seed: every ticket from any of the four sources.
         let mut seed: Vec<String> = Vec::new();
         seed.extend(assigned.iter().cloned());
         seed.extend(reviewer.iter().cloned());
+        seed.extend(github.iter().cloned());
         seed.extend(mentioned.iter().cloned());
 
         self.status = "loading tree…".into();
@@ -2801,19 +3058,8 @@ pub fn is_ticket_started(t: &Ticket) -> bool {
     // Worktree probe — local truth, useful when the user resumed a ticket the daemon
     // hasn't transitioned (or the Jira workflow uses non-standard status names).
     if let Ok(cwd) = std::env::current_dir() {
-        let repo = jui_core::scm::detect(&cwd);
-        if matches!(repo.kind, jui_core::scm::ScmKind::Git) {
-            let slug = t.branch_slug();
-            let repo_name = repo
-                .root
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("repo");
-            let parent = repo.root.parent().unwrap_or(&repo.root);
-            let path = parent.join(format!("{}-worktrees", repo_name)).join(&slug);
-            if path.exists() {
-                return true;
-            }
+        if let Some(path) = jui_core::scm::worktree_path_for_slug(&cwd, &t.branch_slug()) {
+            if path.exists() { return true; }
         }
     }
     false
@@ -3823,6 +4069,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             | Mode::ConfluenceSpaces(_)
             | Mode::ConfluencePages(_)
             | Mode::AssignPicker(_)
+            | Mode::PrCreate(_)
     );
     if !in_text_input && matches!(code, KeyCode::Char('?')) {
         app.show_help = true;
@@ -3846,7 +4093,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     }
                 }
                 ListFocus::Mentioned => {
-                    let n = app.reviewing_tickets.len() + app.mentioned_tickets.len();
+                    let n = app.reviewing_tickets.len()
+                        + app.github_tickets.len()
+                        + app.mentioned_tickets.len();
                     if n > 0 {
                         app.mentioned_selected = (app.mentioned_selected + 1).min(n - 1);
                     }
@@ -4203,13 +4452,27 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             if !matches!(code, KeyCode::Char('d')) {
                 app.pending_delete = None;
             }
-            // Tab cycles focus regardless of which pane is active.
-            if matches!(code, KeyCode::Tab) {
-                app.detail_focus = app.detail_focus.next();
-                return Ok(());
-            }
-            if matches!(code, KeyCode::BackTab) {
-                app.detail_focus = app.detail_focus.prev();
+            // Tab cycles focus regardless of which pane is active. Skip panes
+            // that aren't visible for the current ticket: Subtasks pane is
+            // hidden when the ticket is itself a sub-task; PrComments pane is
+            // hidden when there are no GitHub PR comments cached for this
+            // ticket.
+            if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
+                let is_subtask = app.detail.as_ref()
+                    .and_then(|t| t.issue_type.as_deref())
+                    .map(|x| x.eq_ignore_ascii_case("sub-task") || x.eq_ignore_ascii_case("subtask"))
+                    .unwrap_or(false);
+                let pr_visible = !app.pr_comments.is_empty();
+                let backwards = matches!(code, KeyCode::BackTab);
+                for _ in 0..6 {
+                    app.detail_focus = if backwards { app.detail_focus.prev() } else { app.detail_focus.next() };
+                    let ok = match app.detail_focus {
+                        DetailFocus::Subtasks if is_subtask => false,
+                        DetailFocus::PrComments if !pr_visible => false,
+                        _ => true,
+                    };
+                    if ok { break; }
+                }
                 return Ok(());
             }
             // Esc / q: pop the back-stack if we have one, otherwise fall back to
@@ -4316,6 +4579,48 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.open_assign_picker(AssignPurpose::Assignee).await?;
                     return Ok(());
                 }
+                KeyCode::Char('P') => {
+                    app.open_pr_create().await?;
+                    return Ok(());
+                }
+                KeyCode::Char('Q') => {
+                    // Transition the current ticket to "Dev QA In Progress".
+                    // Used when starting a DevQA pass on someone else's PR.
+                    let key = match &app.detail { Some(t) => t.key.clone(), None => return Ok(()) };
+                    let mut s = ipc::connect().await?;
+                    let resp = ipc::send_request(
+                        &mut s,
+                        &Request::ListTransitions { key: key.clone() },
+                    )
+                    .await?;
+                    let target = if let Response::Transitions { items } = resp {
+                        items
+                            .iter()
+                            .find(|tr| {
+                                tr.to_status
+                                    .as_deref()
+                                    .map(|s| s.eq_ignore_ascii_case("dev qa in progress"))
+                                    .unwrap_or(false)
+                                    || tr.name.to_ascii_lowercase().contains("dev qa in progress")
+                            })
+                            .cloned()
+                    } else {
+                        None
+                    };
+                    let Some(tr) = target else {
+                        app.status = format!("no 'Dev QA In Progress' transition for {key}");
+                        return Ok(());
+                    };
+                    let mut s = ipc::connect().await?;
+                    let _ = ipc::send_request(
+                        &mut s,
+                        &Request::Transition { key: key.clone(), to: tr.name.clone() },
+                    )
+                    .await;
+                    app.status = format!("{key} → Dev QA In Progress");
+                    app.load_detail().await?;
+                    return Ok(());
+                }
                 KeyCode::Char('R') => {
                     app.open_assign_picker(AssignPurpose::Reviewer).await?;
                     return Ok(());
@@ -4344,6 +4649,21 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 DetailFocus::Comments => {
                     detail_comments_keys(app, code, mods).await?;
+                    return Ok(());
+                }
+                DetailFocus::PrComments => {
+                    match code {
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if !app.pr_comments.is_empty() {
+                                app.pr_comment_selected =
+                                    (app.pr_comment_selected + 1).min(app.pr_comments.len() - 1);
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            app.pr_comment_selected = app.pr_comment_selected.saturating_sub(1);
+                        }
+                        _ => {}
+                    }
                     return Ok(());
                 }
                 DetailFocus::Info => {}
@@ -5037,6 +5357,151 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             _ => {}
         },
+        Mode::PrCreate(_) => {
+            // Pending-handle sub-modal: collect a github handle, then continue.
+            let in_pending = matches!(&app.mode, Mode::PrCreate(f) if f.pending_handle.is_some());
+            if in_pending {
+                match code {
+                    KeyCode::Esc => app.mode = Mode::Detail,
+                    KeyCode::Enter => app.submit_pending_handle().await?,
+                    KeyCode::Backspace => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            if let Some(p) = &mut f.pending_handle { p.handle.pop(); }
+                        }
+                    }
+                    KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            if let Some(p) = &mut f.pending_handle { p.handle.push(c); }
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            match code {
+                KeyCode::Esc => app.mode = Mode::Detail,
+                KeyCode::Tab => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        f.field = (f.field + 1) % PrCreateForm::FIELD_COUNT;
+                    }
+                }
+                KeyCode::BackTab => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        f.field = if f.field == 0 { PrCreateForm::FIELD_COUNT - 1 } else { f.field - 1 };
+                    }
+                }
+                KeyCode::F(5) => app.submit_pr_create().await?,
+                KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                    app.submit_pr_create().await?;
+                }
+                KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
+                    app.submit_pr_create().await?;
+                }
+                // Up/Down navigate picker dropdowns when on the reviewer/devqa fields.
+                KeyCode::Up => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            2 => f.reviewer_picker_selected = f.reviewer_picker_selected.saturating_sub(1),
+                            3 => f.devqa_picker_selected = f.devqa_picker_selected.saturating_sub(1),
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Down => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            2 => {
+                                if !f.reviewer_results.is_empty() {
+                                    f.reviewer_picker_selected =
+                                        (f.reviewer_picker_selected + 1).min(f.reviewer_results.len() - 1);
+                                }
+                            }
+                            3 => {
+                                if !f.devqa_results.is_empty() {
+                                    f.devqa_picker_selected =
+                                        (f.devqa_picker_selected + 1).min(f.devqa_results.len() - 1);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Enter => {
+                    // On reviewer/devqa fields, Enter picks the highlighted user.
+                    let mut picked = false;
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            2 => {
+                                if let Some((name, id)) = f.reviewer_results.get(f.reviewer_picker_selected).cloned() {
+                                    f.reviewer = Some((name, id));
+                                    f.reviewer_query.clear();
+                                    f.reviewer_results.clear();
+                                    picked = true;
+                                }
+                            }
+                            3 => {
+                                if let Some((name, id)) = f.devqa_results.get(f.devqa_picker_selected).cloned() {
+                                    f.devqa = Some((name, id));
+                                    f.devqa_query.clear();
+                                    f.devqa_results.clear();
+                                    picked = true;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !picked {
+                        // Body field treats Enter as newline; other fields advance.
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            if f.field == 1 { f.body.push('\n'); }
+                            else { f.field = (f.field + 1) % PrCreateForm::FIELD_COUNT; }
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            0 => { f.title.pop(); }
+                            1 => { f.body.pop(); }
+                            2 => { f.reviewer_query.pop(); }
+                            3 => { f.devqa_query.pop(); }
+                            _ => {}
+                        }
+                    }
+                    // Re-search if on a picker field.
+                    let q = if let Mode::PrCreate(f) = &app.mode {
+                        match f.field {
+                            2 => Some((true, f.reviewer_query.clone())),
+                            3 => Some((false, f.reviewer_query.clone())),
+                            _ => None,
+                        }
+                    } else { None };
+                    if let Some((rev, query)) = q {
+                        if query.len() >= 2 { app.refresh_pr_picker(rev).await?; }
+                    }
+                }
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            0 => f.title.push(c),
+                            1 => f.body.push(c),
+                            2 => f.reviewer_query.push(c),
+                            3 => f.devqa_query.push(c),
+                            _ => {}
+                        }
+                    }
+                    let trigger = if let Mode::PrCreate(f) = &app.mode {
+                        match f.field {
+                            2 if f.reviewer_query.len() >= 2 => Some(true),
+                            3 if f.devqa_query.len() >= 2 => Some(false),
+                            _ => None,
+                        }
+                    } else { None };
+                    if let Some(rev) = trigger { app.refresh_pr_picker(rev).await?; }
+                }
+                _ => {}
+            }
+        }
     }
     Ok(())
 }

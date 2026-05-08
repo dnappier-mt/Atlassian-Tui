@@ -168,6 +168,17 @@ pub fn git_worktree_remove(root: &Path, path: &Path, force: bool) -> Result<()> 
     Ok(())
 }
 
+/// The conventional jui worktree path for a ticket slug: sibling to the repo
+/// at `<repo>/../<repo-name>-worktrees/<slug>`. Returns `None` if `cwd` isn't
+/// inside a git repo.
+pub fn worktree_path_for_slug(cwd: &Path, slug: &str) -> Option<std::path::PathBuf> {
+    let repo = detect(cwd);
+    if !matches!(repo.kind, ScmKind::Git) { return None; }
+    let repo_name = repo.root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let parent = repo.root.parent().unwrap_or(&repo.root);
+    Some(parent.join(format!("{}-worktrees", repo_name)).join(slug))
+}
+
 pub fn current_git_branch(root: &Path) -> Result<Option<String>> {
     let out = Command::new("git")
         .current_dir(root)

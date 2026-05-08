@@ -123,12 +123,25 @@ impl Cache {
             );
             CREATE INDEX IF NOT EXISTS comments_ticket ON comments(ticket_key);
             CREATE TABLE IF NOT EXISTS mentions (
-                role       TEXT NOT NULL,        -- 'reviewer' | 'mentioned'
+                role       TEXT NOT NULL,        -- 'reviewer' | 'mentioned' | 'github'
                 idx        INTEGER NOT NULL,
                 ticket_key TEXT NOT NULL,
                 cached_at  INTEGER NOT NULL,
                 PRIMARY KEY (role, idx)
             );
+            CREATE TABLE IF NOT EXISTS pr_comments (
+                ticket_key TEXT NOT NULL,
+                idx        INTEGER NOT NULL,
+                pr_url     TEXT NOT NULL,
+                pr_number  INTEGER NOT NULL,
+                repo       TEXT NOT NULL,
+                author     TEXT NOT NULL,
+                created    TEXT NOT NULL,
+                body       TEXT NOT NULL,
+                cached_at  INTEGER NOT NULL,
+                PRIMARY KEY (ticket_key, idx)
+            );
+            CREATE INDEX IF NOT EXISTS pr_comments_ticket ON pr_comments(ticket_key);
             "#,
         )?;
         // Idempotent additive migrations — `ALTER TABLE ADD COLUMN` errors if column
@@ -243,7 +256,77 @@ impl Cache {
     pub fn delete_ticket(&self, key: &str) -> Result<()> {
         self.conn.execute("DELETE FROM tickets WHERE key = ?1", [key])?;
         self.conn.execute("DELETE FROM comments WHERE ticket_key = ?1", [key])?;
+        self.conn.execute("DELETE FROM pr_comments WHERE ticket_key = ?1", [key])?;
         Ok(())
+    }
+
+    pub fn upsert_pr_comments(
+        &mut self,
+        ticket_key: &str,
+        pr_url: &str,
+        pr_number: u64,
+        repo: &str,
+        items: &[(String, String, String)], // (author, created, body)
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM pr_comments WHERE ticket_key = ?1", [ticket_key])?;
+        {
+            let mut stmt = tx.prepare(
+                r#"INSERT INTO pr_comments
+                   (ticket_key, idx, pr_url, pr_number, repo, author, created, body, cached_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+            )?;
+            for (i, (author, created, body)) in items.iter().enumerate() {
+                stmt.execute(rusqlite::params![
+                    ticket_key,
+                    i as i64,
+                    pr_url,
+                    pr_number as i64,
+                    repo,
+                    author,
+                    created,
+                    body,
+                    now,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_pr_comments(&self, ticket_key: &str) -> Result<Vec<crate::github::PrComment>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT pr_url, pr_number, repo, author, created, body
+               FROM pr_comments WHERE ticket_key = ?1 ORDER BY idx"#,
+        )?;
+        let rows = stmt.query_map([ticket_key], |r| {
+            Ok(crate::github::PrComment {
+                ticket_key: ticket_key.to_string(),
+                pr_url: r.get::<_, String>(0)?,
+                pr_number: r.get::<_, i64>(1)? as u64,
+                repo: r.get::<_, String>(2)?,
+                author: r.get::<_, String>(3)?,
+                created: r.get::<_, String>(4)?,
+                body: r.get::<_, String>(5)?,
+            })
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    /// Confirmed local project paths linked to `ticket_key`. Used by the
+    /// daemon's PR-create flow to find the worktree.
+    pub fn linked_paths(&self, ticket_key: &str) -> Result<Vec<std::path::PathBuf>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT project_path FROM ticket_projects \
+             WHERE ticket_key = ?1 AND state = 'confirmed' ORDER BY linked_at DESC",
+        )?;
+        let v: Vec<std::path::PathBuf> = stmt
+            .query_map([ticket_key], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .map(std::path::PathBuf::from)
+            .collect();
+        Ok(v)
     }
 
     /// Replace the cached comments for `ticket_key`. Order is preserved via `idx`.

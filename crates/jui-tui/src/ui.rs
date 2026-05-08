@@ -50,6 +50,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_detail(f, chunks[1], app);
             draw_archive_confirm(f, app);
         }
+        Mode::PrCreate(_) => {
+            draw_detail(f, chunks[1], app);
+            draw_pr_create(f, app);
+        }
     }
     if !matches!(&app.mode, Mode::PageView(_)) {
         draw_footer(f, chunks[2], app);
@@ -88,6 +92,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             AssignPurpose::Reviewer => "reviewer",
         },
         Mode::ArchiveConfirm(_) => "archive?",
+        Mode::PrCreate(_) => "pr",
         Mode::ConfluencePages(form) => {
             conf_pages_label = if form.breadcrumb.is_empty() {
                 format!("confluence / {}", form.space_name)
@@ -111,13 +116,19 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     use crate::app::ListFocus;
     use ratatui::layout::{Constraint, Direction, Layout};
-    // Split into Active (top) + Mentioned (bottom). Mentioned grows with row
-    // count, capped at ~40% of the inner area so the active list still leads.
-    let mentioned_rows = app.mentioned_tickets.len() as u16;
-    let mentioned_h = if mentioned_rows == 0 {
+    // Split into Active (top) + Mentioned (bottom). When focused, the Mentioned
+    // section grabs ~70% of the inner area so the user can scroll long lists
+    // comfortably. Otherwise it stays compact (row-count based, capped at 40%).
+    let mentioned_rows = (app.reviewing_tickets.len()
+        + app.github_tickets.len()
+        + app.mentioned_tickets.len()) as u16;
+    let focused = app.list_focus == ListFocus::Mentioned;
+    let mentioned_h = if focused {
+        ((area.height * 70) / 100).max(8)
+    } else if mentioned_rows == 0 {
         4 // "(none)" stub + border
     } else {
-        (mentioned_rows + 2).clamp(5, (area.height / 2).max(5))
+        (mentioned_rows + 2).clamp(5, (area.height * 40 / 100).max(5))
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -232,9 +243,10 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
     let combined = app.combined_mentions();
     let total = combined.len();
     let r = app.reviewing_tickets.len();
+    let g = app.github_tickets.len();
     let m = app.mentioned_tickets.len();
     let title = format!(
-        " reviewing + mentioned — {r} reviewer · {m} @ (Shift+Tab to focus) "
+        " reviewing + github + mentioned — {r} R · {g} V · {m} @ (Shift+Tab to focus) "
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -294,6 +306,10 @@ fn role_badge(role: MentionRole) -> (&'static str, Style) {
         MentionRole::Reviewer => (
             "[R]",
             Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ),
+        MentionRole::Github => (
+            "[V]",
+            Style::default().fg(Color::Rgb(180, 130, 220)).add_modifier(Modifier::BOLD),
         ),
         MentionRole::Mentioned => (
             "[@]",
@@ -904,32 +920,43 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     } else {
         Constraint::Min(5)
     };
-    if is_subtask {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(8),
-                Constraint::Length(projects_h),
-                comments_constraint,
-            ])
-            .split(inner);
-        draw_detail_info(f, chunks[0], app, t);
-        draw_detail_projects(f, chunks[1], app);
-        draw_detail_comments(f, chunks[2], app);
+    // PR comments pane (GitHub side). Hidden entirely when the ticket isn't
+    // tied to a PR. Compact when unfocused; expands to half the inner area
+    // when Tab brings focus to it (PRs can have very long threads).
+    let pr_comments_focused = app.detail_focus == DetailFocus::PrComments;
+    let pr_comments_visible = !app.pr_comments.is_empty();
+    let pr_comments_h: u16 = if !pr_comments_visible {
+        0
+    } else if pr_comments_focused {
+        (inner.height / 2).max(8)
     } else {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(8),
-                Constraint::Length(projects_h),
-                Constraint::Length(subtasks_h),
-                comments_constraint,
-            ])
-            .split(inner);
-        draw_detail_info(f, chunks[0], app, t);
-        draw_detail_projects(f, chunks[1], app);
-        draw_detail_subtasks(f, chunks[2], app, t);
-        draw_detail_comments(f, chunks[3], app);
+        // ~3 rows per comment (header + 1-2 body lines), capped small when unfocused.
+        ((app.pr_comments.len() as u16) * 3 + 2).clamp(5, 10)
+    };
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(5);
+    constraints.push(Constraint::Min(8));
+    constraints.push(Constraint::Length(projects_h));
+    if !is_subtask {
+        constraints.push(Constraint::Length(subtasks_h));
+    }
+    constraints.push(comments_constraint);
+    if pr_comments_visible {
+        constraints.push(Constraint::Length(pr_comments_h));
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    let mut idx = 0;
+    draw_detail_info(f, chunks[idx], app, t); idx += 1;
+    draw_detail_projects(f, chunks[idx], app); idx += 1;
+    if !is_subtask {
+        draw_detail_subtasks(f, chunks[idx], app, t); idx += 1;
+    }
+    draw_detail_comments(f, chunks[idx], app); idx += 1;
+    if pr_comments_visible {
+        draw_detail_pr_comments(f, chunks[idx], app);
     }
 }
 
@@ -1195,6 +1222,69 @@ fn project_link_item(item: &DetailLinkedProject, pending_unlink: bool) -> ListIt
         ));
     }
     ListItem::new(Line::from(spans))
+}
+
+fn draw_detail_pr_comments(f: &mut Frame, area: Rect, app: &App) {
+    let focused = app.detail_focus == DetailFocus::PrComments;
+    let count = app.pr_comments.len();
+    let pr_url = app.pr_comments.first().map(|c| c.pr_url.clone()).unwrap_or_default();
+    let title = if pr_url.is_empty() {
+        format!(" PR comments ({}) ", count)
+    } else {
+        format!(" PR comments ({}) · {} ", count, pr_url)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border(focused))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if count == 0 {
+        return;
+    }
+
+    // Compute scroll so the selected comment is visible. We render headers +
+    // wrapped body lines until the area fills.
+    let viewport_h = inner.height as usize;
+    let wrap_w = inner.width.saturating_sub(2) as usize;
+    let mut all: Vec<Line> = Vec::new();
+    // Track which comment each rendered line belongs to so we can highlight
+    // the selected one.
+    let mut owner: Vec<usize> = Vec::new();
+    for (i, c) in app.pr_comments.iter().enumerate() {
+        let header_style = if focused && i == app.pr_comment_selected {
+            Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Rgb(180, 130, 220)).add_modifier(Modifier::BOLD)
+        };
+        let date = c.created.split('T').next().unwrap_or(&c.created);
+        all.push(Line::from(vec![
+            Span::styled(format!("@{} ", c.author), header_style),
+            Span::styled(format!("· {}", date), Style::default().fg(Color::DarkGray)),
+        ]));
+        owner.push(i);
+        for ln in c.body.lines() {
+            for chunk in wrap_line(ln, wrap_w.max(20)) {
+                all.push(Line::from(Span::raw(format!("  {}", chunk))));
+                owner.push(i);
+            }
+        }
+        all.push(Line::from(""));
+        owner.push(i);
+    }
+
+    // Pick the start line so the selected comment's header is in view. If the
+    // user scrolled past it, snap up.
+    let target_first_line = owner
+        .iter()
+        .position(|&o| o == app.pr_comment_selected)
+        .unwrap_or(0);
+    let max_scroll = all.len().saturating_sub(viewport_h);
+    let scroll = target_first_line.min(max_scroll);
+    let end = (scroll + viewport_h).min(all.len());
+    let visible: Vec<Line> = all[scroll..end].to_vec();
+    f.render_widget(Paragraph::new(visible), inner);
 }
 
 fn draw_detail_comments(f: &mut Frame, area: Rect, app: &App) {
@@ -1955,6 +2045,8 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                 v.extend([
                     ("@", "assign"),
                     ("R", "reviewer"),
+                    ("P", "open PR"),
+                    ("Q", "begin DevQA"),
                     ("C", "claude"),
                     ("s", s_label),
                     ("D", "archive"),
@@ -1996,6 +2088,11 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                 ("A", "toggle archived"),
                 ("D", "archive"),
                 ("C", "claude"),
+                ("esc", "back"),
+            ],
+            DetailFocus::PrComments => vec![
+                ("tab", "next pane"),
+                ("j/k", "move"),
                 ("esc", "back"),
             ],
             DetailFocus::Comments => vec![
@@ -2105,7 +2202,216 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("y/enter", "confirm"),
             ("n/esc", "cancel"),
         ],
+        Mode::PrCreate(_) => vec![
+            ("tab", "field"),
+            ("type", "edit/search"),
+            ("↑/↓", "pick"),
+            ("F5/^S", "submit"),
+            ("esc", "cancel"),
+        ],
     }
+}
+
+fn draw_pr_create(f: &mut Frame, app: &App) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    use crate::app::PrCreateForm;
+    let Mode::PrCreate(form) = &app.mode else { return };
+    let total = f.area();
+    let height = (total.height * 80 / 100).max(20).min(total.height.saturating_sub(2));
+    let width = (total.width * 70 / 100).max(60).min(total.width.saturating_sub(2));
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((total.height.saturating_sub(height)) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(total);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((total.width.saturating_sub(width)) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(v[1]);
+    let area = h[1];
+
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(20, 20, 28))).borders(Borders::NONE),
+        area,
+    );
+
+    let title = format!(" pr · {} ", form.key);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Line::from(Span::styled(
+            title,
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Pending-handle sub-modal preempts the main form.
+    if let Some(p) = &form.pending_handle {
+        let lines = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  No GitHub handle for "),
+                Span::styled(p.display_name.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("  github handle: "),
+                Span::styled("@", Style::default().fg(Color::DarkGray)),
+                Span::styled(p.handle.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled("█", Style::default().fg(Color::Yellow)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "  Saved to ~/.config/jui/users.toml — Enter to save and retry, Esc to cancel.",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )),
+        ];
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
+    let cur = form.field;
+    let label = |i: u8, name: &str| -> Span<'static> {
+        let style = if cur == i {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Span::styled(format!("{:<10}", name), style)
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Title field
+    lines.push(Line::from(vec![
+        label(0, "title"),
+        Span::raw(" "),
+        Span::styled(form.title.clone(), if cur == 0 {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else { Style::default() }),
+        if cur == 0 { Span::styled("█", Style::default().fg(Color::Yellow)) } else { Span::raw("") },
+    ]));
+    lines.push(Line::from(""));
+
+    // Body field — multi-line
+    lines.push(Line::from(vec![label(1, "body"), Span::raw(" (Enter inserts newline)")]));
+    for (i, ln) in form.body.lines().enumerate() {
+        let mut spans = vec![Span::raw("  "), Span::raw(ln.to_string())];
+        if cur == 1 && i == form.body.lines().count().saturating_sub(1) {
+            spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
+        }
+        lines.push(Line::from(spans));
+    }
+    if form.body.is_empty() && cur == 1 {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("█", Style::default().fg(Color::Yellow)),
+        ]));
+    }
+    lines.push(Line::from(""));
+
+    // Reviewer field
+    let reviewer_text = match &form.reviewer {
+        Some((name, _)) => name.clone(),
+        None => form.reviewer_query.clone(),
+    };
+    lines.push(Line::from(vec![
+        label(2, "reviewer"),
+        Span::raw(" "),
+        Span::styled(reviewer_text, Style::default()),
+        if cur == 2 && form.reviewer.is_none() {
+            Span::styled("█", Style::default().fg(Color::Yellow))
+        } else { Span::raw("") },
+    ]));
+    if cur == 2 && form.reviewer.is_none() {
+        if form.reviewer_results.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  type ≥ 2 chars to search Jira users",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for (i, (name, _)) in form.reviewer_results.iter().enumerate().take(6) {
+                let style = if i == form.reviewer_picker_selected {
+                    Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+                } else { Style::default().fg(Color::DarkGray) };
+                let prefix = if i == form.reviewer_picker_selected { "  ▶ " } else { "    " };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(name.clone(), style),
+                ]));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    // DevQA field
+    let devqa_text = match &form.devqa {
+        Some((name, _)) => name.clone(),
+        None => form.devqa_query.clone(),
+    };
+    lines.push(Line::from(vec![
+        label(3, "devqa"),
+        Span::raw(" "),
+        Span::styled(devqa_text, Style::default()),
+        if cur == 3 && form.devqa.is_none() {
+            Span::styled("█", Style::default().fg(Color::Yellow))
+        } else { Span::raw("") },
+    ]));
+    if cur == 3 && form.devqa.is_none() {
+        if form.devqa_results.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  type ≥ 2 chars to search Jira users",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for (i, (name, _)) in form.devqa_results.iter().enumerate().take(6) {
+                let style = if i == form.devqa_picker_selected {
+                    Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+                } else { Style::default().fg(Color::DarkGray) };
+                let prefix = if i == form.devqa_picker_selected { "  ▶ " } else { "    " };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(name.clone(), style),
+                ]));
+            }
+        }
+    }
+    lines.push(Line::from(""));
+
+    if let Some(err) = &form.error {
+        let wrap_w = inner.width.saturating_sub(4) as usize;
+        for ln in err.lines() {
+            for chunk in wrap_line(ln, wrap_w.max(20)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", chunk),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    if form.busy {
+        lines.push(Line::from(Span::styled(
+            "  submitting…",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Tab next field · F5 / Ctrl-S submits · Esc cancels",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let _ = PrCreateForm::FIELD_COUNT; // assert constant references compile
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Greedy whitespace-aware wrap for long error/status messages in modals.
