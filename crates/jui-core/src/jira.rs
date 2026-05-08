@@ -443,11 +443,80 @@ fn adf_to_text(node: &Value) -> String {
 }
 
 fn walk_adf(node: &Value, out: &mut String) {
+    // Plain text leaves.
     if let Some(t) = node.get("text").and_then(|x| x.as_str()) {
         out.push_str(t);
     }
     let node_type = node.get("type").and_then(|x| x.as_str()).unwrap_or("");
-    if matches!(node_type, "paragraph" | "heading" | "listItem" | "codeBlock") {
+    let attrs = node.get("attrs");
+
+    match node_type {
+        // GitHub-for-Jira and other smart-link apps post comments where the
+        // entire body is a card / link with no `text` leaves. Pull whatever
+        // text-bearing fields the attrs carry.
+        "inlineCard" | "blockCard" | "embedCard" => {
+            if let Some(url) = attrs.and_then(|a| a.get("url")).and_then(|x| x.as_str()) {
+                out.push_str(url);
+            }
+        }
+        "applicationCard" => {
+            // `title.text`, `description.text`, optional `link.url`.
+            if let Some(t) = attrs
+                .and_then(|a| a.get("title"))
+                .and_then(|t| t.get("text"))
+                .and_then(|x| x.as_str())
+            {
+                out.push_str(t);
+                out.push('\n');
+            }
+            if let Some(d) = attrs
+                .and_then(|a| a.get("description"))
+                .and_then(|t| t.get("text"))
+                .and_then(|x| x.as_str())
+            {
+                out.push_str(d);
+                out.push('\n');
+            }
+            if let Some(u) = attrs
+                .and_then(|a| a.get("link"))
+                .and_then(|t| t.get("url"))
+                .and_then(|x| x.as_str())
+            {
+                out.push_str(u);
+            }
+        }
+        "mention" => {
+            if let Some(t) = attrs.and_then(|a| a.get("text")).and_then(|x| x.as_str()) {
+                out.push_str(t);
+            } else if let Some(d) = attrs.and_then(|a| a.get("displayName")).and_then(|x| x.as_str()) {
+                out.push('@');
+                out.push_str(d);
+            }
+        }
+        "emoji" => {
+            if let Some(s) = attrs.and_then(|a| a.get("shortName")).and_then(|x| x.as_str()) {
+                out.push_str(s);
+            }
+        }
+        "status" => {
+            if let Some(t) = attrs.and_then(|a| a.get("text")).and_then(|x| x.as_str()) {
+                out.push('[');
+                out.push_str(t);
+                out.push(']');
+            }
+        }
+        "date" => {
+            if let Some(ts) = attrs.and_then(|a| a.get("timestamp")).and_then(|x| x.as_str()) {
+                out.push_str(ts);
+            }
+        }
+        _ => {}
+    }
+
+    if matches!(node_type, "paragraph" | "heading" | "listItem" | "codeBlock"
+        | "blockquote" | "rule" | "bulletList" | "orderedList" | "panel"
+        | "tableRow" | "tableCell" | "tableHeader" | "mediaSingle"
+        | "mediaGroup" | "media") {
         if let Some(arr) = node.get("content").and_then(|x| x.as_array()) {
             for c in arr {
                 walk_adf(c, out);
