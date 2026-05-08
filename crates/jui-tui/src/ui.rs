@@ -1,4 +1,4 @@
-use crate::app::{App, DetailFocus, DetailLinkedProject, Mode, PageLine, PendingDelete, TreeForm, TreeNode};
+use crate::app::{App, AssignPurpose, DetailFocus, DetailLinkedProject, Mode, PageLine, PendingDelete, TreeForm, TreeNode};
 use jui_core::ticket::{fmt_date, fmt_seconds, parse_reply, priority_rank, Comment};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -41,9 +41,21 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_page_view(f, area, app);
         }
         Mode::Tree(_) => draw_tree(f, chunks[1], app),
+        Mode::AssignPicker(_) => {
+            // Draw the underlying Detail first so the modal has context to overlay.
+            draw_detail(f, chunks[1], app);
+            draw_assign_picker(f, app);
+        }
+        Mode::ArchiveConfirm(_) => {
+            draw_detail(f, chunks[1], app);
+            draw_archive_confirm(f, app);
+        }
     }
     if !matches!(&app.mode, Mode::PageView(_)) {
         draw_footer(f, chunks[2], app);
+    }
+    if app.show_help {
+        draw_help_overlay(f, app);
     }
 }
 
@@ -71,6 +83,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         }
         Mode::ConfluenceSpaces(_) => "confluence",
         Mode::Tree(_) => "tree",
+        Mode::AssignPicker(form) => match form.purpose {
+            AssignPurpose::Assignee => "assign",
+            AssignPurpose::Reviewer => "reviewer",
+        },
+        Mode::ArchiveConfirm(_) => "archive?",
         Mode::ConfluencePages(form) => {
             conf_pages_label = if form.breadcrumb.is_empty() {
                 format!("confluence / {}", form.space_name)
@@ -761,48 +778,104 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
 
-    // Four stacked panes: info, linked projects, subtasks, comments.
+    // Stacked panes: info, linked projects, [subtasks], comments. Hide the subtasks
+    // pane when this ticket is itself a sub-task (Jira disallows nested sub-tasks).
+    let is_subtask = t
+        .issue_type
+        .as_deref()
+        .map(|x| x.eq_ignore_ascii_case("sub-task") || x.eq_ignore_ascii_case("subtask"))
+        .unwrap_or(false);
     let projects_h: u16 = ((app.detail_linked_projects.len() as u16).max(1) + 2).min(7);
-    let subtasks_h: u16 = ((t.subtasks.len() as u16).max(1) + 2).min(7);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(8),
-            Constraint::Length(projects_h),
-            Constraint::Length(subtasks_h),
-            Constraint::Min(5),
-        ])
-        .split(inner);
+    // Visible subtask count (after the archived filter) drives the pane height when
+    // the user isn't actively focused on subtasks.
+    let visible_subtasks = visible_subtask_count(app, t);
+    let subtasks_h: u16 = if app.detail_focus == DetailFocus::Subtasks {
+        (inner.height / 2).max(7)
+    } else {
+        ((visible_subtasks as u16).max(1) + 2).min(7)
+    };
+    // Comments pane: shrink to a 3-row stub when empty AND unfocused so the freed
+    // rows go to subtasks/info. Stays focusable so 'c' still works.
+    let comments_focused = app.detail_focus == DetailFocus::Comments;
+    let comments_collapsed = app.comments.is_empty() && !comments_focused;
+    let comments_constraint = if comments_collapsed {
+        Constraint::Length(3)
+    } else {
+        Constraint::Min(5)
+    };
+    if is_subtask {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(projects_h),
+                comments_constraint,
+            ])
+            .split(inner);
+        draw_detail_info(f, chunks[0], app, t);
+        draw_detail_projects(f, chunks[1], app);
+        draw_detail_comments(f, chunks[2], app);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(projects_h),
+                Constraint::Length(subtasks_h),
+                comments_constraint,
+            ])
+            .split(inner);
+        draw_detail_info(f, chunks[0], app, t);
+        draw_detail_projects(f, chunks[1], app);
+        draw_detail_subtasks(f, chunks[2], app, t);
+        draw_detail_comments(f, chunks[3], app);
+    }
+}
 
-    draw_detail_info(f, chunks[0], app, t);
-    draw_detail_projects(f, chunks[1], app);
-    draw_detail_subtasks(f, chunks[2], app, t);
-    draw_detail_comments(f, chunks[3], app);
+fn visible_subtask_count(app: &App, t: &jui_core::ticket::Ticket) -> usize {
+    if app.show_archived_subtasks { t.subtasks.len() }
+    else { t.subtasks.iter().filter(|s| !is_subtask_archived(s)).count() }
+}
+
+fn is_subtask_archived(s: &jui_core::ticket::SubtaskRef) -> bool {
+    let status = s.status.as_deref().unwrap_or("").to_ascii_lowercase();
+    matches!(status.as_str(), "resolved" | "done" | "closed" | "archive" | "archived" | "won't do" | "wont do" | "cancelled" | "canceled")
 }
 
 fn draw_detail_subtasks(f: &mut Frame, area: Rect, app: &App, t: &jui_core::ticket::Ticket) {
     let focused = app.detail_focus == DetailFocus::Subtasks;
+    let visible_idxs = crate::app::visible_subtask_indices(app);
+    let total = t.subtasks.len();
+    let visible = visible_idxs.len();
+    let hidden = total.saturating_sub(visible);
+    let title = if hidden > 0 {
+        format!(" subtasks ({visible} of {total} · {hidden} hidden — A toggle) ")
+    } else {
+        format!(" subtasks ({visible}) ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(focus_border(focused))
-        .title(format!(" subtasks ({}) ", t.subtasks.len()));
+        .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if t.subtasks.is_empty() {
-        let hint = if focused {
-            "(none) · press 'a' or 'T' to add"
+    if visible == 0 {
+        let hint = if total > 0 {
+            "(all archived — press A to show)".to_string()
+        } else if focused {
+            "(none) · press 'a' or 'T' to add".into()
         } else {
-            "(none) · tab into pane, then 'a' to add"
+            "(none) · tab into pane, then 'a' to add".into()
         };
         let p = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)));
         f.render_widget(p, inner);
         return;
     }
 
-    let items: Vec<ListItem> = t
-        .subtasks
+    let items: Vec<ListItem> = visible_idxs
         .iter()
+        .map(|&i| &t.subtasks[i])
         .map(|s| {
             let status = s.status.as_deref().unwrap_or("?");
             let inactive = matches!(
@@ -836,8 +909,8 @@ fn draw_detail_subtasks(f: &mut Frame, area: Rect, app: &App, t: &jui_core::tick
         })
         .collect();
     let mut state = ListState::default();
-    if focused && !t.subtasks.is_empty() {
-        state.select(Some(app.subtask_selected.min(t.subtasks.len() - 1)));
+    if focused && visible > 0 {
+        state.select(Some(app.subtask_selected.min(visible - 1)));
     }
     let list = List::new(items)
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
@@ -1188,6 +1261,32 @@ fn draw_create(f: &mut Frame, area: Rect, app: &App) {
             "  examples: Highest, High, Medium, Low, Lowest  (leave blank to skip)",
             Style::default().fg(Color::DarkGray),
         )));
+    }
+    lines.push(field_line("assignee   ", &form.assignee, form.field == 6));
+    if form.field == 6 {
+        if form.assignee_results.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  type ≥ 2 chars to search users  (blank = me)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for (i, (name, _id)) in form.assignee_results.iter().enumerate().take(8) {
+                let style = if i == form.assignee_picker_selected {
+                    Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let prefix = if i == form.assignee_picker_selected { "  ▶ " } else { "    " };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(name.clone(), style),
+                ]));
+            }
+            lines.push(Line::from(Span::styled(
+                "  ↑/↓ navigate · enter: pick",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
     }
     if let Some(err) = &form.error {
         lines.push(Line::from(""));
@@ -1660,7 +1759,13 @@ fn draw_transition(f: &mut Frame, area: Rect, app: &App) {
 type Hint = (&'static str, &'static str);
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
-    let hints: Vec<Hint> = match &app.mode {
+    let hints = mode_hints(app);
+    let p = Paragraph::new(render_hints(&hints));
+    f.render_widget(p, area);
+}
+
+fn mode_hints(app: &App) -> Vec<Hint> {
+    match &app.mode {
         Mode::List => vec![
             ("j/k", "move"),
             ("tab", "expand subtasks"),
@@ -1669,6 +1774,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ("o", "sort"),
             ("n", "new"),
             ("s", "start"),
+            ("T", "tree"),
             ("a", "archive"),
             ("b", "board"),
             ("p", "projects"),
@@ -1721,19 +1827,39 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ("a/esc", "back"),
         ],
         Mode::Detail => match app.detail_focus {
-            DetailFocus::Info => vec![
-                ("tab", "pane"),
-                ("e", "edit"),
-                ("c", "comment"),
-                ("t", "trans"),
-                ("w", "time"),
-                ("i", "prio"),
-                ("P", "link"),
-                ("T", "subtask"),
-                ("C", "claude"),
-                ("s", "start"),
-                ("esc", "back"),
-            ],
+            DetailFocus::Info => {
+                let s_label = match app.detail.as_ref() {
+                    Some(t) if crate::app::is_ticket_started(t) => "stop",
+                    _ => "start",
+                };
+                let is_subtask = app
+                    .detail
+                    .as_ref()
+                    .and_then(|t| t.issue_type.as_deref())
+                    .map(|x| x.eq_ignore_ascii_case("sub-task") || x.eq_ignore_ascii_case("subtask"))
+                    .unwrap_or(false);
+                let mut v: Vec<Hint> = vec![
+                    ("tab", "pane"),
+                    ("e", "edit"),
+                    ("c", "comment"),
+                    ("t", "trans"),
+                    ("w", "time"),
+                    ("i", "prio"),
+                    ("P", "link"),
+                ];
+                if !is_subtask {
+                    v.push(("T", "subtask"));
+                }
+                v.extend([
+                    ("@", "assign"),
+                    ("R", "reviewer"),
+                    ("C", "claude"),
+                    ("s", s_label),
+                    ("D", "archive"),
+                    ("esc", "back"),
+                ]);
+                v
+            }
             DetailFocus::Projects => {
                 let has_suggestion = app
                     .detail_linked_projects
@@ -1765,6 +1891,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                 ("j/k", "move"),
                 ("enter", "open"),
                 ("a", "add subtask"),
+                ("A", "toggle archived"),
+                ("D", "archive"),
                 ("C", "claude"),
                 ("esc", "back"),
             ],
@@ -1843,18 +1971,327 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             ]
         },
         Mode::PageView(_) => vec![],  // PageView draws its own footer
-        Mode::Tree(_) => vec![
-            ("j/k", "move"),
-            ("o/Tab", "toggle"),
-            ("O/C", "expand/collapse all"),
-            ("c", "create child"),
-            ("v", "two-col"),
-            ("Enter", "detail"),
-            ("q", "back"),
+        Mode::Tree(form) => {
+            let mut hints: Vec<Hint> = vec![
+                ("j/k", "move"),
+                ("o/Tab", "toggle"),
+                ("O/C", "expand/collapse all"),
+            ];
+            let selected_is_subtask = form
+                .visible
+                .get(form.selected)
+                .and_then(|&i| form.nodes[i].issue_type.as_deref())
+                .map(|t| t.eq_ignore_ascii_case("sub-task") || t.eq_ignore_ascii_case("subtask"))
+                .unwrap_or(false);
+            if !selected_is_subtask {
+                hints.push(("c", "create child"));
+            }
+            hints.extend([
+                ("v", "two-col"),
+                ("Enter", "detail"),
+                ("q", "back"),
+            ]);
+            hints
+        }
+        Mode::AssignPicker(_) => vec![
+            ("type", "search"),
+            ("↑/↓", "move"),
+            ("enter", "select"),
+            ("esc", "cancel"),
         ],
+        Mode::ArchiveConfirm(_) => vec![
+            ("y/enter", "confirm"),
+            ("n/esc", "cancel"),
+        ],
+    }
+}
+
+/// Greedy whitespace-aware wrap for long error/status messages in modals.
+fn wrap_line(s: &str, w: usize) -> Vec<String> {
+    if w == 0 || s.len() <= w { return vec![s.to_string()]; }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.len() + 1 + word.len() <= w {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            out.push(std::mem::take(&mut cur));
+            cur.push_str(word);
+        }
+        // Hard-break very long words.
+        while cur.len() > w {
+            let split: String = cur.drain(..w).collect();
+            out.push(split);
+        }
+    }
+    if !cur.is_empty() { out.push(cur); }
+    out
+}
+
+fn draw_archive_confirm(f: &mut Frame, app: &App) {
+    use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+    let Mode::ArchiveConfirm(form) = &app.mode else { return };
+    let total = f.area();
+    let has_error = form.error.is_some();
+    let height = if has_error { 22u16 } else { 9u16 }.min(total.height.saturating_sub(2));
+    let width = (total.width * 70 / 100).max(60).min(total.width.saturating_sub(2));
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((total.height.saturating_sub(height)) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(total);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((total.width.saturating_sub(width)) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(v[1]);
+    let area = h[1];
+
+    f.render_widget(ratatui::widgets::Clear, area);
+    let bg = if has_error { Color::Rgb(40, 16, 16) } else { Color::Rgb(20, 28, 32) };
+    let border = if has_error { Color::Red } else { Color::Yellow };
+    f.render_widget(
+        Block::default().style(Style::default().bg(bg)).borders(Borders::NONE),
+        area,
+    );
+    let title = if has_error { " archive failed " } else { " archive ticket? " };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Line::from(vec![
+            Span::styled(title, Style::default().fg(border).add_modifier(Modifier::BOLD)),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(form.key.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(form.summary.clone(), Style::default()),
+        ]),
+        Line::from(""),
+    ];
+    if let Some(err) = &form.error {
+        // Hard-wrap on whitespace to the inner width so commas-in-list don't get cut.
+        let wrap_w = inner.width.saturating_sub(4) as usize;
+        for ln in err.lines() {
+            for chunk in wrap_line(ln, wrap_w.max(20)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", chunk),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[ Enter / Esc ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("  dismiss"),
+        ]));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Will transition the ticket to Won't Do / Cancelled / Closed / Done.",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("[ y / Enter ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("  archive    "),
+            Span::styled("[ n / Esc ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw("  cancel"),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner);
+}
+
+fn draw_assign_picker(f: &mut Frame, app: &App) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    let Mode::AssignPicker(form) = &app.mode else { return };
+
+    // Center a popup ~60% wide, ~16 rows tall.
+    let total = f.area();
+    let height = 16u16.min(total.height.saturating_sub(2));
+    let width = (total.width * 60 / 100).max(50).min(total.width.saturating_sub(2));
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((total.height.saturating_sub(height)) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(total);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((total.width.saturating_sub(width)) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(v[1]);
+    let area = h[1];
+
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(
+        Block::default()
+            .style(Style::default().bg(Color::Rgb(20, 20, 28)))
+            .borders(Borders::NONE),
+        area,
+    );
+    let title_text = match form.purpose {
+        AssignPurpose::Assignee => format!(" assign {} ", form.key),
+        AssignPurpose::Reviewer => format!(" set reviewer on {} ", form.key),
     };
-    let p = Paragraph::new(render_hints(&hints));
-    f.render_widget(p, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Line::from(vec![
+            Span::styled(title_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Layout: query line, hint line, results.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    // Query
+    let query_line = Line::from(vec![
+        Span::styled("query: ", Style::default().fg(Color::DarkGray)),
+        Span::styled(form.query.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled("█", Style::default().fg(Color::Yellow)),
+    ]);
+    f.render_widget(Paragraph::new(query_line), chunks[0]);
+
+    let hint = match form.purpose {
+        AssignPurpose::Assignee => "type ≥ 2 chars · empty + enter = me",
+        AssignPurpose::Reviewer => "type ≥ 2 chars · enter to set",
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))),
+        chunks[1],
+    );
+
+    // Results
+    let result_lines: Vec<Line> = if form.results.is_empty() {
+        vec![Line::from(Span::styled(
+            "  (no results)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        ))]
+    } else {
+        form.results
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _id))| {
+                let style = if i == form.selected {
+                    Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let prefix = if i == form.selected { "▶ " } else { "  " };
+                Line::from(vec![
+                    Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::styled(name.clone(), style),
+                ])
+            })
+            .collect()
+    };
+    f.render_widget(Paragraph::new(result_lines), chunks[2]);
+
+    // Error
+    if let Some(err) = &form.error {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                err.clone(),
+                Style::default().fg(Color::Red),
+            ))),
+            chunks[3],
+        );
+    }
+}
+
+fn draw_help_overlay(f: &mut Frame, app: &App) {
+    use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+    let hints = mode_hints(app);
+    let total = f.area();
+    // Center a popup ~70% wide, autosize height to row count + 4 lines of chrome.
+    let rows = (hints.len() as u16).max(1) + 4;
+    let height = rows.min(total.height.saturating_sub(2));
+    let width = (total.width * 70 / 100).max(40).min(total.width.saturating_sub(2));
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((total.height.saturating_sub(height)) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(total);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((total.width.saturating_sub(width)) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(v[1]);
+    let area = h[1];
+
+    // Clear area first so content underneath doesn't bleed through.
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Line::from(vec![
+            Span::styled(" help ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("(esc/q/? to close)", Style::default().fg(Color::DarkGray)),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(
+        Block::default()
+            .style(Style::default().bg(Color::Rgb(20, 20, 28)))
+            .borders(Borders::NONE),
+        area,
+    );
+    f.render_widget(block, area);
+
+    let key_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let exp_style = Style::default();
+    let max_key_w = hints.iter().map(|(k, _)| k.len()).max().unwrap_or(1);
+    let lines: Vec<Line> = hints
+        .iter()
+        .map(|(k, v)| {
+            let pad = " ".repeat(max_key_w.saturating_sub(k.len()));
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(k.to_string(), key_style),
+                Span::raw(pad),
+                Span::raw("  "),
+                Span::styled(v.to_string(), exp_style),
+            ])
+        })
+        .collect();
+    let p = Paragraph::new(lines).alignment(Alignment::Left);
+    f.render_widget(p, inner);
 }
 
 fn render_hints(hints: &[Hint]) -> Line<'static> {
@@ -2292,12 +2729,28 @@ fn type_color(issue_type: Option<&str>) -> Color {
 
 fn type_glyph(issue_type: Option<&str>) -> &'static str {
     match issue_type.unwrap_or("") {
-        t if t.eq_ignore_ascii_case("epic") => "◆",
-        t if t.eq_ignore_ascii_case("story") => "●",
-        t if t.eq_ignore_ascii_case("task") => "■",
-        t if t.eq_ignore_ascii_case("bug") => "▲",
-        t if t.eq_ignore_ascii_case("sub-task") | t.eq_ignore_ascii_case("subtask") => "·",
+        t if t.eq_ignore_ascii_case("epic") => "⚡",
+        t if t.eq_ignore_ascii_case("story") => "✦",
+        t if t.eq_ignore_ascii_case("task") => "☑",
+        t if t.eq_ignore_ascii_case("bug") => "✗",
+        t if t.eq_ignore_ascii_case("sub-task") | t.eq_ignore_ascii_case("subtask") => "↳",
+        t if t.eq_ignore_ascii_case("improvement") => "▲",
+        t if t.eq_ignore_ascii_case("spike") => "✱",
         _ => "○",
+    }
+}
+
+/// Short fixed-width type label so columns line up across the tree. 5 chars padded.
+fn type_label(issue_type: Option<&str>) -> &'static str {
+    match issue_type.unwrap_or("") {
+        t if t.eq_ignore_ascii_case("epic") => "Epic ",
+        t if t.eq_ignore_ascii_case("story") => "Story",
+        t if t.eq_ignore_ascii_case("task") => "Task ",
+        t if t.eq_ignore_ascii_case("bug") => "Bug  ",
+        t if t.eq_ignore_ascii_case("sub-task") | t.eq_ignore_ascii_case("subtask") => "Sub  ",
+        t if t.eq_ignore_ascii_case("improvement") => "Impr ",
+        t if t.eq_ignore_ascii_case("spike") => "Spike",
+        _ => "?    ",
     }
 }
 
@@ -2323,9 +2776,13 @@ fn tree_node_line(node: &TreeNode, selected: bool) -> Line<'static> {
         Style::default()
     };
     let summary = if node.summary.is_empty() { "—".to_string() } else { node.summary.clone() };
+    let type_color_v = type_color(node.issue_type.as_deref());
+    let label = type_label(node.issue_type.as_deref());
     Line::from(vec![
         Span::styled(format!("{indent}{arrow}"), Style::default().fg(Color::DarkGray)),
-        Span::styled(format!("{glyph} "), Style::default().fg(type_color(node.issue_type.as_deref()))),
+        Span::styled(format!("{glyph} "), Style::default().fg(type_color_v)),
+        Span::styled(label.to_string(), Style::default().fg(type_color_v).add_modifier(Modifier::BOLD)),
+        Span::styled("  ", Style::default()),
         Span::styled(node.key.clone(), key_style),
         Span::styled("  ", Style::default()),
         Span::styled(summary, summary_style),

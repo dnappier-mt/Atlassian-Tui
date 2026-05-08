@@ -105,6 +105,45 @@ pub enum Mode {
     ConfluencePages(ConfluencePagesForm),
     PageView(PageViewForm),
     Tree(TreeForm),
+    AssignPicker(AssignPickerForm),
+    /// Modal "are you sure?" confirmation before archiving a ticket. Archiving
+    /// transitions the ticket to a closed state (Won't Do / Cancelled / Closed /
+    /// Done — daemon picks the first available). Replaces an earlier delete flow
+    /// that was rejected by Jira with HTTP 403 on most accounts.
+    ArchiveConfirm(ArchiveConfirmForm),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DeleteOrigin {
+    /// Detail Info pane → after archive, return to List.
+    DetailInfo,
+    /// Detail Subtasks pane → after archive, return to List + refresh.
+    Subtasks,
+}
+
+pub struct ArchiveConfirmForm {
+    pub key: String,
+    pub summary: String,
+    pub origin: DeleteOrigin,
+    /// Populated when the daemon returns an error — modal shows it instead of the
+    /// confirmation prompt so the user actually reads it (status bar truncates).
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum AssignPurpose {
+    Assignee,
+    Reviewer,
+}
+
+pub struct AssignPickerForm {
+    pub key: String,
+    pub purpose: AssignPurpose,
+    pub query: String,
+    /// (display_name, account_id)
+    pub results: Vec<(String, String)>,
+    pub selected: usize,
+    pub error: Option<String>,
 }
 
 /// One node in the ticket tree. Stored flat with children referenced by index
@@ -335,6 +374,7 @@ impl DetailFocus {
 }
 
 /// Two-press deletion target. Either a comment id or a linked project path.
+/// Ticket deletion uses the modal `Mode::ArchiveConfirm` instead.
 pub enum PendingDelete {
     Comment(String),
     Link(std::path::PathBuf),
@@ -387,7 +427,16 @@ pub struct CreateForm {
     pub description: String,
     pub time_estimate: String,
     pub priority: String,
-    pub field: u8, // 0=project, 1=type, 2=summary, 3=description, 4=estimate, 5=priority
+    /// Display name typed by the user. Blank = assign to me on submit.
+    pub assignee: String,
+    /// Account id (or username) of the picked user. Set when the user selects
+    /// from the picker via Enter; used for the post-create `issue assign` call.
+    pub assignee_id: Option<String>,
+    pub field: u8, // 0=project, 1=type, 2=summary, 3=description, 4=estimate, 5=priority, 6=assignee
+    /// Cached results from the last user-search round-trip, shown as a dropdown
+    /// when the assignee field has focus.
+    pub assignee_results: Vec<(String, String)>, // (display_name, account_id_or_username)
+    pub assignee_picker_selected: usize,
     /// When set, the new issue is created as a child of this parent key (usually a
     /// sub-task of the currently-viewed ticket).
     pub parent: Option<String>,
@@ -397,7 +446,7 @@ pub struct CreateForm {
 }
 
 impl CreateForm {
-    pub const FIELD_COUNT: u8 = 6;
+    pub const FIELD_COUNT: u8 = 7;
     pub fn field_mut(&mut self) -> &mut String {
         match self.field {
             0 => &mut self.project,
@@ -405,7 +454,8 @@ impl CreateForm {
             2 => &mut self.summary,
             3 => &mut self.description,
             4 => &mut self.time_estimate,
-            _ => &mut self.priority,
+            5 => &mut self.priority,
+            _ => &mut self.assignee,
         }
     }
 }
@@ -486,6 +536,31 @@ pub struct App {
     /// Image protocol picker. Init lazily before the first PageView open so the
     /// terminal-capability query happens after raw mode is set up.
     pub picker: Option<ratatui_image::picker::Picker>,
+    /// '?' overlay showing the current mode's keybindings.
+    pub show_help: bool,
+    /// When false, the Subtasks pane in Detail view hides children whose status is
+    /// in a closed/archived state. Toggle with 'A' from the Subtasks pane.
+    pub show_archived_subtasks: bool,
+    /// Back-stack of where the user came from. Esc/q pops the top frame so
+    /// drilling Tree → Detail or Detail → Subtask → Detail returns to the right
+    /// place. Empty stack falls back to `detail_origin`.
+    pub nav_stack: Vec<NavFrame>,
+}
+
+/// Captured "where to return to" for the back-stack. `Tree` keeps the full
+/// form so expand state and selection survive the round-trip; `Detail` also
+/// remembers focus + selection so popping back lands on the same sub-pane row.
+pub enum NavFrame {
+    List,
+    Archive,
+    Kanban,
+    Tree(Box<TreeForm>),
+    Detail {
+        ticket_key: String,
+        focus: DetailFocus,
+        subtask_selected: usize,
+        comment_selected: usize,
+    },
 }
 
 /// Sentinel offset separating `kanban_extra` indices from `tickets` indices in
@@ -525,6 +600,9 @@ impl App {
             should_quit: false,
             needs_clear: false,
             picker: None,
+            show_help: false,
+            show_archived_subtasks: false,
+            nav_stack: Vec::new(),
         }
     }
 
@@ -956,6 +1034,11 @@ impl App {
             .or_else(|| self.current_ticket().cloned());
         let Some(t) = ticket else { return Ok(()) };
 
+        // If work is already in progress on this ticket, treat `s` as "stop" instead.
+        if is_ticket_started(&t) {
+            return self.stop_work().await;
+        }
+
         let need_time = t.original_estimate_seconds.unwrap_or(0) <= 0;
         let need_priority = match t.priority.as_deref() {
             None | Some("") | Some("--") | Some("None") => true,
@@ -986,6 +1069,55 @@ impl App {
             return Ok(());
         }
         self.execute_start_work().await
+    }
+
+    /// Move the current ticket back to Backlog and pop a Comment form so the user can
+    /// optionally explain why. Esc skips the comment, Ctrl-S submits it.
+    pub async fn stop_work(&mut self) -> Result<()> {
+        let Some(t) = self.detail.clone().or_else(|| self.current_ticket().cloned()) else {
+            return Ok(());
+        };
+        let key = t.key.clone();
+
+        // Find a Backlog transition.
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(&mut s, &Request::ListTransitions { key: key.clone() }).await?;
+        let target = if let Response::Transitions { items } = resp {
+            items
+                .iter()
+                .find(|tr| tr.to_status.as_deref().map(|s| s.eq_ignore_ascii_case("Backlog")).unwrap_or(false))
+                .or_else(|| items.iter().find(|tr| tr.name.to_ascii_lowercase().contains("backlog")))
+                .cloned()
+        } else {
+            None
+        };
+        let Some(tr) = target else {
+            self.status = format!("no Backlog transition available for {key}");
+            return Ok(());
+        };
+
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(
+            &mut s,
+            &Request::Transition { key: key.clone(), to: tr.name.clone() },
+        )
+        .await?;
+        if let Response::Err { message } = resp {
+            self.status = format!("transition err: {message}");
+            return Ok(());
+        }
+        self.status = format!(
+            "{key} → {}",
+            tr.to_status.clone().unwrap_or_else(|| tr.name.clone())
+        );
+
+        // Pop a Comment form so the user can optionally add a note.
+        self.mode = Mode::Comment(CommentForm {
+            key,
+            body: String::new(),
+            reply_to: None,
+        });
+        Ok(())
     }
 
     pub async fn submit_start_work_prompt(&mut self) -> Result<()> {
@@ -1276,6 +1408,8 @@ impl App {
         let description = trim_to_opt(&form.description);
         let priority = trim_to_opt(&form.priority);
         let estimate = trim_to_opt(&form.time_estimate);
+        let assignee_id_picked = form.assignee_id.clone();
+        let assignee_typed = trim_to_opt(&form.assignee);
         let req = Request::CreateTicket {
             project: form.project.clone(),
             issue_type: form.issue_type.clone(),
@@ -1337,6 +1471,28 @@ impl App {
                 Response::Ok => extras.push("estimate"),
                 Response::Err { message } => {
                     self.status = format!("created {new_key}, but estimate failed: {message}");
+                }
+                _ => {}
+            }
+        }
+        // Assignee — blank means assign to me; non-blank uses the picked id, falling
+        // back to the typed text. Skip entirely if neither is available.
+        let assignee_arg: Option<String> = match (&assignee_id_picked, assignee_typed.as_deref()) {
+            (Some(id), _) if !id.is_empty() => Some(id.clone()),
+            (_, Some(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            _ => self.my_account_id.clone(),
+        };
+        if let Some(a) = assignee_arg {
+            let mut s = ipc::connect().await?;
+            match ipc::send_request(
+                &mut s,
+                &Request::AssignTicket { key: new_key.clone(), assignee: a },
+            )
+            .await?
+            {
+                Response::Ok => extras.push("assignee"),
+                Response::Err { message } => {
+                    self.status = format!("created {new_key}, but assign failed: {message}");
                 }
                 _ => {}
             }
@@ -1539,18 +1695,59 @@ impl App {
             self.status = "no available project path to cd into".into();
             return Ok(());
         };
-        let Some(t) = &self.detail else { return Ok(()) };
-        // Write the context to a per-ticket temp file the new claude session reads via cat.
-        let tmp_dir = std::env::temp_dir();
-        let ctx_path = tmp_dir.join(format!("jui-ctx-{}.md", t.key));
-        let context = build_claude_context(t, &form.project_paths, &form.markdown);
-        std::fs::write(&ctx_path, context)?;
-        // tmux new-window: -c sets the cwd, the shell command pipes the context into
-        // claude in interactive mode. Using sh -lc so PATH/aliases resolve normally.
-        let cmd = format!(
-            "cat {ctx} | claude",
-            ctx = shell_escape(&ctx_path.display().to_string())
-        );
+        let Some(t) = self.detail.clone() else { return Ok(()) };
+        let key = t.key.clone();
+        let project_paths = form.project_paths.clone();
+        let markdown = form.markdown.clone();
+
+        // Reuse an existing claude session id for this ticket if we have one
+        // (e.g. a prior `s start`); otherwise generate one now and persist it via
+        // the daemon. This way a Claude launch from "outside" — including when the
+        // ticket was started in the browser — still gets a stable session id we can
+        // resume later.
+        let mut s = ipc::connect().await?;
+        let existing = match ipc::send_request(
+            &mut s,
+            &Request::GetClaudeSession { ticket_key: key.clone() },
+        )
+        .await?
+        {
+            Response::ClaudeSession { session_id } => session_id,
+            _ => None,
+        };
+        let (session_arg, is_resume, session_id) = if let Some(id) = existing {
+            (format!("--resume {}", shell_escape(&id)), true, id)
+        } else {
+            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
+            let mut s = ipc::connect().await?;
+            let _ = ipc::send_request(
+                &mut s,
+                &Request::SaveClaudeSession {
+                    ticket_key: key.clone(),
+                    session_id: new_id.clone(),
+                },
+            )
+            .await?;
+            (format!("--session-id {}", shell_escape(&new_id)), false, new_id)
+        };
+
+        // On resume, claude already has prior context — skip piping. On new sessions,
+        // pipe the context file as the first message.
+        let cmd = if is_resume {
+            format!("claude {session_arg}")
+        } else {
+            let tmp_dir = std::env::temp_dir();
+            let ctx_path = tmp_dir.join(format!("jui-ctx-{}.md", key));
+            let context = build_claude_context(&t, &project_paths, &markdown);
+            std::fs::write(&ctx_path, context)?;
+            format!(
+                "cat {ctx} | claude {session_arg}",
+                ctx = shell_escape(&ctx_path.display().to_string())
+            )
+        };
+
         let status = std::process::Command::new("tmux")
             .arg("new-window")
             .arg("-c")
@@ -1559,11 +1756,16 @@ impl App {
             .status()?;
         if !status.success() {
             self.status = "tmux new-window failed".into();
-        } else {
-            self.status = format!("opened claude in new tmux window @ {}", top.display());
-            if let Mode::Implementation(form) = &mut self.mode {
-                form.status_line = "claude launched in new tmux window".into();
-            }
+            return Ok(());
+        }
+        let mode = if is_resume { "resumed" } else { "new" };
+        self.status = format!(
+            "claude {mode} @ {} · session {}",
+            top.display(),
+            &session_id[..8.min(session_id.len())]
+        );
+        if let Mode::Implementation(form) = &mut self.mode {
+            form.status_line = format!("claude {mode} in new tmux window");
         }
         Ok(())
     }
@@ -1682,67 +1884,169 @@ impl App {
         Ok(())
     }
 
-    /// Build a tree of the user's tickets walking up parent_key chains. Every ticket in
-    /// the tree is freshly fetched via `Request::GetTicket` so parent links and Epic-Link
-    /// custom fields come from the live API, not the (possibly stale) list response.
-    /// Roots are sorted with Epics first, then by key.
+    pub async fn open_assign_picker(&mut self, purpose: AssignPurpose) -> Result<()> {
+        let Some(t) = self.detail.as_ref() else { return Ok(()) };
+        self.mode = Mode::AssignPicker(AssignPickerForm {
+            key: t.key.clone(),
+            purpose,
+            query: String::new(),
+            results: Vec::new(),
+            selected: 0,
+            error: None,
+        });
+        Ok(())
+    }
+
+    /// Re-run user search and store the new results in the AssignPicker form.
+    pub async fn refresh_assign_picker(&mut self) -> Result<()> {
+        let q = if let Mode::AssignPicker(f) = &self.mode {
+            f.query.clone()
+        } else { return Ok(()); };
+        let mut s = ipc::connect().await?;
+        if let Ok(Response::Users { items, .. }) =
+            ipc::send_request(&mut s, &Request::SearchUsers { query: q }).await
+        {
+            if let Mode::AssignPicker(f) = &mut self.mode {
+                f.results = items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+                if f.selected >= f.results.len() {
+                    f.selected = 0;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn submit_assign_picker(&mut self) -> Result<()> {
+        let Mode::AssignPicker(form) = &self.mode else { return Ok(()) };
+        let key = form.key.clone();
+        let purpose = form.purpose;
+        let picked: Option<(String, String)> = form.results.get(form.selected).cloned();
+        let query_blank = form.query.trim().is_empty();
+
+        // Resolve target user
+        let (id, display): (String, String) = match (purpose, picked, query_blank) {
+            (AssignPurpose::Assignee, Some((name, id)), _) => (id, name),
+            (AssignPurpose::Reviewer, Some((name, id)), _) => (id, name),
+            (AssignPurpose::Assignee, None, true) => match self.my_account_id.clone() {
+                Some(id) => (id, "(me)".into()),
+                None => {
+                    if let Mode::AssignPicker(f) = &mut self.mode {
+                        f.error = Some("no my_account_id loaded — type a name".into());
+                    }
+                    return Ok(());
+                }
+            },
+            (AssignPurpose::Reviewer, None, _) => {
+                if let Mode::AssignPicker(f) = &mut self.mode {
+                    f.error = Some("pick a user — reviewer has no default".into());
+                }
+                return Ok(());
+            }
+            (AssignPurpose::Assignee, None, false) => {
+                if let Mode::AssignPicker(f) = &mut self.mode {
+                    f.error = Some("no matches — refine the query or pick from the list".into());
+                }
+                return Ok(());
+            }
+        };
+
+        let req = match purpose {
+            AssignPurpose::Assignee => Request::AssignTicket { key: key.clone(), assignee: id },
+            AssignPurpose::Reviewer => Request::SetReviewer { key: key.clone(), assignee_id: id },
+        };
+        let mut s = ipc::connect().await?;
+        match ipc::send_request(&mut s, &req).await? {
+            Response::Ok => {
+                self.status = match purpose {
+                    AssignPurpose::Assignee => format!("assigned {key} to {display}"),
+                    AssignPurpose::Reviewer => format!("reviewer set on {key}: {display}"),
+                };
+                self.mode = Mode::Detail;
+                self.load_detail().await?;
+            }
+            Response::Err { message } => {
+                if let Mode::AssignPicker(f) = &mut self.mode {
+                    f.error = Some(message);
+                }
+            }
+            _ => {
+                if let Mode::AssignPicker(f) = &mut self.mode {
+                    f.error = Some("unexpected response".into());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Build a tree of the user's tickets walking up parent_key chains. The daemon
+    /// serves the full set (mine + ancestors) from its SQLite cache in a single IPC
+    /// call — the daemon's hourly warmup task keeps the cache populated.
     pub async fn open_tree(&mut self) -> Result<()> {
         use std::collections::HashMap;
         use std::collections::HashSet;
 
         let mine: HashSet<String> = self.tickets.iter().map(|t| t.key.clone()).collect();
-        let mut by_key: HashMap<String, TreeNode> = HashMap::new();
-        let mut queue: Vec<String> = mine.iter().cloned().collect();
-        let mut seen: HashSet<String> = mine.clone();
-        // Status counter so the user knows the tree is working through ancestors.
-        let total_mine = mine.len();
-        self.status = format!("building tree (0/{total_mine})…");
+        self.status = "loading tree…".into();
 
-        let mut fetched = 0usize;
-        while let Some(key) = queue.pop() {
-            if by_key.contains_key(&key) { continue; }
-            // Daemon serves one request per connection — open a fresh socket each time.
-            let mut s = match ipc::connect().await {
-                Ok(s) => s,
-                Err(e) => {
-                    self.status = format!("tree: daemon unavailable: {e}");
-                    return Ok(());
-                }
-            };
-            let resp = match ipc::send_request(&mut s, &Request::GetTicket { key: key.clone() }).await {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            let t = match resp {
-                Response::Ticket { ticket } => ticket,
-                _ => continue,
-            };
+        let mut s = match ipc::connect().await {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = format!("tree: daemon unavailable: {e}");
+                return Ok(());
+            }
+        };
+        let resp = ipc::send_request(
+            &mut s,
+            &Request::GetTicketsWithAncestors { keys: mine.iter().cloned().collect() },
+        )
+        .await?;
+        let items: Vec<jui_core::ticket::Ticket> = match resp {
+            Response::Tickets { items } => items,
+            Response::Err { message } => {
+                self.status = format!("tree err: {message}");
+                return Ok(());
+            }
+            _ => { self.status = "tree: unexpected response".into(); return Ok(()); }
+        };
+
+        let mut by_key: HashMap<String, TreeNode> = HashMap::new();
+        for t in items {
+            let key = t.key.clone();
             let next_pk = match t.parent_key.clone() {
                 Some(np) if np != key => Some(np),
                 _ => None,
             };
             let is_mine = mine.contains(&key);
             by_key.insert(
-                key.clone(),
+                key,
                 TreeNode {
                     key: t.key,
                     summary: t.summary,
                     status: t.status,
                     issue_type: t.issue_type,
-                    parent_key: next_pk.clone(),
+                    parent_key: next_pk,
                     children: Vec::new(),
                     depth: 0,
                     expanded: true,
                     is_mine,
                 },
             );
-            if let Some(n) = next_pk {
-                if seen.insert(n.clone()) { queue.push(n); }
-            }
-            if is_mine {
-                fetched += 1;
-                self.status = format!("building tree ({fetched}/{total_mine})…");
-            }
+        }
+        // Also drop placeholder nodes for any "mine" that the cache didn't have a parent
+        // entry for — without these, a leaf whose parent_key points to an un-cached
+        // ticket would silently lose context.
+        for m in &mine {
+            by_key.entry(m.clone()).or_insert(TreeNode {
+                key: m.clone(),
+                summary: String::new(),
+                status: String::new(),
+                issue_type: None,
+                parent_key: None,
+                children: Vec::new(),
+                depth: 0,
+                expanded: true,
+                is_mine: true,
+            });
         }
 
         // Materialize a stable ordering: indices in by_key insertion order won't be
@@ -2344,6 +2648,56 @@ fn md_style(
     if italic { s = s.add_modifier(Modifier::ITALIC); }
     if link  { s = s.fg(Color::Blue).add_modifier(Modifier::UNDERLINED); }
     s
+}
+
+/// Send a user-search to the daemon and load the results into the Create form's
+/// assignee picker. Errors are swallowed — picker stays as-is on transport problems.
+async fn refresh_assignee_picker(app: &mut App, query: &str) -> Result<()> {
+    let mut s = ipc::connect().await?;
+    if let Ok(Response::Users { items, .. }) =
+        ipc::send_request(&mut s, &Request::SearchUsers { query: query.to_string() }).await
+    {
+        if let Mode::Create(f) = &mut app.mode {
+            f.assignee_results = items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+            if f.assignee_picker_selected >= f.assignee_results.len() {
+                f.assignee_picker_selected = 0;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// "Started" if the ticket is in an active workflow status OR a worktree exists for it
+/// at the conventional `<repo>/../<repo-name>-worktrees/<slug>` path.
+pub fn is_ticket_started(t: &Ticket) -> bool {
+    let inactive = [
+        "open", "backlog", "to do", "todo", "selected for development",
+        "done", "resolved", "closed",
+    ];
+    let s = t.status.to_ascii_lowercase();
+    let status_active = !inactive.iter().any(|x| *x == s);
+    if status_active {
+        return true;
+    }
+    // Worktree probe — local truth, useful when the user resumed a ticket the daemon
+    // hasn't transitioned (or the Jira workflow uses non-standard status names).
+    if let Ok(cwd) = std::env::current_dir() {
+        let repo = jui_core::scm::detect(&cwd);
+        if matches!(repo.kind, jui_core::scm::ScmKind::Git) {
+            let slug = t.branch_slug();
+            let repo_name = repo
+                .root
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("repo");
+            let parent = repo.root.parent().unwrap_or(&repo.root);
+            let path = parent.join(format!("{}-worktrees", repo_name)).join(&slug);
+            if path.exists() {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn is_epic(n: &TreeNode) -> bool {
@@ -3117,8 +3471,30 @@ async fn detail_comments_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers)
     Ok(())
 }
 
+/// Indices into `app.detail.subtasks` that are currently visible (after the
+/// "hide archived" filter). Returned in the original order.
+pub fn visible_subtask_indices(app: &App) -> Vec<usize> {
+    let Some(t) = &app.detail else { return Vec::new() };
+    if app.show_archived_subtasks {
+        return (0..t.subtasks.len()).collect();
+    }
+    let archived = ["resolved", "done", "closed", "archive", "archived",
+        "won't do", "wont do", "cancelled", "canceled"];
+    t.subtasks.iter().enumerate()
+        .filter(|(_, s)| {
+            let st = s.status.as_deref().unwrap_or("").to_ascii_lowercase();
+            !archived.iter().any(|a| *a == st)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+fn visible_subtasks_for(app: &App) -> usize {
+    visible_subtask_indices(app).len()
+}
+
 async fn detail_subtasks_keys(app: &mut App, code: KeyCode) -> Result<()> {
-    let n = app.detail.as_ref().map(|t| t.subtasks.len()).unwrap_or(0);
+    let n = visible_subtasks_for(app);
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
             if n > 0 {
@@ -3127,6 +3503,18 @@ async fn detail_subtasks_keys(app: &mut App, code: KeyCode) -> Result<()> {
         }
         KeyCode::Char('k') | KeyCode::Up => {
             app.subtask_selected = app.subtask_selected.saturating_sub(1);
+        }
+        KeyCode::Char('A') => {
+            app.show_archived_subtasks = !app.show_archived_subtasks;
+            // Clamp the selection so it stays inside the (possibly smaller) visible range.
+            let visible = visible_subtasks_for(app);
+            if visible == 0 { app.subtask_selected = 0; }
+            else if app.subtask_selected >= visible { app.subtask_selected = visible - 1; }
+            app.status = if app.show_archived_subtasks {
+                "subtasks: showing archived".into()
+            } else {
+                "subtasks: hiding archived".into()
+            };
         }
         KeyCode::Char('a') | KeyCode::Char('+') | KeyCode::Char('T') => {
             // Add a new subtask of the current ticket.
@@ -3140,19 +3528,38 @@ async fn detail_subtasks_keys(app: &mut App, code: KeyCode) -> Result<()> {
                     time_estimate: String::new(),
                     priority: String::new(),
                     field: 2,
-                    parent: Some(t.key.clone()),
+                    assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: Some(t.key.clone()),
                     error: None,
                 });
             }
         }
+        KeyCode::Char('D') => {
+            let real_idx = visible_subtask_indices(app).get(app.subtask_selected).copied();
+            let sub = real_idx.and_then(|i| app.detail.as_ref().and_then(|t| t.subtasks.get(i))).cloned();
+            if let Some(s) = sub {
+                app.mode = Mode::ArchiveConfirm(ArchiveConfirmForm {
+                    key: s.key,
+                    summary: s.summary,
+                    origin: DeleteOrigin::Subtasks, error: None,
+                });
+            }
+        }
         KeyCode::Enter => {
-            // Drill into the selected subtask (replaces self.detail with that ticket).
-            let key = app
-                .detail
-                .as_ref()
-                .and_then(|t| t.subtasks.get(app.subtask_selected))
+            // Drill into the selected subtask. Push the current ticket onto the
+            // back-stack so Esc returns to the parent rather than all the way to List.
+            let real_idx = visible_subtask_indices(app).get(app.subtask_selected).copied();
+            let key = real_idx
+                .and_then(|i| app.detail.as_ref().and_then(|t| t.subtasks.get(i)))
                 .map(|s| s.key.clone());
             if let Some(k) = key {
+                if let Some(parent_key) = app.detail.as_ref().map(|t| t.key.clone()) {
+                    app.nav_stack.push(NavFrame::Detail {
+                        ticket_key: parent_key,
+                        focus: app.detail_focus,
+                        subtask_selected: app.subtask_selected,
+                        comment_selected: app.comment_selected,
+                    });
+                }
                 app.detail_focus = DetailFocus::Info;
                 app.open_ticket_by_key(k).await?;
             }
@@ -3277,6 +3684,33 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         app.should_quit = true;
         return Ok(());
     }
+    // Help overlay: toggle on '?'. While open, swallow other keys until the user closes it.
+    if app.show_help {
+        if matches!(code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')) {
+            app.show_help = false;
+        }
+        return Ok(());
+    }
+    // Don't open help while typing into a text field — '?' is a legal character there.
+    let in_text_input = matches!(
+        &app.mode,
+        Mode::Edit(_)
+            | Mode::Comment(_)
+            | Mode::Create(_)
+            | Mode::EditTime(_)
+            | Mode::EditPriority(_)
+            | Mode::Implementation(_)
+            | Mode::ProjectsAdd(_)
+            | Mode::KanbanFilter(_)
+            | Mode::StartWorkPrompt(_)
+            | Mode::ConfluenceSpaces(_)
+            | Mode::ConfluencePages(_)
+            | Mode::AssignPicker(_)
+    );
+    if !in_text_input && matches!(code, KeyCode::Char('?')) {
+        app.show_help = true;
+        return Ok(());
+    }
     match &mut app.mode {
         Mode::List => match code {
             KeyCode::Char('q') => app.should_quit = true,
@@ -3335,7 +3769,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     time_estimate: String::new(),
                     priority: String::new(),
                     field: 0,
-                    parent: None,
+                    assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: None,
                     error: None,
                 });
             }
@@ -3638,13 +4072,35 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 app.detail_focus = app.detail_focus.prev();
                 return Ok(());
             }
-            // Esc / q always exit to the list, regardless of focus.
+            // Esc / q: pop the back-stack if we have one, otherwise fall back to
+            // the original origin. This keeps Tree → Detail and Detail → Subtask
+            // navigation symmetric.
             if matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
-                app.mode = match app.detail_origin {
-                    DetailOrigin::List => Mode::List,
-                    DetailOrigin::Archive => Mode::Archive,
-                    DetailOrigin::Kanban => Mode::Kanban,
-                };
+                if let Some(frame) = app.nav_stack.pop() {
+                    match frame {
+                        NavFrame::Tree(form) => {
+                            app.mode = Mode::Tree(*form);
+                        }
+                        NavFrame::Detail { ticket_key, focus, subtask_selected, comment_selected } => {
+                            app.open_ticket_by_key(ticket_key).await?;
+                            // Restore the pane focus + cursor positions the user had
+                            // before drilling into the subtask.
+                            app.detail_focus = focus;
+                            app.subtask_selected = subtask_selected;
+                            app.comment_selected = comment_selected;
+                            app.mode = Mode::Detail;
+                        }
+                        NavFrame::List => app.mode = Mode::List,
+                        NavFrame::Archive => app.mode = Mode::Archive,
+                        NavFrame::Kanban => app.mode = Mode::Kanban,
+                    }
+                } else {
+                    app.mode = match app.detail_origin {
+                        DetailOrigin::List => Mode::List,
+                        DetailOrigin::Archive => Mode::Archive,
+                        DetailOrigin::Kanban => Mode::Kanban,
+                    };
+                }
                 return Ok(());
             }
             // Global ticket-level shortcuts — fire regardless of which pane is
@@ -3696,6 +4152,11 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 KeyCode::Char('T') => {
                     if let Some(t) = &app.detail {
+                        let pt = t.issue_type.as_deref().unwrap_or("");
+                        if pt.eq_ignore_ascii_case("sub-task") || pt.eq_ignore_ascii_case("subtask") {
+                            app.status = "can't add a child under a sub-task".into();
+                            return Ok(());
+                        }
                         let project_key = t.key.split('-').next().unwrap_or("").to_string();
                         app.mode = Mode::Create(CreateForm {
                             project: project_key,
@@ -3705,8 +4166,26 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                             time_estimate: String::new(),
                             priority: String::new(),
                             field: 2,
-                            parent: Some(t.key.clone()),
+                            assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: Some(t.key.clone()),
                             error: None,
+                        });
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('@') => {
+                    app.open_assign_picker(AssignPurpose::Assignee).await?;
+                    return Ok(());
+                }
+                KeyCode::Char('R') => {
+                    app.open_assign_picker(AssignPurpose::Reviewer).await?;
+                    return Ok(());
+                }
+                KeyCode::Char('D') => {
+                    if let Some(t) = &app.detail {
+                        app.mode = Mode::ArchiveConfirm(ArchiveConfirmForm {
+                            key: t.key.clone(),
+                            summary: t.summary.clone(),
+                            origin: DeleteOrigin::DetailInfo, error: None,
                         });
                     }
                     return Ok(());
@@ -3771,7 +4250,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         priority: String::new(),
                         // Project + type are prefilled; jump straight to the summary field.
                         field: 2,
-                        parent: Some(t.key.clone()),
+                        assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: Some(t.key.clone()),
                         error: None,
                     });
                 }
@@ -3788,37 +4267,75 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             _ => {}
             }
         },
-        Mode::Create(form) => match code {
-            KeyCode::Esc => app.mode = Mode::List,
-            KeyCode::Tab => form.field = (form.field + 1) % CreateForm::FIELD_COUNT,
-            KeyCode::BackTab => {
-                form.field = if form.field == 0 {
-                    CreateForm::FIELD_COUNT - 1
-                } else {
-                    form.field - 1
-                };
-            }
-            KeyCode::F(5) => { app.submit_create().await?; }
-            KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
-                app.submit_create().await?;
-            }
-            KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
-                app.submit_create().await?;
-            }
-            KeyCode::Enter => {
-                if form.field == CreateForm::FIELD_COUNT - 1 {
-                    app.submit_create().await?;
-                } else {
-                    form.field += 1;
+        Mode::Create(form) => {
+            const ASSIGNEE_FIELD: u8 = CreateForm::FIELD_COUNT - 1;
+            match code {
+                KeyCode::Esc => app.mode = Mode::List,
+                KeyCode::Tab => {
+                    form.field = (form.field + 1) % CreateForm::FIELD_COUNT;
+                    if let Mode::Create(f) = &mut app.mode { f.assignee_picker_selected = 0; }
                 }
+                KeyCode::BackTab => {
+                    form.field = if form.field == 0 {
+                        CreateForm::FIELD_COUNT - 1
+                    } else {
+                        form.field - 1
+                    };
+                    if let Mode::Create(f) = &mut app.mode { f.assignee_picker_selected = 0; }
+                }
+                KeyCode::F(5) => { app.submit_create().await?; }
+                KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                    app.submit_create().await?;
+                }
+                KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
+                    app.submit_create().await?;
+                }
+                // Up/Down on assignee field navigate picker dropdown.
+                KeyCode::Up if form.field == ASSIGNEE_FIELD => {
+                    form.assignee_picker_selected = form.assignee_picker_selected.saturating_sub(1);
+                }
+                KeyCode::Down if form.field == ASSIGNEE_FIELD => {
+                    if !form.assignee_results.is_empty() {
+                        form.assignee_picker_selected =
+                            (form.assignee_picker_selected + 1).min(form.assignee_results.len() - 1);
+                    }
+                }
+                KeyCode::Enter if form.field == ASSIGNEE_FIELD && !form.assignee_results.is_empty() => {
+                    if let Some((name, id)) = form.assignee_results.get(form.assignee_picker_selected).cloned() {
+                        form.assignee = name;
+                        form.assignee_id = Some(id);
+                        form.assignee_results.clear();
+                    }
+                }
+                KeyCode::Enter => {
+                    if form.field == ASSIGNEE_FIELD {
+                        app.submit_create().await?;
+                    } else {
+                        form.field += 1;
+                    }
+                }
+                KeyCode::Backspace => {
+                    form.field_mut().pop();
+                    if form.field == ASSIGNEE_FIELD {
+                        let q = form.assignee.clone();
+                        if q.len() >= 2 {
+                            refresh_assignee_picker(app, &q).await?;
+                        } else if let Mode::Create(f) = &mut app.mode {
+                            f.assignee_results.clear();
+                        }
+                    }
+                }
+                KeyCode::Char(c) => {
+                    form.field_mut().push(c);
+                    if form.field == ASSIGNEE_FIELD {
+                        let q = form.assignee.clone();
+                        if q.len() >= 2 {
+                            refresh_assignee_picker(app, &q).await?;
+                        }
+                    }
+                }
+                _ => {}
             }
-            KeyCode::Backspace => {
-                form.field_mut().pop();
-            }
-            KeyCode::Char(c) => {
-                form.field_mut().push(c);
-            }
-            _ => {}
         },
         Mode::Edit(form) => match code {
             KeyCode::Esc => app.mode = Mode::Detail,
@@ -4251,20 +4768,28 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 if let Mode::Tree(f) = &mut app.mode { f.two_column = !f.two_column; }
             }
             KeyCode::Char('c') => {
-                let parent = if let Mode::Tree(f) = &app.mode {
-                    f.visible.get(f.selected).map(|&i| f.nodes[i].key.clone())
+                let info = if let Mode::Tree(f) = &app.mode {
+                    f.visible.get(f.selected).map(|&i| {
+                        (f.nodes[i].key.clone(), f.nodes[i].issue_type.clone())
+                    })
                 } else { None };
-                if let Some(parent_key) = parent {
+                if let Some((parent_key, parent_type)) = info {
+                    let pt = parent_type.as_deref().unwrap_or("");
+                    if pt.eq_ignore_ascii_case("sub-task") || pt.eq_ignore_ascii_case("subtask") {
+                        app.status = format!("can't add a child under sub-task {}", parent_key);
+                        return Ok(());
+                    }
                     let project_key = parent_key.split('-').next().unwrap_or("").to_string();
+                    let issue_type = if pt.eq_ignore_ascii_case("epic") { "Story" } else { "Sub-task" }.to_string();
                     app.mode = Mode::Create(CreateForm {
                         project: project_key,
-                        issue_type: "Task".into(),
+                        issue_type,
                         summary: String::new(),
                         description: String::new(),
                         time_estimate: String::new(),
                         priority: String::new(),
                         field: 2, // jump to summary
-                        parent: Some(parent_key),
+                        assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: Some(parent_key),
                         error: None,
                     });
                 }
@@ -4278,14 +4803,96 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     if let Some(pos) = app.active_idxs.iter().position(|&i| app.tickets[i].key == key) {
                         app.list_selected = pos;
                     }
-                    // Seed detail stub unconditionally — load_detail uses self.detail as a
-                    // fallback when current_ticket() is None (Tree mode is one of those).
+                    // Push the TreeForm onto the back-stack so Esc returns here.
+                    let prev_mode = std::mem::replace(&mut app.mode, Mode::Detail);
+                    if let Mode::Tree(form) = prev_mode {
+                        app.nav_stack.push(NavFrame::Tree(Box::new(form)));
+                    }
                     let mut stub = Ticket::new_stub();
                     stub.key = key.clone();
                     app.detail = Some(stub);
                     app.status = format!("loading {key}…");
-                    app.mode = Mode::Detail;
                     app.load_detail().await?;
+                }
+            }
+            _ => {}
+        },
+        Mode::ArchiveConfirm(_) => match code {
+            KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => {
+                app.mode = Mode::Detail;
+            }
+            KeyCode::Enter | KeyCode::Char('y') | KeyCode::Char('Y') => {
+                // If the modal is already showing an error, treat Enter as dismiss.
+                let has_error = matches!(&app.mode, Mode::ArchiveConfirm(f) if f.error.is_some());
+                if has_error {
+                    app.mode = Mode::Detail;
+                    return Ok(());
+                }
+                let key = if let Mode::ArchiveConfirm(f) = &app.mode {
+                    f.key.clone()
+                } else { return Ok(()); };
+                let mut s = ipc::connect().await?;
+                match ipc::send_request(&mut s, &Request::ArchiveTicket { key: key.clone() }).await? {
+                    Response::Ok => {
+                        app.status = format!("archived {key}");
+                        app.tickets.retain(|t| t.key != key);
+                        app.recompute_indexes();
+                        app.detail_focus = DetailFocus::Info;
+                        app.subtask_selected = 0;
+                        app.detail = None;
+                        app.mode = Mode::List;
+                        app.refresh().await?;
+                    }
+                    Response::Err { message } => {
+                        if let Mode::ArchiveConfirm(f) = &mut app.mode {
+                            f.error = Some(message.clone());
+                        }
+                        app.status = format!("archive failed: {message}");
+                    }
+                    _ => {
+                        if let Mode::ArchiveConfirm(f) = &mut app.mode {
+                            f.error = Some("unexpected daemon response".into());
+                        }
+                    }
+                }
+            }
+            _ => {}
+        },
+        Mode::AssignPicker(_) => match code {
+            KeyCode::Esc => app.mode = Mode::Detail,
+            KeyCode::Up => {
+                if let Mode::AssignPicker(f) = &mut app.mode {
+                    f.selected = f.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Mode::AssignPicker(f) = &mut app.mode {
+                    if !f.results.is_empty() {
+                        f.selected = (f.selected + 1).min(f.results.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Enter => { app.submit_assign_picker().await?; }
+            KeyCode::Backspace => {
+                if let Mode::AssignPicker(f) = &mut app.mode {
+                    f.query.pop();
+                }
+                let q = if let Mode::AssignPicker(f) = &app.mode { f.query.clone() } else { String::new() };
+                if q.len() >= 2 {
+                    app.refresh_assign_picker().await?;
+                } else if let Mode::AssignPicker(f) = &mut app.mode {
+                    f.results.clear();
+                    f.selected = 0;
+                }
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                if let Mode::AssignPicker(f) = &mut app.mode {
+                    f.query.push(c);
+                    f.error = None;
+                }
+                let q = if let Mode::AssignPicker(f) = &app.mode { f.query.clone() } else { String::new() };
+                if q.len() >= 2 {
+                    app.refresh_assign_picker().await?;
                 }
             }
             _ => {}

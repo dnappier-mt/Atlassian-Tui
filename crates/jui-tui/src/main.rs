@@ -39,6 +39,18 @@ enum Cmd {
 }
 
 fn main() -> Result<()> {
+    // Log to /tmp/jui.log only (stderr would garble the TUI in raw mode).
+    let file = tracing_appender::rolling::never("/tmp", "jui.log");
+    let (file_writer, guard) = tracing_appender::non_blocking(file);
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,jui=debug,jui_core=debug,jui_tui=debug")),
+        )
+        .with_writer(file_writer)
+        .with_ansi(false)
+        .init();
+    Box::leak(Box::new(guard));
     let cli = Cli::parse();
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(async {
