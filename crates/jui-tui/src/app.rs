@@ -158,9 +158,12 @@ pub struct TreeNode {
     pub children: Vec<usize>,
     pub depth: u16,
     pub expanded: bool,
-    /// True for a ticket the user owns (i.e. came from `app.tickets`).
+    /// True for a ticket the user owns (assigned, reviewer, or mentioned).
     /// False for ancestors fetched purely to give context.
     pub is_mine: bool,
+    /// Role badge for the leaf source. Ancestors that are themselves not in any
+    /// of the three sets get `None` and render with no badge.
+    pub role: Option<MentionRole>,
 }
 
 pub struct TreeForm {
@@ -346,6 +349,25 @@ pub enum DetailOrigin {
     Kanban,
 }
 
+/// Why a ticket is showing in the bottom List section / has a non-default badge
+/// in Tree mode. Order matters: when a ticket would qualify for multiple roles,
+/// prefer the more specific one (`Assigned` > `Reviewer` > `Mentioned`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MentionRole {
+    Assigned,
+    Reviewer,
+    Mentioned,
+}
+
+/// The List view is split into two sections: the user's active tickets at the
+/// top and tickets where they're reporter / mentioned at the bottom. Tab in
+/// List mode cycles which section receives `j`/`k` and `Enter`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ListFocus {
+    Active,
+    Mentioned,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum DetailFocus {
     Info,
@@ -505,6 +527,17 @@ pub struct App {
     pub detail_origin: DetailOrigin,
     /// accountId of the user, used to check ownership of comments. Loaded once at startup.
     pub my_account_id: Option<String>,
+    pub my_display_name: Option<String>,
+    /// Tickets where the user is the reviewer (configured custom field).
+    pub reviewing_tickets: Vec<Ticket>,
+    /// Tickets where the user has been @-mentioned (text-indexed). Disjoint
+    /// from `reviewing_tickets`; daemon dedupes.
+    pub mentioned_tickets: Vec<Ticket>,
+    /// Selection index across the **combined** Reviewer + Mentioned list when
+    /// the bottom section of the List view is focused.
+    pub mentioned_selected: usize,
+    /// Which list section in the main view has focus — Shift-Tab cycles.
+    pub list_focus: ListFocus,
     /// Pending two-press deletion: a comment id or a linked-project path.
     pub pending_delete: Option<PendingDelete>,
     pub sort_mode: SortMode,
@@ -586,6 +619,11 @@ impl App {
             detail_focus: DetailFocus::Info,
             detail_origin: DetailOrigin::List,
             my_account_id: None,
+            my_display_name: None,
+            reviewing_tickets: Vec::new(),
+            mentioned_tickets: Vec::new(),
+            mentioned_selected: 0,
+            list_focus: ListFocus::Active,
             pending_delete: None,
             sort_mode: SortMode::Updated,
             expanded_parents: std::collections::HashSet::new(),
@@ -619,11 +657,44 @@ impl App {
     pub async fn load_myself(&mut self) -> Result<()> {
         let mut s = ipc::connect().await?;
         match ipc::send_request(&mut s, &Request::Myself).await? {
-            Response::Myself { info } => self.my_account_id = Some(info.account_id),
+            Response::Myself { info } => {
+                self.my_account_id = Some(info.account_id);
+                self.my_display_name = Some(info.display_name);
+            }
             Response::Err { message } => self.status = format!("auth: {message}"),
             _ => {}
         }
         Ok(())
+    }
+
+    /// Pull tickets where the user is reviewer / @-mentioned (not assigned).
+    /// Best-effort — failures only show in the status bar so a refresh of the
+    /// main list still goes through.
+    pub async fn refresh_mentioned(&mut self) -> Result<()> {
+        let mut s = ipc::connect().await?;
+        match ipc::send_request(&mut s, &Request::ListMyMentions).await? {
+            Response::MyMentions { reviewing, mentioned } => {
+                self.reviewing_tickets = reviewing;
+                self.mentioned_tickets = mentioned;
+                let total = self.reviewing_tickets.len() + self.mentioned_tickets.len();
+                if self.mentioned_selected >= total {
+                    self.mentioned_selected = total.saturating_sub(1);
+                }
+            }
+            Response::Err { message } => self.status = format!("mentions: {message}"),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Combined reviewer + mentioned list, in the order the bottom List section
+    /// renders them (reviewer rows first). `(role, ticket)` tuples.
+    pub fn combined_mentions(&self) -> Vec<(MentionRole, &Ticket)> {
+        let mut out: Vec<(MentionRole, &Ticket)> =
+            Vec::with_capacity(self.reviewing_tickets.len() + self.mentioned_tickets.len());
+        for t in &self.reviewing_tickets { out.push((MentionRole::Reviewer, t)); }
+        for t in &self.mentioned_tickets  { out.push((MentionRole::Mentioned, t)); }
+        out
     }
 
     pub fn comment_is_mine(&self, c: &Comment) -> bool {
@@ -816,7 +887,19 @@ impl App {
     /// Returns the ticket currently selected in whichever list view is active.
     pub fn current_ticket(&self) -> Option<&Ticket> {
         let (idxs, sel) = match self.mode {
-            Mode::List => (&self.active_idxs, self.list_selected),
+            Mode::List => match self.list_focus {
+                ListFocus::Active => (&self.active_idxs, self.list_selected),
+                ListFocus::Mentioned => {
+                    // Reviewer rows come first, then mentioned. Index across both.
+                    let r = self.reviewing_tickets.len();
+                    let i = self.mentioned_selected;
+                    return if i < r {
+                        self.reviewing_tickets.get(i)
+                    } else {
+                        self.mentioned_tickets.get(i - r)
+                    };
+                }
+            },
             Mode::Archive => (&self.inactive_idxs, self.archive_selected),
             Mode::Kanban | Mode::KanbanFilter(_) => {
                 let cols = self.kanban_columns();
@@ -954,6 +1037,11 @@ impl App {
             }
             Response::Err { message } => self.status = format!("err: {message}"),
             _ => self.status = "unexpected response".into(),
+        }
+        // Best-effort refresh of the bottom List section; don't fail the whole
+        // refresh if Jira can't answer the mention JQL.
+        if let Err(e) = self.refresh_mentioned().await {
+            self.status = format!("{} · mentioned err: {e:#}", self.status);
         }
         Ok(())
     }
@@ -1985,7 +2073,34 @@ impl App {
         use std::collections::HashMap;
         use std::collections::HashSet;
 
-        let mine: HashSet<String> = self.tickets.iter().map(|t| t.key.clone()).collect();
+        // Build the role map first so we can tag leaves once we have the data.
+        // Assigned wins over Reviewer wins over Mentioned (duplicates dropped).
+        let assigned: HashSet<String> =
+            self.tickets.iter().map(|t| t.key.clone()).collect();
+        let reviewer: HashSet<String> = self
+            .reviewing_tickets
+            .iter()
+            .map(|t| t.key.clone())
+            .filter(|k| !assigned.contains(k))
+            .collect();
+        let mentioned: HashSet<String> = self
+            .mentioned_tickets
+            .iter()
+            .map(|t| t.key.clone())
+            .filter(|k| !assigned.contains(k) && !reviewer.contains(k))
+            .collect();
+        let role_for = |k: &str| -> Option<MentionRole> {
+            if assigned.contains(k) { Some(MentionRole::Assigned) }
+            else if reviewer.contains(k) { Some(MentionRole::Reviewer) }
+            else if mentioned.contains(k) { Some(MentionRole::Mentioned) }
+            else { None }
+        };
+        // Union seed: every ticket from any of the three sources.
+        let mut seed: Vec<String> = Vec::new();
+        seed.extend(assigned.iter().cloned());
+        seed.extend(reviewer.iter().cloned());
+        seed.extend(mentioned.iter().cloned());
+
         self.status = "loading tree…".into();
 
         let mut s = match ipc::connect().await {
@@ -1997,7 +2112,7 @@ impl App {
         };
         let resp = ipc::send_request(
             &mut s,
-            &Request::GetTicketsWithAncestors { keys: mine.iter().cloned().collect() },
+            &Request::GetTicketsWithAncestors { keys: seed.clone() },
         )
         .await?;
         let items: Vec<jui_core::ticket::Ticket> = match resp {
@@ -2016,7 +2131,8 @@ impl App {
                 Some(np) if np != key => Some(np),
                 _ => None,
             };
-            let is_mine = mine.contains(&key);
+            let role = role_for(&key);
+            let is_mine = role.is_some();
             by_key.insert(
                 key,
                 TreeNode {
@@ -2029,15 +2145,17 @@ impl App {
                     depth: 0,
                     expanded: true,
                     is_mine,
+                    role,
                 },
             );
         }
-        // Also drop placeholder nodes for any "mine" that the cache didn't have a parent
-        // entry for — without these, a leaf whose parent_key points to an un-cached
-        // ticket would silently lose context.
-        for m in &mine {
-            by_key.entry(m.clone()).or_insert(TreeNode {
-                key: m.clone(),
+        // Placeholder nodes for any seed key the cache didn't return — without
+        // these, a leaf whose parent_key points to an un-cached ticket would
+        // silently lose context.
+        for k in &seed {
+            let role = role_for(k);
+            by_key.entry(k.clone()).or_insert(TreeNode {
+                key: k.clone(),
                 summary: String::new(),
                 status: String::new(),
                 issue_type: None,
@@ -2045,7 +2163,8 @@ impl App {
                 children: Vec::new(),
                 depth: 0,
                 expanded: true,
-                is_mine: true,
+                is_mine: role.is_some(),
+                role,
             });
         }
 
@@ -3714,14 +3833,35 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
     match &mut app.mode {
         Mode::List => match code {
             KeyCode::Char('q') => app.should_quit = true,
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !app.active_idxs.is_empty() {
-                    app.list_selected = (app.list_selected + 1).min(app.active_idxs.len() - 1);
+            KeyCode::BackTab => {
+                // Shift-Tab cycles focus between the Active list and the
+                // Mentioned list at the bottom.
+                app.list_focus = match app.list_focus {
+                    ListFocus::Active => ListFocus::Mentioned,
+                    ListFocus::Mentioned => ListFocus::Active,
+                };
+            }
+            KeyCode::Char('j') | KeyCode::Down => match app.list_focus {
+                ListFocus::Active => {
+                    if !app.active_idxs.is_empty() {
+                        app.list_selected = (app.list_selected + 1).min(app.active_idxs.len() - 1);
+                    }
                 }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                app.list_selected = app.list_selected.saturating_sub(1);
-            }
+                ListFocus::Mentioned => {
+                    let n = app.reviewing_tickets.len() + app.mentioned_tickets.len();
+                    if n > 0 {
+                        app.mentioned_selected = (app.mentioned_selected + 1).min(n - 1);
+                    }
+                }
+            },
+            KeyCode::Char('k') | KeyCode::Up => match app.list_focus {
+                ListFocus::Active => {
+                    app.list_selected = app.list_selected.saturating_sub(1);
+                }
+                ListFocus::Mentioned => {
+                    app.mentioned_selected = app.mentioned_selected.saturating_sub(1);
+                }
+            },
             KeyCode::Char('r') => { app.refresh().await?; }
             KeyCode::Char('o') => {
                 app.sort_mode = app.sort_mode.next();
@@ -3740,6 +3880,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             KeyCode::Char('f') => { app.open_confluence_spaces().await?; }
             KeyCode::Char('T') => { app.open_tree().await?; }
             KeyCode::Tab => {
+                // Tab expands subtasks in the Active section; no-op in Mentioned.
+                if app.list_focus != ListFocus::Active { return Ok(()); }
                 if let Some(&t_idx) = app.active_idxs.get(app.list_selected) {
                     let key = app.tickets[t_idx].key.clone();
                     let has_children = app.parent_child_counts.get(&key).copied().unwrap_or(0) > 0;

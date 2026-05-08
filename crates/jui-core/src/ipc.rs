@@ -20,6 +20,11 @@ pub enum Request {
     /// individual round-trips. Daemon's hourly warmup task keeps the cache
     /// populated with parents.
     GetTicketsWithAncestors { keys: Vec<String> },
+    /// Open tickets where the user is the **reviewer** (per the configured
+    /// reviewer custom field) or has been **@-mentioned** in the description /
+    /// comments — and is *not* the assignee. Daemon issues both queries and
+    /// returns them tagged so the TUI can render `[R]` vs `[@]` badges.
+    ListMyMentions,
     DeleteTicket { key: String },
     /// Transition the ticket to a "closed" state. Daemon picks the first available
     /// transition matching (case-insensitive): Won't Do, Cancelled, Closed, Done.
@@ -89,6 +94,9 @@ pub enum Request {
 pub enum Response {
     Pong,
     Tickets { items: Vec<Ticket> },
+    /// Pair of result lists for `ListMyMentions`. Reviewer takes precedence on
+    /// overlap; daemon dedupes by key before returning.
+    MyMentions { reviewing: Vec<Ticket>, mentioned: Vec<Ticket> },
     Ticket { ticket: Ticket },
     StartWork { reply: StartWorkReply },
     Created { key: String },

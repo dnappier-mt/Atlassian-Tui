@@ -370,6 +370,46 @@ async fn dispatch(
             Ok(Response::Myself { info })
         }
 
+        Request::ListMyMentions => {
+            // Reviewer: configured custom field == currentUser().
+            // Mentioned: text contains "@<display name>" (Jira's text index
+            // tokenises @-mentions as the display name).
+            // Both exclude tickets the user is already assigned to and only
+            // include open issues. Reviewer takes precedence over mention on
+            // overlap so the TUI's [R] badge wins over [@].
+            let api = JiraApi::from_jira_cli_config()?;
+            let me = api.myself().await?;
+            let display = me.display_name.replace('"', "\\\"");
+
+            // Strip "customfield_" prefix to get the numeric id JQL expects.
+            let cf_id = state
+                .config
+                .jira
+                .reviewer_customfield
+                .strip_prefix("customfield_")
+                .unwrap_or(&state.config.jira.reviewer_customfield)
+                .to_string();
+            let reviewer_jql = format!(
+                "cf[{cf_id}] = currentUser() AND assignee != currentUser() AND statusCategory != Done"
+            );
+            let mention_jql = format!(
+                "text ~ \"@{display}\" AND assignee != currentUser() AND statusCategory != Done"
+            );
+
+            let reviewing = state.jira.search(&reviewer_jql, 50).await.unwrap_or_default();
+            let mut mentioned = state.jira.search(&mention_jql, 50).await.unwrap_or_default();
+            // Dedupe — drop anything from `mentioned` that already appears in `reviewing`.
+            let reviewer_keys: std::collections::HashSet<String> =
+                reviewing.iter().map(|t| t.key.clone()).collect();
+            mentioned.retain(|t| !reviewer_keys.contains(&t.key));
+            tracing::info!(
+                reviewing = reviewing.len(),
+                mentioned = mentioned.len(),
+                "ListMyMentions"
+            );
+            Ok(Response::MyMentions { reviewing, mentioned })
+        }
+
         Request::ListProjects => {
             // Re-read config every call so external edits show up.
             let cfg = GlobalConfig::load().unwrap_or_default();

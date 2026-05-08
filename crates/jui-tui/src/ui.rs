@@ -1,4 +1,4 @@
-use crate::app::{App, AssignPurpose, DetailFocus, DetailLinkedProject, Mode, PageLine, PendingDelete, TreeForm, TreeNode};
+use crate::app::{App, AssignPurpose, DetailFocus, DetailLinkedProject, MentionRole, Mode, PageLine, PendingDelete, TreeForm, TreeNode};
 use jui_core::ticket::{fmt_date, fmt_seconds, parse_reply, priority_rank, Comment};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -109,6 +109,31 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_list(f: &mut Frame, area: Rect, app: &App) {
+    use crate::app::ListFocus;
+    use ratatui::layout::{Constraint, Direction, Layout};
+    // Split into Active (top) + Mentioned (bottom). Mentioned grows with row
+    // count, capped at ~40% of the inner area so the active list still leads.
+    let mentioned_rows = app.mentioned_tickets.len() as u16;
+    let mentioned_h = if mentioned_rows == 0 {
+        4 // "(none)" stub + border
+    } else {
+        (mentioned_rows + 2).clamp(5, (area.height / 2).max(5))
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(8),
+            Constraint::Length(mentioned_h),
+        ])
+        .split(area);
+    draw_list_active(f, chunks[0], app);
+    draw_list_mentioned(f, chunks[1], app);
+    let _ = ListFocus::Active; // imported for the helper fns below
+}
+
+fn draw_list_active(f: &mut Frame, area: Rect, app: &App) {
+    use crate::app::ListFocus;
+    let focused = app.list_focus == ListFocus::Active;
     // Grow key/status columns when the pane is wide so they don't butt up
     // against each other. Borders eat 2 cells; baseline target ≈ 80 cols.
     let extra = (area.width as usize).saturating_sub(2).saturating_sub(80);
@@ -183,7 +208,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let mut state = ListState::default();
-    state.select(if app.active_idxs.is_empty() { None } else { Some(app.list_selected) });
+    state.select(if app.active_idxs.is_empty() || !focused { None } else { Some(app.list_selected) });
     let title = format!(
         " active tickets — {} · sort: {} {}",
         app.active_idxs.len(),
@@ -195,10 +220,86 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
         }
     );
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
+        .block(Block::default().borders(Borders::ALL).border_style(focus_border(focused)).title(title))
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
-        .highlight_symbol("▶ ");
+        .highlight_symbol(if focused { "▶ " } else { "  " });
     f.render_stateful_widget(list, area, &mut state);
+}
+
+fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
+    use crate::app::ListFocus;
+    let focused = app.list_focus == ListFocus::Mentioned;
+    let combined = app.combined_mentions();
+    let total = combined.len();
+    let r = app.reviewing_tickets.len();
+    let m = app.mentioned_tickets.len();
+    let title = format!(
+        " reviewing + mentioned — {r} reviewer · {m} @ (Shift+Tab to focus) "
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(focus_border(focused))
+        .title(title);
+
+    if combined.is_empty() {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                " (none) — you're not a reviewer or @-mentioned on any open tickets",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )),
+            inner,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = combined
+        .iter()
+        .map(|(role, t)| {
+            let (badge, badge_style) = role_badge(*role);
+            let (glyph, glyph_style) = issue_type_glyph(t.issue_type.as_deref());
+            let line = Line::from(vec![
+                Span::styled(format!(" {badge} "), badge_style),
+                Span::styled(format!("{glyph} "), glyph_style),
+                Span::styled(format!("{:<12} ", t.key), Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    format!("{:<14} ", truncate(&t.status, 14)),
+                    Style::default().fg(Color::Green),
+                ),
+                priority_span(t.priority.as_deref()),
+                Span::raw(" "),
+                Span::raw(t.summary.clone()),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(if focused && total > 0 { Some(app.mentioned_selected.min(total - 1)) } else { None });
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol(if focused { "▶ " } else { "  " });
+    f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Badge text + style for a role. `[A]` = assigned (rarely used since assigned
+/// is the default in most renders), `[R]` = reviewer, `[@]` = mentioned.
+fn role_badge(role: MentionRole) -> (&'static str, Style) {
+    match role {
+        MentionRole::Assigned => (
+            "[A]",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        MentionRole::Reviewer => (
+            "[R]",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ),
+        MentionRole::Mentioned => (
+            "[@]",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+    }
 }
 
 fn draw_archive(f: &mut Frame, area: Rect, app: &App) {
@@ -1769,6 +1870,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
         Mode::List => vec![
             ("j/k", "move"),
             ("tab", "expand subtasks"),
+            ("S-tab", "toggle section"),
             ("enter", "open"),
             ("r", "refresh"),
             ("o", "sort"),
@@ -2778,17 +2880,27 @@ fn tree_node_line(node: &TreeNode, selected: bool) -> Line<'static> {
     let summary = if node.summary.is_empty() { "—".to_string() } else { node.summary.clone() };
     let type_color_v = type_color(node.issue_type.as_deref());
     let label = type_label(node.issue_type.as_deref());
-    Line::from(vec![
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled(format!("{indent}{arrow}"), Style::default().fg(Color::DarkGray)),
         Span::styled(format!("{glyph} "), Style::default().fg(type_color_v)),
         Span::styled(label.to_string(), Style::default().fg(type_color_v).add_modifier(Modifier::BOLD)),
         Span::styled("  ", Style::default()),
-        Span::styled(node.key.clone(), key_style),
-        Span::styled("  ", Style::default()),
-        Span::styled(summary, summary_style),
-        Span::styled(format!("  [{}]", node.status), Style::default().fg(Color::DarkGray)),
-    ])
-    .style(bg)
+    ];
+    // Role badge (only on leaves the user actually owns; ancestors get blanks
+    // so columns line up).
+    let badge_width = "[X] ".len();
+    if let Some(role) = node.role {
+        let (badge, style) = role_badge(role);
+        spans.push(Span::styled(badge.to_string(), style));
+        spans.push(Span::raw(" "));
+    } else {
+        spans.push(Span::raw(" ".repeat(badge_width)));
+    }
+    spans.push(Span::styled(node.key.clone(), key_style));
+    spans.push(Span::styled("  ", Style::default()));
+    spans.push(Span::styled(summary, summary_style));
+    spans.push(Span::styled(format!("  [{}]", node.status), Style::default().fg(Color::DarkGray)));
+    Line::from(spans).style(bg)
 }
 
 fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
