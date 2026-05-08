@@ -110,6 +110,25 @@ impl Cache {
             );
             CREATE INDEX IF NOT EXISTS confluence_pages_parent
                 ON confluence_pages(space_key, parent_id);
+            CREATE TABLE IF NOT EXISTS comments (
+                ticket_key TEXT NOT NULL,
+                idx        INTEGER NOT NULL,
+                id         TEXT,
+                account_id TEXT,
+                author     TEXT NOT NULL,
+                created    TEXT NOT NULL,
+                body       TEXT NOT NULL,
+                cached_at  INTEGER NOT NULL,
+                PRIMARY KEY (ticket_key, idx)
+            );
+            CREATE INDEX IF NOT EXISTS comments_ticket ON comments(ticket_key);
+            CREATE TABLE IF NOT EXISTS mentions (
+                role       TEXT NOT NULL,        -- 'reviewer' | 'mentioned'
+                idx        INTEGER NOT NULL,
+                ticket_key TEXT NOT NULL,
+                cached_at  INTEGER NOT NULL,
+                PRIMARY KEY (role, idx)
+            );
             "#,
         )?;
         // Idempotent additive migrations — `ALTER TABLE ADD COLUMN` errors if column
@@ -223,7 +242,115 @@ impl Cache {
 
     pub fn delete_ticket(&self, key: &str) -> Result<()> {
         self.conn.execute("DELETE FROM tickets WHERE key = ?1", [key])?;
+        self.conn.execute("DELETE FROM comments WHERE ticket_key = ?1", [key])?;
         Ok(())
+    }
+
+    /// Replace the cached comments for `ticket_key`. Order is preserved via `idx`.
+    pub fn upsert_comments(&mut self, ticket_key: &str, items: &[crate::ticket::Comment]) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM comments WHERE ticket_key = ?1", [ticket_key])?;
+        {
+            let mut stmt = tx.prepare(
+                r#"INSERT INTO comments (ticket_key, idx, id, account_id, author, created, body, cached_at)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+            )?;
+            for (i, c) in items.iter().enumerate() {
+                stmt.execute(rusqlite::params![
+                    ticket_key,
+                    i as i64,
+                    c.id,
+                    c.account_id,
+                    c.author,
+                    c.created,
+                    c.body,
+                    now,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_comments(&self, ticket_key: &str) -> Result<Vec<crate::ticket::Comment>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT id, account_id, author, created, body
+               FROM comments WHERE ticket_key = ?1 ORDER BY idx"#,
+        )?;
+        let rows = stmt.query_map([ticket_key], |r| {
+            Ok(crate::ticket::Comment {
+                id: r.get(0)?,
+                account_id: r.get(1)?,
+                author: r.get(2)?,
+                created: r.get(3)?,
+                body: r.get(4)?,
+            })
+        })?;
+        let v: Vec<_> = rows.filter_map(|r| r.ok()).collect();
+        Ok(v)
+    }
+
+    /// Seconds since these comments were last refreshed. None means cache miss.
+    pub fn comments_age_secs(&self, ticket_key: &str) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT MAX(cached_at) FROM comments WHERE ticket_key = ?1",
+        )?;
+        let now = chrono::Utc::now().timestamp();
+        let mut rows = stmt.query([ticket_key])?;
+        if let Some(row) = rows.next()? {
+            let ts: Option<i64> = row.get(0)?;
+            return Ok(ts.map(|t| now - t));
+        }
+        Ok(None)
+    }
+
+    /// Replace the cached `mentions` table for the given role. Order via `idx`.
+    pub fn upsert_mentions(&mut self, role: &str, keys: &[String]) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        let tx = self.conn.transaction()?;
+        tx.execute("DELETE FROM mentions WHERE role = ?1", [role])?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO mentions (role, idx, ticket_key, cached_at) VALUES (?1, ?2, ?3, ?4)",
+            )?;
+            for (i, k) in keys.iter().enumerate() {
+                stmt.execute(rusqlite::params![role, i as i64, k, now])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Resolve cached mention rows back to full Tickets via the `tickets` table,
+    /// preserving the role's stored order.
+    pub fn get_mentions(&self, role: &str) -> Result<Vec<Ticket>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket_key FROM mentions WHERE role = ?1 ORDER BY idx",
+        )?;
+        let keys: Vec<String> = stmt
+            .query_map([role], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let mut out = Vec::with_capacity(keys.len());
+        for k in keys {
+            if let Some(t) = self.get_ticket(&k)? {
+                out.push(t);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Age of the freshest mention row for the given role (cache freshness check).
+    pub fn mentions_age_secs(&self, role: &str) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare("SELECT MAX(cached_at) FROM mentions WHERE role = ?1")?;
+        let now = chrono::Utc::now().timestamp();
+        let mut rows = stmt.query([role])?;
+        if let Some(row) = rows.next()? {
+            let ts: Option<i64> = row.get(0)?;
+            return Ok(ts.map(|t| now - t));
+        }
+        Ok(None)
     }
 
     pub fn known_keys(&self) -> Result<Vec<String>> {

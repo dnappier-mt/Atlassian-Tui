@@ -162,6 +162,18 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { ancestor_warmup_loop(state).await });
     }
 
+    // Comment + mentions warmup. First run delayed so login / refresh have
+    // a chance to populate the tickets table; both then re-run on the same
+    // cadence as poll_loop.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+            warm_comments(&state).await;
+            refresh_my_mentions(&state).await;
+        });
+    }
+
     // Tmux status writer.
     {
         let state = state.clone();
@@ -350,17 +362,42 @@ async fn dispatch(
 
         Request::AddComment { key, body } => {
             state.jira.add_comment(&key, &body).await?;
+            // Async refresh of the affected ticket's comments + view.
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
             Ok(Response::Ok)
         }
 
         Request::ListComments { key } => {
-            let items = state.jira.comments(&key).await?;
-            Ok(Response::Comments { items })
+            // Cache-first. Spawn an async refresh if the cache is stale (older
+            // than 5 minutes) but still serve the cached rows immediately so the
+            // detail pane never blocks on a Jira round-trip.
+            const STALE: i64 = 300;
+            let cached = state.cache.lock().await.get_comments(&key)?;
+            let age = state.cache.lock().await.comments_age_secs(&key)?;
+            let cache_hit = age.is_some();
+            if !cache_hit || age.map(|a| a > STALE).unwrap_or(true) {
+                let s2 = state.clone();
+                let k2 = key.clone();
+                tokio::spawn(async move { refresh_comments(&s2, &k2).await; });
+            }
+            if cache_hit {
+                Ok(Response::Comments { items: cached })
+            } else {
+                // First-ever fetch — pull live now so the user sees real comments.
+                let items = state.jira.comments(&key).await?;
+                let _ = state.cache.lock().await.upsert_comments(&key, &items);
+                Ok(Response::Comments { items })
+            }
         }
 
         Request::DeleteComment { key, comment_id } => {
             let api = JiraApi::from_jira_cli_config()?;
             api.delete_comment(&key, &comment_id).await?;
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
             Ok(Response::Ok)
         }
 
@@ -371,42 +408,29 @@ async fn dispatch(
         }
 
         Request::ListMyMentions => {
-            // Reviewer: configured custom field == currentUser().
-            // Mentioned: text contains "@<display name>" (Jira's text index
-            // tokenises @-mentions as the display name).
-            // Both exclude tickets the user is already assigned to and only
-            // include open issues. Reviewer takes precedence over mention on
-            // overlap so the TUI's [R] badge wins over [@].
-            let api = JiraApi::from_jira_cli_config()?;
-            let me = api.myself().await?;
-            let display = me.display_name.replace('"', "\\\"");
-
-            // Strip "customfield_" prefix to get the numeric id JQL expects.
-            let cf_id = state
-                .config
-                .jira
-                .reviewer_customfield
-                .strip_prefix("customfield_")
-                .unwrap_or(&state.config.jira.reviewer_customfield)
-                .to_string();
-            let reviewer_jql = format!(
-                "cf[{cf_id}] = currentUser() AND assignee != currentUser() AND statusCategory != Done"
-            );
-            let mention_jql = format!(
-                "text ~ \"@{display}\" AND assignee != currentUser() AND statusCategory != Done"
-            );
-
-            let reviewing = state.jira.search(&reviewer_jql, 50).await.unwrap_or_default();
-            let mut mentioned = state.jira.search(&mention_jql, 50).await.unwrap_or_default();
-            // Dedupe — drop anything from `mentioned` that already appears in `reviewing`.
-            let reviewer_keys: std::collections::HashSet<String> =
-                reviewing.iter().map(|t| t.key.clone()).collect();
-            mentioned.retain(|t| !reviewer_keys.contains(&t.key));
-            tracing::info!(
-                reviewing = reviewing.len(),
-                mentioned = mentioned.len(),
-                "ListMyMentions"
-            );
+            // Cache-first. The poll loop refreshes mentions periodically; we
+            // also kick off an async refresh if the cache is older than 5 min.
+            const STALE: i64 = 300;
+            let (reviewing, mentioned) = {
+                let cache = state.cache.lock().await;
+                (cache.get_mentions("reviewer")?, cache.get_mentions("mentioned")?)
+            };
+            let age_r = state.cache.lock().await.mentions_age_secs("reviewer")?;
+            let age_m = state.cache.lock().await.mentions_age_secs("mentioned")?;
+            let stale = age_r.map(|a| a > STALE).unwrap_or(true)
+                || age_m.map(|a| a > STALE).unwrap_or(true);
+            if reviewing.is_empty() && mentioned.is_empty() {
+                // First-ever — populate now so the TUI gets real rows.
+                refresh_my_mentions(&state).await;
+                let cache = state.cache.lock().await;
+                let reviewing = cache.get_mentions("reviewer")?;
+                let mentioned = cache.get_mentions("mentioned")?;
+                return Ok(Response::MyMentions { reviewing, mentioned });
+            }
+            if stale {
+                let s2 = state.clone();
+                tokio::spawn(async move { refresh_my_mentions(&s2).await; });
+            }
             Ok(Response::MyMentions { reviewing, mentioned })
         }
 
@@ -579,6 +603,9 @@ async fn dispatch(
 
         Request::Transition { key, to } => {
             state.jira.transition(&key, &to).await?;
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
             Ok(Response::Ok)
         }
 
@@ -593,6 +620,17 @@ async fn dispatch(
                 .jira
                 .create(&project, &issue_type, &summary, body.as_deref(), parent.as_deref())
                 .await?;
+            // Pull the new ticket into cache + refresh the parent's view so its
+            // subtasks list updates without waiting for the next poll tick.
+            let s2 = state.clone();
+            let k2 = key.clone();
+            let parent_key = parent.clone();
+            tokio::spawn(async move {
+                refresh_ticket_after_mutation(&s2, &k2).await;
+                if let Some(p) = parent_key {
+                    refresh_ticket_after_mutation(&s2, &p).await;
+                }
+            });
             Ok(Response::Created { key })
         }
 
@@ -649,17 +687,29 @@ async fn dispatch(
             } else {
                 state.jira.assign(&key, &assignee).await?;
             }
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
             Ok(Response::Ok)
         }
 
         Request::SetReviewer { key, assignee_id } => {
             let api = JiraApi::from_jira_cli_config()?;
             api.set_reviewer(&key, &assignee_id, &state.config.jira.reviewer_customfield).await?;
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move {
+                refresh_ticket_after_mutation(&s2, &k2).await;
+                refresh_my_mentions(&s2).await;
+            });
             Ok(Response::Ok)
         }
 
         Request::EditSummary { key, summary } => {
             state.jira.edit_summary(&key, &summary).await?;
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
             Ok(Response::Ok)
         }
 
@@ -668,6 +718,9 @@ async fn dispatch(
             // instances. The REST PUT endpoint reliably accepts {"name": ...}.
             let api = JiraApi::from_jira_cli_config()?;
             api.set_priority(&key, &priority).await?;
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
             Ok(Response::Ok)
         }
 
@@ -680,6 +733,9 @@ async fn dispatch(
         Request::SetEstimate { key, original, remaining } => {
             let api = JiraApi::from_jira_cli_config()?;
             api.set_estimate(&key, original.as_deref(), remaining.as_deref()).await?;
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
             Ok(Response::Ok)
         }
 
@@ -890,6 +946,93 @@ async fn warm_ticket_ancestors(state: &State) {
     info!(fetched, ancestors_added, "ticket warmup complete");
 }
 
+/// Re-fetch a single ticket's view + comments from Jira and update the cache.
+/// Used after mutations so the next cache read sees fresh data.
+async fn refresh_ticket_after_mutation(state: &State, key: &str) {
+    if let Ok(t) = state.jira.view(key).await {
+        if let Err(e) = state.cache.lock().await.upsert_tickets(std::slice::from_ref(&t)) {
+            warn!(%key, "post-mutation ticket upsert: {e:#}");
+        }
+    }
+    refresh_comments(state, key).await;
+}
+
+async fn refresh_comments(state: &State, key: &str) {
+    match state.jira.comments(key).await {
+        Ok(items) => {
+            if let Err(e) = state.cache.lock().await.upsert_comments(key, &items) {
+                warn!(%key, "comment upsert: {e:#}");
+            }
+        }
+        Err(e) => warn!(%key, "comment refresh: {e:#}"),
+    }
+}
+
+/// Pull every cached ticket's comments and stash them. Pricey on first run
+/// (one Jira API call per ticket) but turns Detail-open into a SQLite read
+/// after that. Polite delay between calls.
+async fn warm_comments(state: &State) {
+    let keys: Vec<String> = match state.cache.lock().await.list_tickets(10_000) {
+        Ok(t) => t.into_iter().map(|x| x.key).collect(),
+        Err(e) => { warn!("comment warmup: list_tickets failed: {e:#}"); return; }
+    };
+    let total = keys.len();
+    let mut fetched = 0usize;
+    for k in keys {
+        refresh_comments(state, &k).await;
+        fetched += 1;
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    info!(fetched, total, "comment warmup complete");
+}
+
+/// Run the reviewer + @-mention JQLs and store the resulting key lists in the
+/// `mentions` table. Uses tickets that should already be in the `tickets` table
+/// (poll_loop ensures this); skips upsert of full Ticket rows so we don't
+/// thrash the cache from this hot path.
+async fn refresh_my_mentions(state: &State) {
+    let api = match JiraApi::from_jira_cli_config() {
+        Ok(a) => a,
+        Err(e) => { warn!("mentions refresh: api config: {e:#}"); return; }
+    };
+    let me = match api.myself().await {
+        Ok(m) => m,
+        Err(e) => { warn!("mentions refresh: myself: {e:#}"); return; }
+    };
+    let display = me.display_name.replace('"', "\\\"");
+    let cf_id = state
+        .config
+        .jira
+        .reviewer_customfield
+        .strip_prefix("customfield_")
+        .unwrap_or(&state.config.jira.reviewer_customfield)
+        .to_string();
+    let reviewer_jql = format!(
+        "cf[{cf_id}] = currentUser() AND assignee != currentUser() AND statusCategory != Done"
+    );
+    let mention_jql = format!(
+        "text ~ \"@{display}\" AND assignee != currentUser() AND statusCategory != Done"
+    );
+    let reviewing = state.jira.search(&reviewer_jql, 50).await.unwrap_or_default();
+    let mut mentioned = state.jira.search(&mention_jql, 50).await.unwrap_or_default();
+    let reviewer_keys: std::collections::HashSet<String> =
+        reviewing.iter().map(|t| t.key.clone()).collect();
+    mentioned.retain(|t| !reviewer_keys.contains(&t.key));
+
+    // Persist the full Ticket rows (so get_mentions can resolve them) AND the
+    // lightweight role → key list.
+    {
+        let mut cache = state.cache.lock().await;
+        let _ = cache.upsert_tickets(&reviewing);
+        let _ = cache.upsert_tickets(&mentioned);
+        let r_keys: Vec<String> = reviewing.iter().map(|t| t.key.clone()).collect();
+        let m_keys: Vec<String> = mentioned.iter().map(|t| t.key.clone()).collect();
+        let _ = cache.upsert_mentions("reviewer", &r_keys);
+        let _ = cache.upsert_mentions("mentioned", &m_keys);
+    }
+    info!(reviewing = reviewing.len(), mentioned = mentioned.len(), "mentions refreshed");
+}
+
 async fn ancestor_warmup_loop(state: Arc<State>) {
     // Initial run after a small delay so login / refresh have happened.
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -909,6 +1052,10 @@ async fn poll_loop(state: Arc<State>) {
         if let Err(e) = poll_once(&state).await {
             warn!("poll failed: {e:#}");
         }
+        // Refresh mentions on every poll tick — cheap (two JQL searches) and
+        // keeps the bottom List section / Tree-mode badges in sync with the
+        // server even if the user never triggers a mutation.
+        refresh_my_mentions(&state).await;
         iv.tick().await;
     }
 }

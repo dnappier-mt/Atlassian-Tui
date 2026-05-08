@@ -3520,14 +3520,12 @@ async fn main_loop<B: ratatui::backend::Backend>(
                 if k.kind != KeyEventKind::Press {
                     continue;
                 }
-                let was_list = matches!(app.mode, Mode::List | Mode::Archive);
                 handle_key(app, k.code, k.modifiers).await?;
-                let now_list = matches!(app.mode, Mode::List | Mode::Archive);
-                if now_list && !was_list {
-                    if let Err(e) = app.refresh().await {
-                        app.status = format!("refresh failed: {e:#}");
-                    }
-                }
+                // Note: List/Archive intentionally don't auto-refresh on mode
+                // transition any more — the daemon cache is kept hot via the
+                // poll loop and via async refresh-after-mutation, so the user
+                // only pays the Jira round-trip when they explicitly press 'r'
+                // or change something.
             }
         }
         if app.should_quit {
