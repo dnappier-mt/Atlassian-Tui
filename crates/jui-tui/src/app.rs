@@ -399,6 +399,36 @@ pub enum MentionRole {
     Mentioned,
 }
 
+/// User-managed workflow state for a PR the user is reviewing. Stored per
+/// ticket-key in SQLite via the daemon. Distinct from GitHub's own PR state
+/// (open/closed/merged) — this is "where am I in my review process".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PrUserState {
+    /// Default — PR has shown up in jui but the user hasn't started yet.
+    Awaiting,
+    /// User pressed `Q` (begin DevQA) — actively reviewing.
+    Reviewing,
+    /// User marked done via `K` in Detail.
+    Completed,
+}
+
+impl PrUserState {
+    pub fn from_db(s: &str) -> Self {
+        match s {
+            "reviewing" => Self::Reviewing,
+            "completed" => Self::Completed,
+            _ => Self::Awaiting,
+        }
+    }
+    pub fn to_db(&self) -> &'static str {
+        match self {
+            Self::Awaiting => "awaiting",
+            Self::Reviewing => "reviewing",
+            Self::Completed => "completed",
+        }
+    }
+}
+
 /// The List view is split into two sections: the user's active tickets at the
 /// top and tickets where they're reporter / mentioned at the bottom. Tab in
 /// List mode cycles which section receives `j`/`k` and `Enter`.
@@ -580,6 +610,12 @@ pub struct App {
     /// ticket is tied to a GitHub PR.
     pub pr_comments: Vec<jui_core::github::PrComment>,
     pub pr_comment_selected: usize,
+    /// User-managed PR review state per ticket key (Awaiting / Reviewing /
+    /// Completed). Loaded from the daemon on refresh.
+    pub pr_user_states: std::collections::HashMap<String, PrUserState>,
+    /// When false, Completed PRs are filtered out of the bottom List section
+    /// and Tree mode. Toggle with `K` in the bottom List section.
+    pub show_completed_prs: bool,
     /// Tickets where the user has been @-mentioned in Jira text (description /
     /// comments). Disjoint from `reviewing_tickets` and `github_tickets`.
     pub mentioned_tickets: Vec<Ticket>,
@@ -674,6 +710,8 @@ impl App {
             github_tickets: Vec::new(),
             pr_comments: Vec::new(),
             pr_comment_selected: 0,
+            pr_user_states: std::collections::HashMap::new(),
+            show_completed_prs: false,
             mentioned_tickets: Vec::new(),
             mentioned_selected: 0,
             list_focus: ListFocus::Active,
@@ -720,6 +758,44 @@ impl App {
         Ok(())
     }
 
+    /// Lookup the user's review state for a ticket. Default `Awaiting` when
+    /// the ticket has never been touched.
+    pub fn pr_state(&self, ticket_key: &str) -> PrUserState {
+        self.pr_user_states
+            .get(ticket_key)
+            .copied()
+            .unwrap_or(PrUserState::Awaiting)
+    }
+
+    /// Persist a state change via the daemon and update the local cache so
+    /// the UI reflects it immediately.
+    pub async fn set_pr_state(&mut self, ticket_key: &str, new_state: PrUserState) -> Result<()> {
+        let mut s = ipc::connect().await?;
+        let _ = ipc::send_request(
+            &mut s,
+            &Request::SetPrUserState {
+                ticket_key: ticket_key.to_string(),
+                state: new_state.to_db().to_string(),
+            },
+        )
+        .await?;
+        self.pr_user_states.insert(ticket_key.to_string(), new_state);
+        Ok(())
+    }
+
+    pub async fn refresh_pr_user_states(&mut self) -> Result<()> {
+        let mut s = ipc::connect().await?;
+        if let Ok(Response::PrUserStates { items }) =
+            ipc::send_request(&mut s, &Request::GetPrUserStates).await
+        {
+            self.pr_user_states = items
+                .into_iter()
+                .map(|(k, v)| (k, PrUserState::from_db(&v)))
+                .collect();
+        }
+        Ok(())
+    }
+
     /// Pull tickets where the user is reviewer / @-mentioned (not assigned).
     /// Best-effort — failures only show in the status bar so a refresh of the
     /// main list still goes through.
@@ -751,9 +827,16 @@ impl App {
                 + self.github_tickets.len()
                 + self.mentioned_tickets.len(),
         );
-        for t in &self.reviewing_tickets { out.push((MentionRole::Reviewer, t)); }
-        for t in &self.github_tickets { out.push((MentionRole::Github, t)); }
-        for t in &self.mentioned_tickets  { out.push((MentionRole::Mentioned, t)); }
+        let drop_completed = !self.show_completed_prs;
+        let keep = |key: &str| -> bool {
+            if drop_completed && self.pr_state(key) == PrUserState::Completed {
+                return false;
+            }
+            true
+        };
+        for t in &self.reviewing_tickets { if keep(&t.key) { out.push((MentionRole::Reviewer, t)); } }
+        for t in &self.github_tickets { if keep(&t.key) { out.push((MentionRole::Github, t)); } }
+        for t in &self.mentioned_tickets { if keep(&t.key) { out.push((MentionRole::Mentioned, t)); } }
         out
     }
 
@@ -1106,6 +1189,8 @@ impl App {
         if let Err(e) = self.refresh_mentioned().await {
             self.status = format!("{} · mentioned err: {e:#}", self.status);
         }
+        // PR review state is cheap to pull and gates rendering.
+        let _ = self.refresh_pr_user_states().await;
         Ok(())
     }
 
@@ -1846,6 +1931,166 @@ impl App {
         if let Mode::Implementation(form) = &mut self.mode {
             form.status_line = format!("saved → {}", path.display());
         }
+        Ok(())
+    }
+
+    /// Set up a DevQA worktree for the ticket's PR (daemon side) and open a
+    /// tmux pane in it running `claude` with PR context. No-op (and returns
+    /// `Ok`) when the ticket has no PR cached.
+    pub async fn begin_devqa_worktree(&mut self, key: &str) -> Result<()> {
+        let Some(c) = self.pr_comments.first().cloned() else { return Ok(()); };
+        let repo = c.repo.clone();
+        let pr_url = c.pr_url.clone();
+        let pr_number = c.pr_number;
+
+        // 1. Daemon: locate clone, fetch PR head, create worktree.
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(
+            &mut s,
+            &Request::SetupDevQaWorktree {
+                ticket_key: key.to_string(),
+                repo: repo.clone(),
+                pr_number,
+            },
+        )
+        .await?;
+        let (path, branch) = match resp {
+            Response::DevQaWorktree { path, branch } => (path, branch),
+            Response::Err { message } => return Err(anyhow::anyhow!(message)),
+            _ => return Err(anyhow::anyhow!("unexpected daemon response")),
+        };
+
+        // 2. Tmux check.
+        if std::env::var("TMUX").is_err() {
+            self.status = format!(
+                "DevQA worktree at {} (branch {branch}) — open tmux to launch claude",
+                path.display()
+            );
+            return Ok(());
+        }
+
+        // 3. Get/create a Claude session id for the ticket so subsequent
+        //    DevQA passes resume the same session.
+        let mut s = ipc::connect().await?;
+        let existing = match ipc::send_request(
+            &mut s,
+            &Request::GetClaudeSession { ticket_key: key.to_string() },
+        )
+        .await?
+        {
+            Response::ClaudeSession { session_id } => session_id,
+            _ => None,
+        };
+        let (session_arg, is_resume, _session_id) = if let Some(id) = existing {
+            (format!("--resume {}", shell_escape(&id)), true, id)
+        } else {
+            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
+            let mut s = ipc::connect().await?;
+            let _ = ipc::send_request(
+                &mut s,
+                &Request::SaveClaudeSession {
+                    ticket_key: key.to_string(),
+                    session_id: new_id.clone(),
+                },
+            )
+            .await?;
+            (format!("--session-id {}", shell_escape(&new_id)), false, new_id)
+        };
+
+        // 4. Build PR context file (ticket info + PR url + cached PR comments).
+        let cmd = if is_resume {
+            format!("cd {} && claude {}", shell_escape(&path.display().to_string()), session_arg)
+        } else {
+            let mut ctx = String::new();
+            if let Some(t) = &self.detail {
+                ctx.push_str(&format!("# DevQA: {}\n\n", t.key));
+                ctx.push_str(&format!("**Status**: {}\n", t.status));
+                if !t.summary.is_empty() {
+                    ctx.push_str(&format!("**Summary**: {}\n", t.summary));
+                }
+                if let Some(d) = &t.description {
+                    if !d.trim().is_empty() {
+                        ctx.push_str("\n## Ticket description\n\n");
+                        ctx.push_str(d);
+                        ctx.push('\n');
+                    }
+                }
+            } else {
+                ctx.push_str(&format!("# DevQA: {key}\n\n"));
+            }
+            ctx.push_str(&format!("\n## Pull request\n\n{pr_url}\n\nBranch: `{branch}`\nRepo: `{repo}`\n"));
+            if !self.pr_comments.is_empty() {
+                ctx.push_str("\n## PR comments\n\n");
+                for c in &self.pr_comments {
+                    ctx.push_str(&format!("**@{}** · {}\n\n{}\n\n---\n\n",
+                        c.author, c.created.split('T').next().unwrap_or(&c.created), c.body));
+                }
+            }
+            ctx.push_str(
+"\nYou are doing a DevQA pass on this pull request. Run / smoke-test the
+change, look for regressions, and report findings to me directly here.
+
+## Rules for posting on the PR
+
+- **Never** post a pass / fail / approval comment to GitHub (`gh pr comment`,
+  `gh pr review --approve`, `gh pr review --request-changes`, etc.)
+  *without my explicit approval first*. Show me the proposed comment text
+  here and wait for me to say go.
+- When I do approve and you post the pass/fail comment, also add a 🚀
+  reaction to the **PR description itself** (the top-level body posted by
+  the author — not your own comment). One way:
+    ```
+    gh api -X POST -H \"Accept: application/vnd.github+json\" \\
+        repos/$REPO/issues/$PR_NUMBER/reactions -f content=rocket
+    ```
+  Substitute the actual repo (`",
+            );
+            ctx.push_str(&repo);
+            ctx.push_str("`) and PR number (`");
+            ctx.push_str(&pr_number.to_string());
+            ctx.push_str("`).\n");
+
+            let ctx_path = std::env::temp_dir().join(format!("jui-devqa-{key}.md"));
+            std::fs::write(&ctx_path, ctx)?;
+            format!(
+                "cd {} && cat {} | claude {}",
+                shell_escape(&path.display().to_string()),
+                shell_escape(&ctx_path.display().to_string()),
+                session_arg,
+            )
+        };
+
+        // 5. Open the pane (split or new window per the existing rule).
+        let width = tmux_window_width().unwrap_or(0);
+        let out = if width >= 400 {
+            std::process::Command::new("tmux")
+                .args(["split-window", "-h", "-P", "-F", "#{pane_id}", "-c"])
+                .arg(&path)
+                .arg(format!("sh -lc {}", shell_escape(&cmd)))
+                .output()?
+        } else {
+            std::process::Command::new("tmux")
+                .args(["new-window", "-P", "-F", "#{pane_id}", "-c"])
+                .arg(&path)
+                .arg(format!("sh -lc {}", shell_escape(&cmd)))
+                .output()?
+        };
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "tmux pane failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let send_cmd = format!(
+            "(sleep 4; tmux send-keys -t {pane} '/remote-control' Enter) >/dev/null 2>&1 &"
+        );
+        let _ = std::process::Command::new("sh").arg("-c").arg(&send_cmd).spawn();
+
+        let mode = if is_resume { "resumed" } else { "new" };
+        self.status = format!("DevQA · claude {mode} @ {} · {pr_url}", path.display());
         Ok(())
     }
 
@@ -3045,6 +3290,25 @@ async fn refresh_assignee_picker(app: &mut App, query: &str) -> Result<()> {
 
 /// "Started" if the ticket is in an active workflow status OR a worktree exists for it
 /// at the conventional `<repo>/../<repo-name>-worktrees/<slug>` path.
+/// Best-effort: does the current Detail ticket already have a GitHub PR
+/// associated with it? Used to suppress the `P` (open PR) keybind so the user
+/// doesn't re-open a PR for a ticket where one already exists.
+///
+/// Heuristics:
+///   1. Cached PR comments are non-empty (daemon's github mentions refresh
+///      populates these when the ticket's branch matches a known PR).
+///   2. Any Jira comment body contains a `github.com/.../pull/<n>` URL — we
+///      post this ourselves whenever the user opens a PR via `P`.
+pub fn ticket_has_pr(app: &App) -> bool {
+    if !app.pr_comments.is_empty() {
+        return true;
+    }
+    app.comments.iter().any(|c| {
+        let b = &c.body;
+        b.contains("github.com/") && b.contains("/pull/")
+    })
+}
+
 pub fn is_ticket_started(t: &Ticket) -> bool {
     let inactive = [
         "open", "backlog", "to do", "todo", "selected for development",
@@ -4086,6 +4350,16 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     ListFocus::Mentioned => ListFocus::Active,
                 };
             }
+            KeyCode::Char('K') => {
+                // Toggle visibility of Completed PRs in the bottom section,
+                // regardless of which list focus is active.
+                app.show_completed_prs = !app.show_completed_prs;
+                app.status = if app.show_completed_prs {
+                    "PRs: showing completed".into()
+                } else {
+                    "PRs: hiding completed".into()
+                };
+            }
             KeyCode::Char('j') | KeyCode::Down => match app.list_focus {
                 ListFocus::Active => {
                     if !app.active_idxs.is_empty() {
@@ -4545,7 +4819,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.open_priority_picker().await?;
                     return Ok(());
                 }
-                KeyCode::Char('P') => {
+                KeyCode::Char('L') => {
                     app.open_ticket_projects().await?;
                     return Ok(());
                 }
@@ -4580,12 +4854,41 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     return Ok(());
                 }
                 KeyCode::Char('P') => {
+                    if ticket_has_pr(app) {
+                        app.status = "ticket already has a PR".into();
+                        return Ok(());
+                    }
                     app.open_pr_create().await?;
                     return Ok(());
                 }
+                KeyCode::Char('K') => {
+                    // Cycle the user-managed PR review state. Awaiting →
+                    // Reviewing → Completed → Awaiting (lets the user un-mark).
+                    if !ticket_has_pr(app) {
+                        app.status = "no PR to mark".into();
+                        return Ok(());
+                    }
+                    let key = match &app.detail { Some(t) => t.key.clone(), None => return Ok(()) };
+                    let next = match app.pr_state(&key) {
+                        PrUserState::Awaiting => PrUserState::Reviewing,
+                        PrUserState::Reviewing => PrUserState::Completed,
+                        PrUserState::Completed => PrUserState::Awaiting,
+                    };
+                    app.set_pr_state(&key, next).await?;
+                    app.status = format!("{key} review state: {}", match next {
+                        PrUserState::Awaiting => "Awaiting Your Review",
+                        PrUserState::Reviewing => "Reviewing",
+                        PrUserState::Completed => "Completed",
+                    });
+                    return Ok(());
+                }
                 KeyCode::Char('Q') => {
-                    // Transition the current ticket to "Dev QA In Progress".
-                    // Used when starting a DevQA pass on someone else's PR.
+                    // Find a transition whose target status contains "dev qa in
+                    // progress" (case-insensitive). Site-specific workflows
+                    // prefix the status with a team name (e.g. "Firmware Dev
+                    // QA In Progress") and the transition itself may just be
+                    // called "Next", so matching on the destination is more
+                    // reliable than the transition name.
                     let key = match &app.detail { Some(t) => t.key.clone(), None => return Ok(()) };
                     let mut s = ipc::connect().await?;
                     let resp = ipc::send_request(
@@ -4594,31 +4897,48 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     )
                     .await?;
                     let target = if let Response::Transitions { items } = resp {
+                        let needle = "dev qa in progress";
                         items
                             .iter()
                             .find(|tr| {
                                 tr.to_status
                                     .as_deref()
-                                    .map(|s| s.eq_ignore_ascii_case("dev qa in progress"))
+                                    .map(|s| s.to_ascii_lowercase().contains(needle))
                                     .unwrap_or(false)
-                                    || tr.name.to_ascii_lowercase().contains("dev qa in progress")
+                                    || tr.name.to_ascii_lowercase().contains(needle)
                             })
                             .cloned()
                     } else {
                         None
                     };
                     let Some(tr) = target else {
-                        app.status = format!("no 'Dev QA In Progress' transition for {key}");
+                        app.status = format!(
+                            "no 'Dev QA In Progress' transition for {key} \
+                             (current status may not allow it)"
+                        );
                         return Ok(());
                     };
+                    let to_label = tr.to_status.clone().unwrap_or_else(|| tr.name.clone());
                     let mut s = ipc::connect().await?;
-                    let _ = ipc::send_request(
+                    let resp = ipc::send_request(
                         &mut s,
                         &Request::Transition { key: key.clone(), to: tr.name.clone() },
                     )
-                    .await;
-                    app.status = format!("{key} → Dev QA In Progress");
+                    .await?;
+                    if let Response::Err { message } = resp {
+                        app.status = format!("transition err: {message}");
+                        return Ok(());
+                    }
+                    app.status = format!("{key} → {to_label}");
+                    // Mark the PR as actively under review.
+                    let _ = app.set_pr_state(&key, PrUserState::Reviewing).await;
                     app.load_detail().await?;
+                    // Set up the DevQA worktree + open Claude in tmux. Skip
+                    // silently when there's no associated PR (e.g. ticket
+                    // landed in our list via @-mention without a PR).
+                    if let Err(e) = app.begin_devqa_worktree(&key).await {
+                        app.status = format!("{key} → {to_label} · worktree err: {e:#}");
+                    }
                     return Ok(());
                 }
                 KeyCode::Char('R') => {
@@ -4695,7 +5015,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     });
                 }
             }
-            KeyCode::Char('P') => { app.open_ticket_projects().await?; }
+            KeyCode::Char('L') => { app.open_ticket_projects().await?; }
             KeyCode::Char('i') => { app.open_priority_picker().await?; }
             KeyCode::Char('C') => { app.open_implementation().await?; }
             KeyCode::Char('T') => {

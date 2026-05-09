@@ -47,6 +47,23 @@ pub enum Request {
     /// ticket is associated with an open PR — daemon populates during the
     /// github-mentions refresh).
     ListPrComments { ticket_key: String },
+    /// Set up a DevQA worktree for the given PR: locate the user's local clone
+    /// of `repo`, fetch `pull/<pr_number>/head` into a local branch, and
+    /// `git worktree add` it at `<repo>/../<repo>-worktrees/<ticket_key>-devqa`.
+    /// Returns the path and the local branch name so the TUI can open a tmux
+    /// pane + Claude with PR context.
+    SetupDevQaWorktree {
+        ticket_key: String,
+        repo: String,        // "<owner>/<name>"
+        pr_number: u64,
+    },
+    /// Set the user-managed PR review state for the given ticket. Valid values:
+    /// "awaiting", "reviewing", "completed". Persisted via SQLite so the state
+    /// survives daemon restarts.
+    SetPrUserState { ticket_key: String, state: String },
+    /// Map of ticket_key → state for every PR the user has touched. Tickets
+    /// that have never been touched return `Awaiting` by convention (TUI default).
+    GetPrUserStates,
     DeleteTicket { key: String },
     /// Transition the ticket to a "closed" state. Daemon picks the first available
     /// transition matching (case-insensitive): Won't Do, Cancelled, Closed, Done.
@@ -129,6 +146,10 @@ pub enum Response {
     GithubHandle { handle: String },
     /// Reply for `ListPrComments`.
     PrComments { items: Vec<crate::github::PrComment> },
+    /// Reply for `SetupDevQaWorktree`.
+    DevQaWorktree { path: std::path::PathBuf, branch: String },
+    /// Reply for `GetPrUserStates`.
+    PrUserStates { items: std::collections::HashMap<String, String> },
     Ticket { ticket: Ticket },
     StartWork { reply: StartWorkReply },
     Created { key: String },

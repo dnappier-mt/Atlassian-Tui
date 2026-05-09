@@ -471,6 +471,20 @@ async fn dispatch(
             Ok(Response::PrComments { items })
         }
 
+        Request::SetupDevQaWorktree { ticket_key, repo, pr_number } => {
+            setup_devqa_worktree(&state, &ticket_key, &repo, pr_number).await
+        }
+
+        Request::SetPrUserState { ticket_key, state: pr_state } => {
+            state.cache.lock().await.set_pr_state(&ticket_key, &pr_state)?;
+            Ok(Response::Ok)
+        }
+
+        Request::GetPrUserStates => {
+            let items = state.cache.lock().await.get_all_pr_states()?;
+            Ok(Response::PrUserStates { items })
+        }
+
         Request::CreatePullRequest {
             ticket_key,
             title,
@@ -1207,6 +1221,172 @@ async fn create_pull_request(
     Ok(Response::PullRequestCreated { url: pr.url, number: pr.number })
 }
 
+/// Walk `git remote` for the clone, return the name of any remote whose URL
+/// resolves to `target_slug` (`owner/repo`). If none exists, add one named
+/// after `desired_name` (typically the PR author's first name) pointing at
+/// `https://github.com/<target_slug>.git`, then return that name.
+async fn ensure_remote_for_repo(
+    clone: &std::path::Path,
+    target_slug: &str,
+    desired_name: &str,
+) -> Result<String> {
+    use jui_core::scm::parse_github_slug;
+    let target_lc = target_slug.to_ascii_lowercase();
+
+    // Enumerate remotes via `git remote -v` (one line per remote per direction).
+    let out = std::process::Command::new("git")
+        .args(["-C", clone.to_str().unwrap(), "remote", "-v"])
+        .output()
+        .context("git remote -v")?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "git remote -v failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut existing: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in stdout.lines() {
+        // Format: "<name>\t<url> (fetch|push)"
+        let mut parts = line.split_whitespace();
+        if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
+            existing.entry(name.to_string()).or_insert_with(|| url.to_string());
+        }
+    }
+
+    // 1. Already have a remote pointing at the right repo? Use it.
+    for (name, url) in &existing {
+        if let Some(slug) = parse_github_slug(url) {
+            if slug.to_ascii_lowercase() == target_lc {
+                return Ok(name.clone());
+            }
+        }
+    }
+
+    // 2. Need to add one. Prefer `desired_name`; if it's already taken by a
+    //    different repo, suffix with `-pr` to avoid clobber.
+    let url = format!("https://github.com/{target_slug}.git");
+    let name = if existing.contains_key(desired_name) {
+        format!("{desired_name}-pr")
+    } else {
+        desired_name.to_string()
+    };
+    if existing.contains_key(&name) {
+        let out = std::process::Command::new("git")
+            .args(["-C", clone.to_str().unwrap(), "remote", "set-url", &name, &url])
+            .output()
+            .context("git remote set-url")?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "git remote set-url failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        info!(remote = %name, %target_slug, "updated remote URL");
+    } else {
+        let out = std::process::Command::new("git")
+            .args(["-C", clone.to_str().unwrap(), "remote", "add", &name, &url])
+            .output()
+            .context("git remote add")?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "git remote add {name} {url} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        info!(remote = %name, %target_slug, "added remote");
+    }
+    Ok(name)
+}
+
+/// Resolve a local clone for `repo` (matching origin or upstream remote),
+/// fetch the PR head as a local branch, and `git worktree add` it.
+async fn setup_devqa_worktree(
+    state: &Arc<State>,
+    ticket_key: &str,
+    repo: &str,
+    pr_number: u64,
+) -> Result<Response> {
+    let candidates: Vec<std::path::PathBuf> = state
+        .config
+        .projects
+        .iter()
+        .map(|p| p.path.clone())
+        .collect();
+    let clone = jui_core::scm::find_clone_for_gh_repo(repo, &candidates).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no local clone matches {repo}. Add the clone to projects \
+             ([[projects]] in config.toml or 'p' in the TUI)."
+        )
+    })?;
+
+    // Local branch name + worktree path.
+    let local_branch = format!("devqa-pr-{pr_number}");
+    let repo_name = clone
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
+    let parent = clone.parent().unwrap_or(&clone);
+    let worktrees_root = parent.join(format!("{}-worktrees", repo_name));
+    std::fs::create_dir_all(&worktrees_root)?;
+    let worktree_path = worktrees_root.join(format!("{ticket_key}-devqa"));
+
+    // 1. Find (or add) a remote that points at the PR's upstream repo so we
+    //    can fetch `pull/<n>/head`. The user's clone likely has:
+    //      origin    → their fork
+    //      upstream? → upstream repo (sometimes missing on fork-only clones)
+    //    GitHub mirrors every PR's HEAD into the upstream's `pull/N/head` refs
+    //    regardless of which fork the PR was opened from, so we just need any
+    //    remote that resolves to `repo` (the PR's upstream slug). When we have
+    //    to add one, name it after the PR author's first name so the user can
+    //    eyeball whose contribution they're reviewing.
+    let author_login = jui_core::github::pr_author_login(repo, pr_number).await
+        .unwrap_or_default();
+    let desired_name = if author_login.is_empty() {
+        "contributor".to_string()
+    } else {
+        jui_core::github::user_first_name_remote_safe(&author_login).await
+            .unwrap_or_else(|_| author_login.clone())
+    };
+    let remote = ensure_remote_for_repo(&clone, repo, &desired_name).await?;
+    let refspec = format!("pull/{pr_number}/head:{local_branch}");
+    let out = std::process::Command::new("git")
+        .args(["-C", clone.to_str().unwrap(), "fetch", "--force", &remote, &refspec])
+        .output()
+        .context("git fetch pull/<n>/head")?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "git fetch {remote} pull/{pr_number}/head failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+
+    // 2. Create the worktree (or reuse if it already exists).
+    if !worktree_path.exists() {
+        let out = std::process::Command::new("git")
+            .args([
+                "-C", clone.to_str().unwrap(),
+                "worktree", "add",
+                worktree_path.to_str().unwrap(),
+                &local_branch,
+            ])
+            .output()
+            .context("git worktree add")?;
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "git worktree add failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+    }
+
+    info!(%ticket_key, %repo, pr_number, path = %worktree_path.display(), "DevQA worktree ready");
+    Ok(Response::DevQaWorktree {
+        path: worktree_path,
+        branch: local_branch,
+    })
+}
+
 /// Pull GitHub PRs the current user has been requested to review (or
 /// @-mentioned on) and store them under the `mentions` table with role
 /// `"github"`. Each PR's branch name is parsed via `scm::extract_ticket_key`
@@ -1256,8 +1436,12 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
     }
 
     // Fetch PR comments for each tied ticket. One round trip per PR — this is
-    // the slow part; rate-limit politely.
+    // the slow part; rate-limit politely. Also probe each PR for an APPROVED
+    // review by the current user — if found, auto-mark the user's review state
+    // as `completed` (auto-sync from `gh pr review --approve` and friends).
+    let my_login = jui_core::github::whoami().await.ok();
     let mut total_comments = 0usize;
+    let mut auto_completed = 0usize;
     for (ticket_key, pr) in &pr_for_key {
         match jui_core::github::pr_comments(&pr.repo, pr.number).await {
             Ok(items) => {
@@ -1272,12 +1456,45 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
             }
             Err(e) => warn!(repo = %pr.repo, number = pr.number, "pr comments fetch: {e:#}"),
         }
+
+        if let Some(login) = &my_login {
+            if let Ok(Some(state_str)) =
+                jui_core::github::my_latest_review_state(&pr.repo, pr.number, login).await
+            {
+                if state_str.eq_ignore_ascii_case("APPROVED") {
+                    let current = state.cache.lock().await.get_pr_state(ticket_key).ok().flatten();
+                    if current.as_deref() != Some("completed") {
+                        let _ = state.cache.lock().await.set_pr_state(ticket_key, "completed");
+                        auto_completed += 1;
+                        // Mark the ticket with a "DevQA complete" comment on
+                        // both Jira and the PR. Only fires on the transition
+                        // into Completed (the current != completed gate
+                        // prevents repeats).
+                        const DEVQA_COMMENT: &str = "DevQA complete";
+                        if let Err(e) = state.jira.add_comment(ticket_key, DEVQA_COMMENT).await {
+                            warn!(%ticket_key, "auto DevQA-complete jira comment failed: {e:#}");
+                        } else {
+                            refresh_comments(state, ticket_key).await;
+                        }
+                        if let Err(e) = jui_core::github::post_pr_comment(
+                            &pr.repo, pr.number, DEVQA_COMMENT,
+                        ).await {
+                            warn!(repo = %pr.repo, number = pr.number,
+                                  "auto DevQA-complete pr comment failed: {e:#}");
+                        }
+                        info!(%ticket_key, repo = %pr.repo, number = pr.number,
+                              "auto-marked PR Completed (gh APPROVED) + posted DevQA comments");
+                    }
+                }
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
     info!(
         github_prs = prs.len(),
         tickets = keys.len(),
         pr_comments = total_comments,
+        auto_completed,
         "github mentions refreshed"
     );
     Ok(())

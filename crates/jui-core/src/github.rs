@@ -164,26 +164,43 @@ pub async fn add_reviewer(path: &Path, pr_number: u64, gh_handle: &str) -> Resul
     Ok(())
 }
 
-/// Open PRs where the current user is a requested reviewer.
+/// Open PRs the user is involved with as a reviewer — covers BOTH:
+///   - `--review-requested=@me` (someone tagged you on the PR)
+///   - `--reviewed-by=@me` (you already left a review, even if just PENDING)
+/// Some workflows assign reviewers via Jira comments rather than GitHub's
+/// review-request mechanism — once the user starts a review, this catches it.
 pub async fn search_review_requested() -> Result<Vec<PrSummary>> {
-    let out = Command::new("gh")
-        .args([
-            "search", "prs",
-            "--review-requested", "@me",
-            "--state", "open",
-            "--limit", "50",
-            "--json", "number,title,url,repository,author",
-        ])
-        .output()
-        .await
-        .context("running gh search prs --review-requested")?;
+    let mut prs = run_search(&["--review-requested", "@me"]).await.unwrap_or_default();
+    let extra = run_search(&["--reviewed-by", "@me"]).await.unwrap_or_default();
+    // Dedupe by URL.
+    let mut seen: std::collections::HashSet<String> =
+        prs.iter().map(|p| p.url.clone()).collect();
+    for p in extra {
+        if seen.insert(p.url.clone()) {
+            prs.push(p);
+        }
+    }
+    Ok(prs)
+}
+
+/// Run `gh search prs <qualifier> --state open --limit 50 --json ...` and
+/// turn the response into PrSummary rows (one extra `gh pr view` per row to
+/// recover the head branch).
+async fn run_search(qualifier: &[&str]) -> Result<Vec<PrSummary>> {
+    let mut args: Vec<&str> = vec!["search", "prs"];
+    args.extend_from_slice(qualifier);
+    args.extend_from_slice(&[
+        "--state", "open",
+        "--limit", "50",
+        "--json", "number,title,url,repository,author",
+    ]);
+    let out = Command::new("gh").args(&args).output().await.context("running gh search prs")?;
     if !out.status.success() {
         return Err(anyhow!(
-            "gh search prs failed: {}",
+            "gh search prs {qualifier:?} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    // Search response doesn't include headRefName — we have to follow up per PR.
     #[derive(Deserialize)]
     struct Hit {
         number: u64,
@@ -367,6 +384,150 @@ pub async fn pr_comments(repo: &str, number: u64) -> Result<Vec<(String, String,
         }
     }
     Ok(all)
+}
+
+/// PR author's GitHub login (`gh pr view -R <repo> <num> --json author -q .author.login`).
+pub async fn pr_author_login(repo: &str, number: u64) -> Result<String> {
+    let out = Command::new("gh")
+        .args([
+            "pr", "view", &number.to_string(),
+            "-R", repo,
+            "--json", "author",
+            "-q", ".author.login",
+        ])
+        .output()
+        .await
+        .context("running gh pr view")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh pr view (author) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// First name of the GitHub user as set on their public profile, sanitised for
+/// use as a git remote name (lowercase alphanumeric + hyphen, no leading or
+/// trailing hyphens). Falls back to the login if the user has no name set.
+pub async fn user_first_name_remote_safe(login: &str) -> Result<String> {
+    let out = Command::new("gh")
+        .args([
+            "api", &format!("users/{login}"),
+            "-q", ".name",
+        ])
+        .output()
+        .await
+        .context("running gh api users/<login>")?;
+    let raw = if out.status.success() {
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    } else {
+        String::new()
+    };
+    let candidate = if raw.is_empty() {
+        login.to_string()
+    } else {
+        raw.split_whitespace().next().unwrap_or(login).to_string()
+    };
+    Ok(sanitize_remote_name(&candidate))
+}
+
+/// Lowercase, replace runs of non-alphanumeric with `-`, trim leading/trailing
+/// `-`. Returns `"contributor"` if the result is empty.
+fn sanitize_remote_name(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_dash = false;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() { "contributor".to_string() } else { trimmed }
+}
+
+/// Post an issue-level comment on a PR (`gh pr comment`).
+pub async fn post_pr_comment(repo: &str, number: u64, body: &str) -> Result<()> {
+    let out = Command::new("gh")
+        .args([
+            "pr", "comment", &number.to_string(),
+            "-R", repo,
+            "--body", body,
+        ])
+        .output()
+        .await
+        .context("running gh pr comment")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh pr comment failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Most-recent review state submitted by `my_login` on the given PR. Returns
+/// `None` when the user hasn't reviewed it yet. Possible values per GitHub:
+/// `"APPROVED"`, `"CHANGES_REQUESTED"`, `"COMMENTED"`, `"DISMISSED"`.
+pub async fn my_latest_review_state(
+    repo: &str,
+    number: u64,
+    my_login: &str,
+) -> Result<Option<String>> {
+    let path = format!("repos/{repo}/pulls/{number}/reviews?per_page=100");
+    let out = Command::new("gh")
+        .args(["api", "--paginate", &path])
+        .output()
+        .await
+        .context("running gh api repos/.../pulls/.../reviews")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api reviews failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct Review {
+        user: ReviewUser,
+        state: String,
+        submitted_at: Option<String>,
+    }
+    #[derive(Deserialize)]
+    struct ReviewUser { login: String }
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut latest: Option<(String, String)> = None;
+    for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
+        if chunk.is_empty() { continue; }
+        let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
+            chunk
+        } else if chunk.starts_with('[') {
+            format!("{chunk}]")
+        } else if chunk.ends_with(']') {
+            format!("[{chunk}")
+        } else {
+            format!("[{chunk}]")
+        };
+        let reviews: Vec<Review> = match serde_json::from_str(&chunk) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for r in reviews {
+            if !r.user.login.eq_ignore_ascii_case(my_login) { continue; }
+            // Track the chronologically last one. submitted_at is RFC3339 so
+            // string comparison is fine.
+            let when = r.submitted_at.unwrap_or_default();
+            match &latest {
+                Some((cur_when, _)) if cur_when >= &when => {}
+                _ => latest = Some((when, r.state)),
+            }
+        }
+    }
+    Ok(latest.map(|(_, s)| s))
 }
 
 /// The current user's GitHub login (`gh api user -q .login`).

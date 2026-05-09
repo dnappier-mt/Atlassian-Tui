@@ -142,6 +142,11 @@ impl Cache {
                 PRIMARY KEY (ticket_key, idx)
             );
             CREATE INDEX IF NOT EXISTS pr_comments_ticket ON pr_comments(ticket_key);
+            CREATE TABLE IF NOT EXISTS pr_user_state (
+                ticket_key TEXT PRIMARY KEY,
+                state      TEXT NOT NULL,        -- 'awaiting' | 'reviewing' | 'completed'
+                updated_at INTEGER NOT NULL
+            );
             "#,
         )?;
         // Idempotent additive migrations — `ALTER TABLE ADD COLUMN` errors if column
@@ -293,6 +298,39 @@ impl Cache {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// User-managed state for a PR (Awaiting / Reviewing / Completed). Does
+    /// not come from GitHub — purely a workflow tracker. Returns `None` if no
+    /// row, which the TUI treats as `Awaiting` by default.
+    pub fn set_pr_state(&mut self, ticket_key: &str, state: &str) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            r#"INSERT INTO pr_user_state (ticket_key, state, updated_at)
+               VALUES (?1, ?2, ?3)
+               ON CONFLICT(ticket_key) DO UPDATE SET state=excluded.state, updated_at=excluded.updated_at"#,
+            rusqlite::params![ticket_key, state, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pr_state(&self, ticket_key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT state FROM pr_user_state WHERE ticket_key = ?1",
+        )?;
+        let mut rows = stmt.query([ticket_key])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(row.get::<_, String>(0)?));
+        }
+        Ok(None)
+    }
+
+    pub fn get_all_pr_states(&self) -> Result<std::collections::HashMap<String, String>> {
+        let mut stmt = self.conn.prepare("SELECT ticket_key, state FROM pr_user_state")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
     pub fn get_pr_comments(&self, ticket_key: &str) -> Result<Vec<crate::github::PrComment>> {

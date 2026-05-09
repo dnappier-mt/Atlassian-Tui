@@ -168,6 +168,58 @@ pub fn git_worktree_remove(root: &Path, path: &Path, force: bool) -> Result<()> 
     Ok(())
 }
 
+/// Parse `owner/repo` from a GitHub remote URL in any common form.
+pub fn parse_github_slug(url: &str) -> Option<String> {
+    let s = url.trim();
+    let s = s
+        .strip_prefix("https://github.com/")
+        .or_else(|| s.strip_prefix("http://github.com/"))
+        .or_else(|| s.strip_prefix("git@github.com:"))
+        .or_else(|| s.strip_prefix("ssh://git@github.com/"))?;
+    let s = s.trim_end_matches('/').trim_end_matches(".git");
+    if s.split('/').count() == 2 && !s.is_empty() {
+        Some(s.to_string())
+    } else {
+        None
+    }
+}
+
+/// Read `git remote get-url <name>` for the repo at `path`. Returns the parsed
+/// `owner/repo` slug (or `None` if the remote doesn't exist or isn't a GitHub URL).
+pub fn gh_slug_for_remote(path: &Path, remote: &str) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", path.to_str()?, "remote", "get-url", remote])
+        .output()
+        .ok()?;
+    if !out.status.success() { return None; }
+    let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    parse_github_slug(&url)
+}
+
+/// Find a local clone whose `origin` or `upstream` remote points to the given
+/// `<owner>/<repo>` slug. First exact-match origin, then exact-match upstream,
+/// then case-insensitive on either.
+pub fn find_clone_for_gh_repo(
+    pr_slug: &str,
+    candidates: &[std::path::PathBuf],
+) -> Option<std::path::PathBuf> {
+    let pr_lc = pr_slug.to_ascii_lowercase();
+    let mut fallback: Option<std::path::PathBuf> = None;
+    for p in candidates {
+        for remote in ["origin", "upstream"] {
+            if let Some(slug) = gh_slug_for_remote(p, remote) {
+                if slug == pr_slug {
+                    return Some(p.clone());
+                }
+                if slug.to_ascii_lowercase() == pr_lc && fallback.is_none() {
+                    fallback = Some(p.clone());
+                }
+            }
+        }
+    }
+    fallback
+}
+
 /// The conventional jui worktree path for a ticket slug: sibling to the repo
 /// at `<repo>/../<repo-name>-worktrees/<slug>`. Returns `None` if `cwd` isn't
 /// inside a git repo.
@@ -199,14 +251,31 @@ pub struct RepoEntry {
 }
 
 /// Walk `root` recursively (depth-limited) and return every directory that contains a
-/// `.git` or `.svn` marker. Stops descending into a repo once found.
+/// `.git` or `.svn` marker. Stops descending into a repo once found. Symlinks
+/// to directories are followed; cycles are broken via a canonicalized-path
+/// visited set so a `~/workspace -> /mnt/workspace` link doesn't infinite-loop.
 pub fn find_repos(root: &Path, max_depth: usize) -> Vec<RepoEntry> {
     let mut out = Vec::new();
-    walk(root, 0, max_depth, &mut out);
+    let mut visited: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    walk(root, 0, max_depth, &mut out, &mut visited);
     out
 }
 
-fn walk(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<RepoEntry>) {
+fn walk(
+    dir: &Path,
+    depth: usize,
+    max_depth: usize,
+    out: &mut Vec<RepoEntry>,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) {
+    // Canonicalize for cycle detection. Skip if we've been here under a
+    // different name (e.g. via a symlink).
+    let canonical = std::fs::canonicalize(dir).ok();
+    if let Some(c) = &canonical {
+        if !visited.insert(c.clone()) { return; }
+    }
+
     if dir.join(".git").exists() {
         out.push(RepoEntry { path: dir.to_path_buf(), kind: "git".into() });
         return;
@@ -221,7 +290,9 @@ fn walk(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<RepoEntry>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for entry in rd.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+        // `entry.file_type()` is lstat — symlinks-to-directories return false
+        // for is_dir(). `path.is_dir()` follows symlinks via metadata().
+        if !path.is_dir() {
             continue;
         }
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
@@ -231,7 +302,7 @@ fn walk(dir: &Path, depth: usize, max_depth: usize, out: &mut Vec<RepoEntry>) {
                 "node_modules" | "target" | "dist" | "build" | "venv" | ".cache" | "__pycache__"
             ) { continue; }
         }
-        walk(&path, depth + 1, max_depth, out);
+        walk(&path, depth + 1, max_depth, out, visited);
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::app::{App, AssignPurpose, DetailFocus, DetailLinkedProject, MentionRole, Mode, PageLine, PendingDelete, TreeForm, TreeNode};
+use crate::app::{App, AssignPurpose, DetailFocus, DetailLinkedProject, MentionRole, Mode, PageLine, PendingDelete, PrUserState, TreeForm, TreeNode};
 use jui_core::ticket::{fmt_date, fmt_seconds, parse_reply, priority_rank, Comment};
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -271,19 +271,26 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
         .map(|(role, t)| {
             let (badge, badge_style) = role_badge(*role);
             let (glyph, glyph_style) = issue_type_glyph(t.issue_type.as_deref());
-            let line = Line::from(vec![
-                Span::styled(format!(" {badge} "), badge_style),
-                Span::styled(format!("{glyph} "), glyph_style),
-                Span::styled(format!("{:<12} ", t.key), Style::default().fg(Color::Yellow)),
-                Span::styled(
-                    format!("{:<14} ", truncate(&t.status, 14)),
-                    Style::default().fg(Color::Green),
-                ),
-                priority_span(t.priority.as_deref()),
-                Span::raw(" "),
-                Span::raw(t.summary.clone()),
-            ]);
-            ListItem::new(line)
+            let pr_label = pr_state_label(*role, app.pr_state(&t.key));
+            let mut spans: Vec<Span> = Vec::with_capacity(10);
+            spans.push(Span::raw(" "));
+            // Lead with the user's review state — most prominent column.
+            if let Some((text, st)) = pr_label {
+                spans.push(Span::styled(text.to_string(), st));
+            } else {
+                spans.push(Span::raw("       "));
+            }
+            spans.push(Span::styled(format!("{badge} "), badge_style));
+            spans.push(Span::styled(format!("{glyph} "), glyph_style));
+            spans.push(Span::styled(format!("{:<12} ", t.key), Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(
+                format!("{:<14} ", truncate(&t.status, 14)),
+                Style::default().fg(Color::Green),
+            ));
+            spans.push(priority_span(t.priority.as_deref()));
+            spans.push(Span::raw(" "));
+            spans.push(Span::raw(t.summary.clone()));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let mut state = ListState::default();
@@ -293,6 +300,38 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
         .highlight_symbol(if focused { "▶ " } else { "  " });
     f.render_stateful_widget(list, area, &mut state);
+}
+
+/// Returns `pr_state_label` only when both arguments resolve sensibly. Used
+/// from tree rendering where `pr_state` is `Option`.
+fn role_to_pr_label(
+    role: MentionRole,
+    pr_state: Option<PrUserState>,
+) -> Option<(&'static str, Style)> {
+    pr_state_label(role, pr_state?)
+}
+
+/// 9-char fixed-width "AWAIT/REVIEW/DONE" label for the user's PR review state.
+/// Padded so columns line up across rows. Returns `None` when the role isn't
+/// a PR-bearing one (no point labelling pure Jira reviewer/@-mention rows).
+fn pr_state_label(role: MentionRole, state: PrUserState) -> Option<(&'static str, Style)> {
+    if !matches!(role, MentionRole::Github | MentionRole::Reviewer) {
+        return None;
+    }
+    Some(match state {
+        PrUserState::Awaiting => (
+            "AWAIT  ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        PrUserState::Reviewing => (
+            "REVIEW ",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        PrUserState::Completed => (
+            "DONE   ",
+            Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+        ),
+    })
 }
 
 /// Badge text + style for a role. `[A]` = assigned (rarely used since assigned
@@ -1967,6 +2006,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("n", "new"),
             ("s", "start"),
             ("T", "tree"),
+            ("K", "show/hide done PRs"),
             ("a", "archive"),
             ("b", "board"),
             ("p", "projects"),
@@ -2037,21 +2077,24 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                     ("t", "trans"),
                     ("w", "time"),
                     ("i", "prio"),
-                    ("P", "link"),
+                    ("L", "link"),
                 ];
                 if !is_subtask {
                     v.push(("T", "subtask"));
                 }
-                v.extend([
-                    ("@", "assign"),
-                    ("R", "reviewer"),
-                    ("P", "open PR"),
-                    ("Q", "begin DevQA"),
-                    ("C", "claude"),
-                    ("s", s_label),
-                    ("D", "archive"),
-                    ("esc", "back"),
-                ]);
+                v.push(("@", "assign"));
+                v.push(("R", "reviewer"));
+                if !crate::app::ticket_has_pr(app) {
+                    v.push(("P", "open PR"));
+                }
+                v.push(("Q", "begin DevQA"));
+                if crate::app::ticket_has_pr(app) {
+                    v.push(("K", "PR state"));
+                }
+                v.push(("C", "claude"));
+                v.push(("s", s_label));
+                v.push(("D", "archive"));
+                v.push(("esc", "back"));
                 v
             }
             DetailFocus::Projects => {
@@ -2640,11 +2683,14 @@ fn draw_assign_picker(f: &mut Frame, app: &App) {
 fn draw_help_overlay(f: &mut Frame, app: &App) {
     use ratatui::layout::{Alignment, Constraint, Direction, Layout};
     let hints = mode_hints(app);
+    let legend = legend_lines(app);
     let total = f.area();
-    // Center a popup ~70% wide, autosize height to row count + 4 lines of chrome.
-    let rows = (hints.len() as u16).max(1) + 4;
+    let two_col = !legend.is_empty();
+    // Size the popup to whichever column is taller.
+    let rows = (hints.len().max(legend.len()) as u16).max(1) + 4;
     let height = rows.min(total.height.saturating_sub(2));
-    let width = (total.width * 70 / 100).max(40).min(total.width.saturating_sub(2));
+    let width_pct = if two_col { 80 } else { 70 };
+    let width = (total.width * width_pct / 100).max(40).min(total.width.saturating_sub(2));
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -2685,21 +2731,224 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
     let key_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
     let exp_style = Style::default();
     let max_key_w = hints.iter().map(|(k, _)| k.len()).max().unwrap_or(1);
-    let lines: Vec<Line> = hints
+    let key_lines: Vec<Line> = hints
         .iter()
         .map(|(k, v)| {
             let pad = " ".repeat(max_key_w.saturating_sub(k.len()));
+            let desc = long_desc(k, v).unwrap_or(v);
             Line::from(vec![
                 Span::raw("  "),
                 Span::styled(k.to_string(), key_style),
                 Span::raw(pad),
                 Span::raw("  "),
-                Span::styled(v.to_string(), exp_style),
+                Span::styled(desc.to_string(), exp_style),
             ])
         })
         .collect();
-    let p = Paragraph::new(lines).alignment(Alignment::Left);
-    f.render_widget(p, inner);
+
+    if two_col {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(45), Constraint::Min(1)])
+            .split(inner);
+        f.render_widget(
+            Paragraph::new(key_lines).alignment(Alignment::Left),
+            cols[0],
+        );
+        f.render_widget(
+            Paragraph::new(legend).alignment(Alignment::Left),
+            cols[1],
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(key_lines).alignment(Alignment::Left),
+            inner,
+        );
+    }
+}
+
+/// Legend column shown next to the keybindings on the help overlay. Currently
+/// populated only on the List view (where the badges + state labels appear).
+/// Returns an empty vec to fall back to single-column layout in other modes.
+fn legend_lines(app: &App) -> Vec<Line<'static>> {
+    if !matches!(app.mode, Mode::List) {
+        return Vec::new();
+    }
+    let dim = Style::default().fg(Color::DarkGray);
+    let header = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let body = Style::default();
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let entry = |badge: &str, badge_style: Style, label: &str| {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(badge.to_string(), badge_style),
+            Span::raw("  "),
+            Span::styled(label.to_string(), body),
+        ])
+    };
+
+    lines.push(Line::from(Span::styled(" Role badges", header)));
+    let (b, s) = role_badge(MentionRole::Assigned);
+    lines.push(entry(b, s, "Assigned to you (Active list)"));
+    let (b, s) = role_badge(MentionRole::Reviewer);
+    lines.push(entry(b, s, "Reviewer (Jira reviewer field)"));
+    let (b, s) = role_badge(MentionRole::Github);
+    lines.push(entry(b, s, "Reviewer (GitHub PR review request)"));
+    let (b, s) = role_badge(MentionRole::Mentioned);
+    lines.push(entry(b, s, "@-mentioned in Jira description / comment"));
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(" PR review state (your tracker)", header)));
+    if let Some((b, s)) = pr_state_label(MentionRole::Github, PrUserState::Awaiting) {
+        lines.push(entry(b.trim_end(), s, "Awaiting your review (default)"));
+    }
+    if let Some((b, s)) = pr_state_label(MentionRole::Github, PrUserState::Reviewing) {
+        lines.push(entry(b.trim_end(), s, "Actively reviewing (auto on Q)"));
+    }
+    if let Some((b, s)) = pr_state_label(MentionRole::Github, PrUserState::Completed) {
+        lines.push(entry(b.trim_end(), s, "Completed (auto on gh APPROVED, hidden default)"));
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(" Issue type glyphs", header)));
+    for (gl, name) in [
+        ("⚡", "Epic"), ("✦", "Story"), ("☑", "Task"),
+        ("✗", "Bug"), ("↳", "Sub-task"), ("▲", "Improvement"),
+        ("✱", "Spike"),
+    ] {
+        let style = Style::default().fg(type_color(Some(name)));
+        lines.push(entry(gl, style, name));
+    }
+    lines.push(Line::from(""));
+
+    lines.push(Line::from(Span::styled(" Sections", header)));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Active", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("    your assigned work (top pane)", dim),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("Mentioned", Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(" reviewer + GitHub + @-mentions (bottom)", dim),
+    ]));
+
+    lines
+}
+
+/// Per-(key, footer_short) → 3-word(ish) description shown in the `?` help
+/// overlay. Footer hints stay terse for the bottom bar; the overlay lifts
+/// `mode_hints` entries through this table to give the user enough context to
+/// disambiguate similar verbs ("link" — link what?).
+fn long_desc(key: &str, short: &str) -> Option<&'static str> {
+    match (key, short) {
+        // List view
+        ("j/k", "move") => Some("move selection up/down"),
+        ("tab", "expand subtasks") => Some("expand/collapse subtasks"),
+        ("S-tab", "toggle section") => Some("switch active/mentioned section"),
+        ("enter", "open") => Some("open ticket detail"),
+        ("r", "refresh") => Some("force refresh from Jira"),
+        ("o", "sort") => Some("cycle sort mode"),
+        ("n", "new") => Some("create new top-level ticket"),
+        ("s", "start") => Some("start work session"),
+        ("s", "stop") => Some("stop work + transition"),
+        ("T", "tree") => Some("open ticket tree view"),
+        ("a", "archive") => Some("view archived tickets"),
+        ("b", "board") => Some("open kanban board"),
+        ("p", "projects") => Some("manage linked projects"),
+        ("f", "confluence") => Some("browse Confluence pages"),
+        ("q", "quit") => Some("quit jui"),
+
+        // Kanban
+        ("h/l", "column") => Some("move between columns"),
+        ("j/k", "card") => Some("move between cards"),
+        ("e", "expand col") => Some("expand selected column"),
+        ("m", "minimize col") => Some("minimize selected column"),
+        ("u", "filter users") => Some("filter by assignee"),
+        ("b/esc", "back") => Some("back to list"),
+
+        // KanbanFilter
+        ("type", "search") => Some("type to search users"),
+        ("space/enter", "toggle") => Some("toggle assignee selection"),
+        ("ctrl+c", "clear all") => Some("clear all selected"),
+        ("esc", "done") => Some("close filter, apply"),
+        ("ctrl+s", "save team") => Some("save filter as team"),
+        ("type", "team name") => Some("type team name"),
+        ("enter", "save") => Some("save and close"),
+        ("esc", "cancel") => Some("cancel without saving"),
+
+        // Projects mode
+        ("a", "add") => Some("add a project"),
+        ("d", "remove") => Some("remove selected project"),
+        ("type", "filter") => Some("type to filter repos"),
+
+        // Detail · Info
+        ("tab", "pane") => Some("cycle to next pane"),
+        ("e", "edit") => Some("edit ticket summary"),
+        ("c", "comment") => Some("add a comment"),
+        ("t", "trans") => Some("transition ticket status"),
+        ("w", "time") => Some("log time worked"),
+        ("i", "prio") => Some("edit ticket priority"),
+        ("L", "link") => Some("link a local project"),
+        ("T", "subtask") => Some("create child sub-task"),
+        ("@", "assign") => Some("change ticket assignee"),
+        ("R", "reviewer") => Some("set ticket reviewer"),
+        ("P", "open PR") => Some("open GitHub pull request"),
+        ("Q", "begin DevQA") => Some("start DevQA on PR"),
+        ("C", "claude") => Some("launch Claude in tmux"),
+        ("D", "archive") => Some("archive this ticket"),
+        ("K", "PR state") => Some("cycle PR review state"),
+        ("K", "show/hide done PRs") => Some("toggle completed PRs"),
+        ("esc", "back") => Some("back to previous view"),
+
+        // Detail · Projects
+        ("tab", "next pane") => Some("cycle to next pane"),
+        ("y", "approve") => Some("approve suggested project"),
+        ("d", "dismiss/unlink") => Some("dismiss / unlink project"),
+        ("d", "unlink") => Some("unlink project from ticket"),
+
+        // Detail · Subtasks
+        ("a", "add subtask") => Some("create new sub-task"),
+        ("A", "toggle archived") => Some("show/hide archived subtasks"),
+
+        // Detail · Comments
+        ("c", "new") => Some("post a new comment"),
+        ("R", "reply") => Some("reply to selected comment"),
+        ("d", "delete (own)") => Some("delete your comment"),
+
+        // Tree
+        ("o/Tab", "toggle") => Some("toggle node expand/collapse"),
+        ("O/C", "expand/collapse all") => Some("expand or collapse all"),
+        ("c", "create child") => Some("create child of selected"),
+        ("v", "two-col") => Some("toggle two-column layout"),
+        ("Enter", "detail") => Some("open node in detail"),
+
+        // Confluence
+        ("enter", "view page") => Some("open page in viewer"),
+        ("l/→", "drill into children") => Some("drill into child pages"),
+        ("h/←/esc", "back") => Some("back to parent"),
+
+        // Page viewer
+        ("j/k", "scroll") => Some("scroll page up/down"),
+        ("/", "search") => Some("search within page"),
+        ("n/N", "next/prev") => Some("next/previous match"),
+        ("e", "edit") => Some("edit in $EDITOR"),
+        ("S", "sync") => Some("sync edits via mark"),
+
+        // Archive / PR / Assign confirms
+        ("y/enter", "confirm") => Some("confirm and proceed"),
+        ("n/esc", "cancel") => Some("cancel without changes"),
+        ("F5/^S", "submit") => Some("submit the form"),
+        ("type", "edit/search") => Some("type to edit/search"),
+        ("type", "search/edit") => Some("type to search/edit"),
+        ("↑/↓", "pick") => Some("up/down to pick"),
+        ("↑/↓", "move") => Some("move within picker"),
+        ("enter", "select") => Some("select highlighted entry"),
+        ("enter", "next/submit") => Some("next field or submit"),
+        ("F5/ctrl+enter/ctrl+s", "submit") => Some("submit anywhere"),
+
+        _ => None,
+    }
 }
 
 fn render_hints(hints: &[Hint]) -> Line<'static> {
@@ -3163,6 +3412,14 @@ fn type_label(issue_type: Option<&str>) -> &'static str {
 }
 
 fn tree_node_line(node: &TreeNode, selected: bool) -> Line<'static> {
+    tree_node_line_with_pr_state(node, selected, None)
+}
+
+fn tree_node_line_with_pr_state(
+    node: &TreeNode,
+    selected: bool,
+    pr_state: Option<PrUserState>,
+) -> Line<'static> {
     let indent = "  ".repeat(node.depth as usize);
     let arrow = if !node.children.is_empty() {
         if node.expanded { "▼ " } else { "▶ " }
@@ -3199,6 +3456,12 @@ fn tree_node_line(node: &TreeNode, selected: bool) -> Line<'static> {
         let (badge, style) = role_badge(role);
         spans.push(Span::styled(badge.to_string(), style));
         spans.push(Span::raw(" "));
+        if let (Some(state), Some((label, label_style))) =
+            (pr_state, role_to_pr_label(role, pr_state))
+        {
+            let _ = state; // silence unused when state.is_none()
+            spans.push(Span::styled(label.to_string(), label_style));
+        }
     } else {
         spans.push(Span::raw(" ".repeat(badge_width)));
     }
@@ -3212,13 +3475,13 @@ fn tree_node_line(node: &TreeNode, selected: bool) -> Line<'static> {
 fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
     let Mode::Tree(form) = &app.mode else { return };
     if form.two_column {
-        draw_tree_two_column(f, area, form);
+        draw_tree_two_column(f, area, form, app);
     } else {
-        draw_tree_single(f, area, form);
+        draw_tree_single(f, area, form, app);
     }
 }
 
-fn draw_tree_single(f: &mut Frame, area: Rect, form: &TreeForm) {
+fn draw_tree_single(f: &mut Frame, area: Rect, form: &TreeForm, app: &App) {
     let inner = Block::default()
         .borders(Borders::ALL)
         .title(" tickets — tree (T) ")
@@ -3241,13 +3504,15 @@ fn draw_tree_single(f: &mut Frame, area: Rect, form: &TreeForm) {
     let lines: Vec<Line> = (scroll..end)
         .map(|i| {
             let node_idx = form.visible[i];
-            tree_node_line(&form.nodes[node_idx], i == form.selected)
+            let node = &form.nodes[node_idx];
+            let pr_state = node.role.and_then(|_| Some(app.pr_state(&node.key)));
+            tree_node_line_with_pr_state(node, i == form.selected, pr_state)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_tree_two_column(f: &mut Frame, area: Rect, form: &TreeForm) {
+fn draw_tree_two_column(f: &mut Frame, area: Rect, form: &TreeForm, app: &App) {
     use ratatui::layout::{Constraint, Direction, Layout};
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -3319,7 +3584,9 @@ fn draw_tree_two_column(f: &mut Frame, area: Rect, form: &TreeForm) {
         .map(|i| {
             let node_idx = subtree_visible[i];
             let is_sel = Some(&node_idx) == form.visible.get(form.selected);
-            tree_node_line(&form.nodes[node_idx], is_sel)
+            let node = &form.nodes[node_idx];
+            let pr_state = node.role.and_then(|_| Some(app.pr_state(&node.key)));
+            tree_node_line_with_pr_state(node, is_sel, pr_state)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), right_inner);
