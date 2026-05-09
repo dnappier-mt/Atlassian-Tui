@@ -221,7 +221,7 @@ fn draw_list_active(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default();
     state.select(if app.active_idxs.is_empty() || !focused { None } else { Some(app.list_selected) });
     let title = format!(
-        " active tickets — {} · sort: {} {}",
+        " Jira Assigned — {} · sort: {} {}",
         app.active_idxs.len(),
         app.sort_mode.label(),
         if app.inactive_idxs.is_empty() {
@@ -246,7 +246,7 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
     let g = app.github_tickets.len();
     let m = app.mentioned_tickets.len();
     let title = format!(
-        " reviewing + github + mentioned — {r} R · {g} V · {m} @ (Shift+Tab to focus) "
+        " reviewing + github + mentioned — {r} jira-R · {g} gh-R · {m} @ (Shift+Tab to focus) "
     );
     let block = Block::default()
         .borders(Borders::ALL)
@@ -266,6 +266,15 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    // Auto-size the status column to the longest status across visible rows,
+    // capped so it doesn't crowd the summary on a narrow terminal.
+    let status_w: usize = combined
+        .iter()
+        .map(|(_, t)| t.status.chars().count())
+        .max()
+        .unwrap_or(14)
+        .clamp(14, 28);
+
     let items: Vec<ListItem> = combined
         .iter()
         .map(|(role, t)| {
@@ -283,8 +292,11 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
             spans.push(Span::styled(format!("{badge} "), badge_style));
             spans.push(Span::styled(format!("{glyph} "), glyph_style));
             spans.push(Span::styled(format!("{:<12} ", t.key), Style::default().fg(Color::Yellow)));
+            // Status column auto-sizes to the longest visible status, capped
+            // at 28 chars so workflow names like "Firmware Dev QA In Progress"
+            // fit and the priority + summary aren't pushed under it.
             spans.push(Span::styled(
-                format!("{:<14} ", truncate(&t.status, 14)),
+                format!("{:<width$} ", truncate(&t.status, status_w), width = status_w),
                 Style::default().fg(Color::Green),
             ));
             spans.push(priority_span(t.priority.as_deref()));
@@ -334,25 +346,30 @@ fn pr_state_label(role: MentionRole, state: PrUserState) -> Option<(&'static str
     })
 }
 
-/// Badge text + style for a role. `[A]` = assigned (rarely used since assigned
-/// is the default in most renders), `[R]` = reviewer, `[@]` = mentioned.
+/// Badge text + style for a role. Color is the source-of-truth identifier:
+///   purple → Jira-side badge ([A] assigned, [R] reviewer)
+///   blue   → GitHub-side badge ([R] PR reviewer, [@] mentioned)
+/// `[R]` deliberately doubles up: Jira-reviewer and GitHub-reviewer share the
+/// glyph; the user reads color to tell them apart.
 fn role_badge(role: MentionRole) -> (&'static str, Style) {
+    let purple = Color::Rgb(170, 130, 255); // Jira side
+    let blue = Color::Rgb(80, 160, 255);    // GitHub side
     match role {
         MentionRole::Assigned => (
             "[A]",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default().fg(purple).add_modifier(Modifier::BOLD),
         ),
         MentionRole::Reviewer => (
             "[R]",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default().fg(purple).add_modifier(Modifier::BOLD),
         ),
         MentionRole::Github => (
-            "[V]",
-            Style::default().fg(Color::Rgb(180, 130, 220)).add_modifier(Modifier::BOLD),
+            "[R]",
+            Style::default().fg(blue).add_modifier(Modifier::BOLD),
         ),
         MentionRole::Mentioned => (
             "[@]",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default().fg(blue).add_modifier(Modifier::BOLD),
         ),
     }
 }
@@ -2230,6 +2247,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             }
             hints.extend([
                 ("v", "two-col"),
+                ("K", "show/hide done PRs"),
                 ("Enter", "detail"),
                 ("q", "back"),
             ]);
@@ -2767,11 +2785,13 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
     }
 }
 
-/// Legend column shown next to the keybindings on the help overlay. Currently
-/// populated only on the List view (where the badges + state labels appear).
+/// Legend column shown next to the keybindings on the help overlay. Populated
+/// for views where the role badges + state labels appear (List, Tree).
 /// Returns an empty vec to fall back to single-column layout in other modes.
 fn legend_lines(app: &App) -> Vec<Line<'static>> {
-    if !matches!(app.mode, Mode::List) {
+    let in_list = matches!(app.mode, Mode::List);
+    let in_tree = matches!(app.mode, Mode::Tree(_));
+    if !in_list && !in_tree {
         return Vec::new();
     }
     let dim = Style::default().fg(Color::DarkGray);
@@ -2787,15 +2807,15 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         ])
     };
 
-    lines.push(Line::from(Span::styled(" Role badges", header)));
+    lines.push(Line::from(Span::styled(" Role badges  (purple = Jira · blue = GitHub)", header)));
     let (b, s) = role_badge(MentionRole::Assigned);
-    lines.push(entry(b, s, "Assigned to you (Active list)"));
+    lines.push(entry(b, s, "Assigned to you (Jira)"));
     let (b, s) = role_badge(MentionRole::Reviewer);
     lines.push(entry(b, s, "Reviewer (Jira reviewer field)"));
     let (b, s) = role_badge(MentionRole::Github);
-    lines.push(entry(b, s, "Reviewer (GitHub PR review request)"));
+    lines.push(entry(b, s, "Reviewer (GitHub PR — same letter, blue)"));
     let (b, s) = role_badge(MentionRole::Mentioned);
-    lines.push(entry(b, s, "@-mentioned in Jira description / comment"));
+    lines.push(entry(b, s, "Mentioned (GitHub @-mention)"));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(" PR review state (your tracker)", header)));
@@ -2821,17 +2841,31 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
     }
     lines.push(Line::from(""));
 
-    lines.push(Line::from(Span::styled(" Sections", header)));
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("Active", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled("    your assigned work (top pane)", dim),
-    ]));
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("Mentioned", Style::default().add_modifier(Modifier::BOLD)),
-        Span::styled(" reviewer + GitHub + @-mentions (bottom)", dim),
-    ]));
+    if in_list {
+        lines.push(Line::from(Span::styled(" Sections", header)));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Active", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("    your assigned work (top pane)", dim),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Mentioned", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(" reviewer + GitHub + @-mentions (bottom)", dim),
+        ]));
+    } else if in_tree {
+        lines.push(Line::from(Span::styled(" Tree node sources", header)));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("solid", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("       a ticket from one of your queues", dim),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("italic dim", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            Span::styled("  ancestor pulled in for context only", dim),
+        ]));
+    }
 
     lines
 }

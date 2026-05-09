@@ -837,6 +837,13 @@ impl App {
         for t in &self.reviewing_tickets { if keep(&t.key) { out.push((MentionRole::Reviewer, t)); } }
         for t in &self.github_tickets { if keep(&t.key) { out.push((MentionRole::Github, t)); } }
         for t in &self.mentioned_tickets { if keep(&t.key) { out.push((MentionRole::Mentioned, t)); } }
+        // Stable sort: rows whose user-managed PR state is Completed sink to
+        // the bottom (only meaningful when show_completed_prs is on, since
+        // they're filtered out entirely otherwise). Other rows keep their
+        // role-grouped order.
+        out.sort_by_key(|(_, t)| {
+            (self.pr_state(&t.key) == PrUserState::Completed) as u8
+        });
         out
     }
 
@@ -2571,17 +2578,25 @@ change, look for regressions, and report findings to me directly here.
         // Assigned wins over Reviewer wins over Mentioned (duplicates dropped).
         let assigned: HashSet<String> =
             self.tickets.iter().map(|t| t.key.clone()).collect();
+        // Drop completed PRs entirely when the K-toggle says so. Otherwise
+        // keep them — the children sort below sinks them to the bottom.
+        let drop_completed = !self.show_completed_prs;
+        let is_completed = |k: &str| -> bool {
+            self.pr_user_states.get(k).copied() == Some(PrUserState::Completed)
+        };
         let reviewer: HashSet<String> = self
             .reviewing_tickets
             .iter()
             .map(|t| t.key.clone())
             .filter(|k| !assigned.contains(k))
+            .filter(|k| !drop_completed || !is_completed(k))
             .collect();
         let github: HashSet<String> = self
             .github_tickets
             .iter()
             .map(|t| t.key.clone())
             .filter(|k| !assigned.contains(k) && !reviewer.contains(k))
+            .filter(|k| !drop_completed || !is_completed(k))
             .collect();
         let mentioned: HashSet<String> = self
             .mentioned_tickets
@@ -2699,14 +2714,28 @@ change, look for regressions, and report findings to me directly here.
             let bep = is_epic(&nodes[b]);
             bep.cmp(&aep).then_with(|| nodes[a].key.cmp(&nodes[b].key))
         });
-        // Sort each node's children by issue type weight (Story < Task < Sub-task)
-        // then by key, so the visual tree is stable.
+        // Sort each node's children, in priority order:
+        //   1. Completed PRs sink to the very bottom.
+        //   2. GitHub-mention rows sink under non-GitHub siblings (your own
+        //      sub-tasks under a Story show first; PRs you're reviewing
+        //      from someone else's branch on the same Story trail behind).
+        //   3. Issue-type weight (Story < Task < Sub-task).
+        //   4. Ticket key (stable visual order).
+        let states_snap = self.pr_user_states.clone();
+        let is_done = |k: &str| -> bool {
+            states_snap.get(k).copied() == Some(PrUserState::Completed)
+        };
         for i in 0..nodes.len() {
             let mut ch = std::mem::take(&mut nodes[i].children);
             ch.sort_by(|&a, &b| {
-                let wa = type_weight(&nodes[a]);
-                let wb = type_weight(&nodes[b]);
-                wa.cmp(&wb).then_with(|| nodes[a].key.cmp(&nodes[b].key))
+                let da = is_done(&nodes[a].key) as u8;
+                let db = is_done(&nodes[b].key) as u8;
+                let ga = matches!(nodes[a].role, Some(MentionRole::Github)) as u8;
+                let gb = matches!(nodes[b].role, Some(MentionRole::Github)) as u8;
+                da.cmp(&db)
+                    .then_with(|| ga.cmp(&gb))
+                    .then_with(|| type_weight(&nodes[a]).cmp(&type_weight(&nodes[b])))
+                    .then_with(|| nodes[a].key.cmp(&nodes[b].key))
             });
             nodes[i].children = ch;
         }
@@ -4352,7 +4381,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             KeyCode::Char('K') => {
                 // Toggle visibility of Completed PRs in the bottom section,
-                // regardless of which list focus is active.
+                // regardless of which list focus is active. Tree mode also
+                // honours the toggle but needs a rebuild to apply (handled
+                // elsewhere — Tree mode has its own K handler).
                 app.show_completed_prs = !app.show_completed_prs;
                 app.status = if app.show_completed_prs {
                     "PRs: showing completed".into()
@@ -5504,6 +5535,18 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         },
         Mode::Tree(_) => match code {
             KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::List; }
+            KeyCode::Char('K') => {
+                // Same toggle semantics as List view, plus a tree rebuild so
+                // the filter+sort actually applies (the K handler at the top
+                // of handle_key only flips the flag).
+                app.show_completed_prs = !app.show_completed_prs;
+                app.status = if app.show_completed_prs {
+                    "PRs: showing completed".into()
+                } else {
+                    "PRs: hiding completed".into()
+                };
+                app.open_tree().await?;
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Mode::Tree(f) = &mut app.mode {
                     if !f.visible.is_empty() {
