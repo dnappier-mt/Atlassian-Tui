@@ -101,6 +101,9 @@ pub enum Request {
     SaveClaudeSession { ticket_key: String, session_id: String },
     Transition { key: String, to: String },
     ListTransitions { key: String },
+    /// Fetch the instance's full set of status names (deduped, alpha-sorted).
+    /// Used by the Settings status-pickers.
+    ListStatuses,
     CreateTicket {
         project: String,
         issue_type: String,
@@ -112,6 +115,9 @@ pub enum Request {
         parent: Option<String>,
     },
     EditSummary { key: String, summary: String },
+    EditDescription { key: String, body: String },
+    /// Ask Claude to rewrite a description more tightly. Pure transform — no Jira write.
+    ImproveDescription { summary: String, body: String },
     EditPriority { key: String, priority: String },
     ListPriorities,
     SetEstimate { key: String, original: Option<String>, remaining: Option<String> },
@@ -135,17 +141,28 @@ pub enum Response {
     Tickets { items: Vec<Ticket> },
     /// Result lists for `ListMyMentions`. Reviewer wins over GitHub wins over
     /// Mentioned on overlap; daemon dedupes by key before returning.
+    /// `authored` is just ticket keys of open PRs the user authored — used to
+    /// flag the corresponding rows in tree/list views (no ticket payload since
+    /// the user's own tickets are already loaded).
     MyMentions {
         reviewing: Vec<Ticket>,
         mentioned: Vec<Ticket>,
         github: Vec<Ticket>,
+        #[serde(default)]
+        authored: Vec<String>,
     },
     /// Reply for `CreatePullRequest`.
     PullRequestCreated { url: String, number: u64 },
     /// Reply for `GetGithubHandle`. Empty string == no mapping.
     GithubHandle { handle: String },
-    /// Reply for `ListPrComments`.
-    PrComments { items: Vec<crate::github::PrComment> },
+    /// Reply for `ListPrComments`. `pr_link` is the canonical PR URL tied to
+    /// the ticket (populated even when there are zero comments); `None` when
+    /// no PR is associated.
+    PrComments {
+        items: Vec<crate::github::PrComment>,
+        #[serde(default)]
+        pr_link: Option<String>,
+    },
     /// Reply for `SetupDevQaWorktree`.
     DevQaWorktree { path: std::path::PathBuf, branch: String },
     /// Reply for `GetPrUserStates`.
@@ -156,9 +173,12 @@ pub enum Response {
     Notifications { items: Vec<NotificationItem> },
     Status { status: DaemonStatus },
     Transitions { items: Vec<TransitionOption> },
+    Statuses { items: Vec<String> },
     Comments { items: Vec<Comment> },
     Priorities { items: Vec<String> },
     Implementation { markdown: String, project_paths: Vec<String>, updated_at: String },
+    /// Reply for `ImproveDescription`.
+    Improved { body: String },
     /// Sent immediately when a generation request was queued; the markdown shows up on
     /// a subsequent GetImplementation call.
     Queued,

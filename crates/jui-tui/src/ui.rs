@@ -54,6 +54,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             draw_detail(f, chunks[1], app);
             draw_pr_create(f, app);
         }
+        Mode::ActiveStatusConfig(_) => draw_active_status_config(f, chunks[1], app),
+        Mode::Settings(_) => draw_settings(f, chunks[1], app),
     }
     if !matches!(&app.mode, Mode::PageView(_)) {
         draw_footer(f, chunks[2], app);
@@ -93,6 +95,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         },
         Mode::ArchiveConfirm(_) => "archive?",
         Mode::PrCreate(_) => "pr",
+        Mode::ActiveStatusConfig(_) => "workflow",
+        Mode::Settings(_) => "settings",
         Mode::ConfluencePages(form) => {
             conf_pages_label = if form.breadcrumb.is_empty() {
                 format!("confluence / {}", form.space_name)
@@ -959,6 +963,10 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         .map(|x| x.eq_ignore_ascii_case("sub-task") || x.eq_ignore_ascii_case("subtask"))
         .unwrap_or(false);
     let projects_h: u16 = ((app.detail_linked_projects.len() as u16).max(1) + 2).min(7);
+    // PR link box: shown only when the ticket is tied to a GitHub PR. Fixed
+    // 3 rows (border + url).
+    let pr_link_visible = app.detail_pr_link.is_some();
+    let pr_link_h: u16 = if pr_link_visible { 3 } else { 0 };
     // Visible subtask count (after the archived filter) drives the pane height when
     // the user isn't actively focused on subtasks.
     let visible_subtasks = visible_subtask_count(app, t);
@@ -989,9 +997,12 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         // ~3 rows per comment (header + 1-2 body lines), capped small when unfocused.
         ((app.pr_comments.len() as u16) * 3 + 2).clamp(5, 10)
     };
-    let mut constraints: Vec<Constraint> = Vec::with_capacity(5);
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(6);
     constraints.push(Constraint::Min(8));
     constraints.push(Constraint::Length(projects_h));
+    if pr_link_visible {
+        constraints.push(Constraint::Length(pr_link_h));
+    }
     if !is_subtask {
         constraints.push(Constraint::Length(subtasks_h));
     }
@@ -1007,6 +1018,9 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     let mut idx = 0;
     draw_detail_info(f, chunks[idx], app, t); idx += 1;
     draw_detail_projects(f, chunks[idx], app); idx += 1;
+    if pr_link_visible {
+        draw_detail_pr_link(f, chunks[idx], app); idx += 1;
+    }
     if !is_subtask {
         draw_detail_subtasks(f, chunks[idx], app, t); idx += 1;
     }
@@ -1014,6 +1028,20 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     if pr_comments_visible {
         draw_detail_pr_comments(f, chunks[idx], app);
     }
+}
+
+fn draw_detail_pr_link(f: &mut Frame, area: Rect, app: &App) {
+    let Some(url) = &app.detail_pr_link else { return };
+    let block = Block::default().borders(Borders::ALL).title(" pull request ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let line = Line::from(vec![Span::styled(
+        url.clone(),
+        Style::default()
+            .fg(Color::Rgb(80, 160, 255))
+            .add_modifier(Modifier::UNDERLINED),
+    )]);
+    f.render_widget(Paragraph::new(line), inner);
 }
 
 fn visible_subtask_count(app: &App, t: &jui_core::ticket::Ticket) -> usize {
@@ -1560,15 +1588,121 @@ fn draw_create(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
     let Mode::Edit(form) = &app.mode else { return };
-    let lines = vec![
-        Line::from(format!("editing {}", form.key)),
-        Line::from(""),
-        field_line("summary   ", &form.summary, true),
-        Line::from(""),
-        Line::from(Span::styled("enter: save   esc: cancel", Style::default().fg(Color::DarkGray))),
+    let block = Block::default().borders(Borders::ALL).title(" edit ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let has_suggestion = form.suggestion.is_some();
+    let (desc_h, sugg_h, sep_h) = if has_suggestion {
+        // Split the remaining vertical space roughly 50/50 between the user's body
+        // and the Claude suggestion, with a 2-line separator/header.
+        let avail = inner.height.saturating_sub(7);
+        let half = avail / 2;
+        (half.max(1), avail.saturating_sub(half).max(1), 2)
+    } else {
+        (inner.height.saturating_sub(7).max(1), 0, 0)
+    };
+
+    let mut constraints: Vec<Constraint> = vec![
+        Constraint::Length(1), // title
+        Constraint::Length(1), // blank
+        Constraint::Length(1), // summary field
+        Constraint::Length(1), // blank
+        Constraint::Length(1), // description label
+        Constraint::Length(desc_h),
     ];
-    let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" edit "));
-    f.render_widget(p, area);
+    if has_suggestion {
+        constraints.push(Constraint::Length(sep_h)); // separator + label
+        constraints.push(Constraint::Length(sugg_h));
+    }
+    constraints.push(Constraint::Length(1)); // hint
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    f.render_widget(Paragraph::new(format!("editing {}", form.key)), chunks[0]);
+    // Render summary with the caret inline when active (avoid the trailing
+    // caret `field_line` adds — the inline one already shows position).
+    let summary_active = form.field == 0;
+    let summary_text = if summary_active {
+        insert_caret(&form.summary, form.summary_cursor)
+    } else {
+        form.summary.clone()
+    };
+    let summary_style = if summary_active {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("summary       ", Style::default().fg(Color::DarkGray)),
+            Span::styled(summary_text, summary_style),
+        ])),
+        chunks[2],
+    );
+    let desc_label_active = form.field == 1;
+    let desc_label_style = if desc_label_active {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let mut label_spans: Vec<Span> = vec![Span::styled("description:", desc_label_style)];
+    if app.pending_improve.is_some() {
+        label_spans.push(Span::raw("  "));
+        label_spans.push(Span::styled(
+            "(asking claude to tighten…)",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(label_spans)),
+        chunks[4],
+    );
+    let body_text = if desc_label_active && !has_suggestion {
+        insert_caret(&form.description, form.description_cursor)
+    } else {
+        form.description.clone()
+    };
+    f.render_widget(
+        Paragraph::new(body_text).wrap(Wrap { trim: false }),
+        chunks[5],
+    );
+
+    let hint_idx = if has_suggestion {
+        let sep_lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "claude suggestion (y: accept · n: reject):",
+                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            )),
+        ];
+        f.render_widget(Paragraph::new(sep_lines).wrap(Wrap { trim: false }), chunks[6]);
+        let sugg = form.suggestion.clone().unwrap_or_default();
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                sugg,
+                Style::default().fg(Color::Magenta),
+            ))
+            .wrap(Wrap { trim: false }),
+            chunks[7],
+        );
+        8
+    } else {
+        6
+    };
+
+    let hint_text = if has_suggestion {
+        "y: keep claude rewrite   n/esc: reject   (then ctrl+s/F5 to save)"
+    } else {
+        "tab: switch · ←→↑↓/home/end: move · del: forward · enter: save (sum) / newline (desc) · ctrl+r or F6: claude tighten · ctrl+s/F5: save · esc: cancel"
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
+        chunks[hint_idx],
+    );
 }
 
 fn draw_comment(f: &mut Frame, area: Rect, app: &App) {
@@ -1683,6 +1817,209 @@ fn draw_ticket_projects(f: &mut Frame, area: Rect, app: &App) {
         .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
+}
+
+fn draw_active_status_config(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::ActiveStatusConfig(form) = &app.mode else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" active workflow statuses ({}) ", form.items.len()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Reserve the bottom row for the add-input box (when adding) and the hint.
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    if form.items.is_empty() {
+        let p = Paragraph::new(Span::styled(
+            "no active statuses — press 'i' to add one",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(p, chunks[0]);
+    } else {
+        let items: Vec<ListItem> = form
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let pending = form.pending_remove == Some(i);
+                let mut spans: Vec<Span> = vec![
+                    Span::styled(" ● ", Style::default().fg(Color::Green)),
+                    Span::styled(s.clone(), Style::default()),
+                ];
+                if pending {
+                    spans.push(Span::styled(
+                        "  press 'd' again to remove",
+                        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                ListItem::new(Line::from(spans))
+            })
+            .collect();
+        let mut state = ListState::default();
+        if !form.items.is_empty() {
+            state.select(Some(form.selected.min(form.items.len() - 1)));
+        }
+        let list = List::new(items)
+            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_symbol("▶ ");
+        let mut s = state;
+        f.render_stateful_widget(list, chunks[0], &mut s);
+    }
+
+    // Add-input row (only when adding).
+    if let Some(buf) = &form.adding {
+        let line = Line::from(vec![
+            Span::styled(" new: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(buf.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+        ]);
+        f.render_widget(Paragraph::new(line), chunks[1]);
+    }
+
+    let hint = if form.adding.is_some() {
+        "enter: add · esc: cancel"
+    } else {
+        "j/k: move · i: add · d×2: delete · esc/q: back   (saved on every change)"
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        chunks[2],
+    );
+}
+
+fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::Settings(form) = &app.mode else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" settings ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows: [(&str, &str); 2] = [
+        ("Default create status", form.default_create_status.as_str()),
+        ("All-mine exclude status", form.all_mine_exclude_status.as_str()),
+    ];
+
+    let mut items: Vec<ListItem> = Vec::new();
+    for (label, value) in rows.iter() {
+        let value_span = if value.is_empty() {
+            Span::styled("(empty)", Style::default().fg(Color::DarkGray))
+        } else {
+            Span::styled((*value).to_string(), Style::default().add_modifier(Modifier::BOLD))
+        };
+        let line = Line::from(vec![
+            Span::styled(format!(" {label:<26} "), Style::default().fg(Color::Gray)),
+            value_span,
+        ]);
+        items.push(ListItem::new(line));
+    }
+
+    let mut state = ListState::default();
+    state.select(Some(form.selected.min(rows.len() - 1)));
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+    let mut s = state;
+    f.render_stateful_widget(list, chunks[0], &mut s);
+
+    let help_line = match form.selected {
+        0 => "applied as a post-create transition after a new ticket is created",
+        1 => "JQL clause: assignee = currentUser() AND status != \"<this>\" when the M-toggle is on",
+        _ => "",
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(help_line, Style::default().fg(Color::DarkGray))),
+        chunks[1],
+    );
+
+    let hint = if form.picker.is_some() {
+        "type: filter · ↑/↓: move · enter: pick · esc: cancel"
+    } else {
+        "j/k: move · i/enter: edit · esc/q: back   (saved on every change)"
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        chunks[2],
+    );
+
+    if form.picker.is_some() {
+        draw_settings_picker(f, area, app);
+    }
+}
+
+fn draw_settings_picker(f: &mut Frame, parent: Rect, app: &App) {
+    let Mode::Settings(form) = &app.mode else { return };
+    let Some(p) = form.picker.as_ref() else { return };
+
+    // Centered modal: 60% × 70% of the settings area, clamped.
+    let w = parent.width.saturating_sub(4).min(70).max(30);
+    let h = parent.height.saturating_sub(4).min(20).max(8);
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    // Clear behind so we don't render on top of the list rows.
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let title = match p.row {
+        0 => " pick default create status ",
+        1 => " pick all-mine exclude status ",
+        _ => " pick status ",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+
+    // Top: filter input + status line.
+    let filter_line = Line::from(vec![
+        Span::styled(" filter: ", Style::default().fg(Color::Cyan)),
+        Span::styled(p.query.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("▏", Style::default().fg(Color::Cyan)),
+    ]);
+    let state_line = if p.loading {
+        Line::from(Span::styled(" loading…", Style::default().fg(Color::DarkGray)))
+    } else if let Some(err) = &p.error {
+        Line::from(Span::styled(
+            format!(" err: {err}"),
+            Style::default().fg(Color::Red),
+        ))
+    } else {
+        let n = p.filtered().len();
+        Line::from(Span::styled(
+            format!(" {n} match{}", if n == 1 { "" } else { "es" }),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    f.render_widget(Paragraph::new(vec![filter_line, state_line]), chunks[0]);
+
+    // Bottom: scrollable list.
+    let matches: Vec<&str> = p.filtered();
+    let items: Vec<ListItem> = matches
+        .iter()
+        .map(|s| ListItem::new(Span::raw((*s).to_string())))
+        .collect();
+    let mut list_state = ListState::default();
+    if !matches.is_empty() {
+        list_state.select(Some(p.selected.min(matches.len() - 1)));
+    }
+    let list = List::new(items)
+        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
 }
 
 fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
@@ -2023,10 +2360,13 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("n", "new"),
             ("s", "start"),
             ("T", "tree"),
+            ("M", "all mine"),
             ("K", "show/hide done PRs"),
             ("a", "archive"),
             ("b", "board"),
             ("p", "projects"),
+            ("W", "workflow"),
+            (",", "settings"),
             ("f", "confluence"),
             ("q", "quit"),
         ],
@@ -2068,6 +2408,20 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("enter", "add"),
             ("esc", "back"),
         ],
+        Mode::ActiveStatusConfig(form) => {
+            if form.adding.is_some() {
+                vec![("type", "status"), ("enter", "add"), ("esc", "cancel")]
+            } else {
+                vec![("j/k", "move"), ("i", "add"), ("d×2", "remove"), ("esc", "back")]
+            }
+        }
+        Mode::Settings(form) => {
+            if form.picker.is_some() {
+                vec![("type", "filter"), ("↑/↓", "move"), ("enter", "pick"), ("esc", "cancel")]
+            } else {
+                vec![("j/k", "move"), ("i/enter", "edit"), ("esc/q", "back")]
+            }
+        }
         Mode::Archive => vec![
             ("j/k", "move"),
             ("enter", "open"),
@@ -2078,7 +2432,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
         Mode::Detail => match app.detail_focus {
             DetailFocus::Info => {
                 let s_label = match app.detail.as_ref() {
-                    Some(t) if crate::app::is_ticket_started(t) => "stop",
+                    Some(t) if crate::app::ticket_status_active(&t.status, &app.active_statuses) => "stop",
                     _ => "start",
                 };
                 let is_subtask = app
@@ -2176,7 +2530,22 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("F5/ctrl+enter/ctrl+s", "submit"),
             ("esc", "cancel"),
         ],
-        Mode::Edit(_) => vec![("enter", "save"), ("esc", "cancel")],
+        Mode::Edit(form) => {
+            if form.suggestion.is_some() {
+                vec![
+                    ("y", "keep claude rewrite"),
+                    ("n/esc", "reject"),
+                ]
+            } else {
+                vec![
+                    ("tab", "switch field"),
+                    ("enter", "save (sum) / newline (desc)"),
+                    ("ctrl+r", "claude tighten"),
+                    ("ctrl+s/F5", "save"),
+                    ("esc", "cancel"),
+                ]
+            }
+        }
         Mode::Comment(_) => vec![("ctrl+s", "submit"), ("esc", "cancel")],
         Mode::Transition(_) => vec![
             ("j/k", "move"),
@@ -2828,6 +3197,11 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
     if let Some((b, s)) = pr_state_label(MentionRole::Github, PrUserState::Completed) {
         lines.push(entry(b.trim_end(), s, "Completed (auto on gh APPROVED, hidden default)"));
     }
+    lines.push(entry(
+        "[PR]",
+        Style::default().fg(Color::Rgb(80, 160, 255)).add_modifier(Modifier::BOLD),
+        "You have an open PR authored — sinks below not-yet-PR'd in Tree",
+    ));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(" Issue type glyphs", header)));
@@ -2890,6 +3264,7 @@ fn long_desc(key: &str, short: &str) -> Option<&'static str> {
         ("a", "archive") => Some("view archived tickets"),
         ("b", "board") => Some("open kanban board"),
         ("p", "projects") => Some("manage linked projects"),
+        ("W", "workflow") => Some("edit active Jira statuses (start/stop)"),
         ("f", "confluence") => Some("browse Confluence pages"),
         ("q", "quit") => Some("quit jui"),
 
@@ -2999,6 +3374,17 @@ fn render_hints(hints: &[Hint]) -> Line<'static> {
         spans.push(Span::styled(explanation.to_string(), exp_style));
     }
     Line::from(spans)
+}
+
+/// Insert the caret glyph at byte offset `cursor` inside `s`. Caller is
+/// responsible for landing `cursor` on a UTF-8 boundary (the edit_* helpers do).
+fn insert_caret(s: &str, cursor: usize) -> String {
+    let cur = cursor.min(s.len());
+    let mut out = String::with_capacity(s.len() + 3);
+    out.push_str(&s[..cur]);
+    out.push('▏');
+    out.push_str(&s[cur..]);
+    out
 }
 
 fn field_line<'a>(label: &'a str, value: &'a str, active: bool) -> Line<'a> {
@@ -3495,6 +3881,16 @@ fn tree_node_line_with_pr_state(
         {
             let _ = state; // silence unused when state.is_none()
             spans.push(Span::styled(label.to_string(), label_style));
+        } else if node.has_my_open_pr {
+            // No incoming-review label to show here, so reuse the slot for
+            // the "you have an open PR" hint. Blue (GitHub-side) to match
+            // the other GitHub-origin badges.
+            spans.push(Span::styled(
+                "[PR]   ".to_string(),
+                Style::default()
+                    .fg(Color::Rgb(80, 160, 255))
+                    .add_modifier(Modifier::BOLD),
+            ));
         }
     } else {
         spans.push(Span::raw(" ".repeat(badge_width)));

@@ -14,6 +14,8 @@ pub struct GlobalConfig {
     pub poll: PollConfig,
     #[serde(default)]
     pub projects: Vec<ProjectEntry>,
+    #[serde(default)]
+    pub workflow: WorkflowConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +96,57 @@ impl Default for PollConfig {
 }
 
 fn default_interval() -> u64 { 120 }
+
+/// Jira workflow states the user considers "in flight". Drives the start/stop
+/// hint label and the start_work shortcut. User-editable from the TUI via
+/// `Mode::ActiveStatusConfig` so the same binary works for non-MTConnect
+/// boards that use different status names.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowConfig {
+    #[serde(default = "default_active_statuses")]
+    pub active_statuses: Vec<String>,
+    /// Status to transition newly created tickets into. Empty string disables
+    /// the auto-transition (ticket stays at the project's initial status).
+    #[serde(default = "default_create_status")]
+    pub default_create_status: String,
+    /// Status excluded by the "all my tickets" toggle on the List view. The
+    /// toggle replaces the default `statusCategory != Done` clause with
+    /// `status != "<this>"`, surfacing every assigned ticket except the
+    /// terminal state. Empty string = no exclusion.
+    #[serde(default = "default_all_mine_exclude_status")]
+    pub all_mine_exclude_status: String,
+}
+
+impl Default for WorkflowConfig {
+    fn default() -> Self {
+        Self {
+            active_statuses: default_active_statuses(),
+            default_create_status: default_create_status(),
+            all_mine_exclude_status: default_all_mine_exclude_status(),
+        }
+    }
+}
+
+fn default_active_statuses() -> Vec<String> {
+    [
+        "In Progress",
+        "Code Review",
+        "Dev QA in Progress",
+        "Dev QA Complete",
+        "Closed",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+fn default_create_status() -> String {
+    "Firmware Backlog".to_string()
+}
+
+fn default_all_mine_exclude_status() -> String {
+    "Firmware Closed".to_string()
+}
 
 /// Per-repo override loaded from `.jui.toml` if present.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

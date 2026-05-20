@@ -341,7 +341,21 @@ async fn dispatch(
                     .ok_or_else(|| anyhow::anyhow!("no such ticket {key}"))?,
             };
             let slug = ticket.branch_slug();
-            let repo = scm::detect(&cwd);
+            // Prefer the ticket's first confirmed linked project as the SCM
+            // anchor — guarantees the worktree lands next to the repo the
+            // ticket actually targets, even when the user launched jui from
+            // outside that repo. Falls back to the caller-supplied cwd
+            // (typically the TUI's working dir) when no linked project is
+            // recorded.
+            let scm_anchor = state
+                .cache
+                .lock()
+                .await
+                .linked_paths(&key)?
+                .into_iter()
+                .next()
+                .unwrap_or(cwd);
+            let repo = scm::detect(&scm_anchor);
             let outcome = scm::start_work(&repo, &key, &slug)?;
             let reply = match outcome {
                 scm::StartWorkOutcome::GitWorktree {
@@ -419,20 +433,23 @@ async fn dispatch(
             // GitHub side is refreshed by `refresh_github_mentions` on the same
             // cadence. Async refresh kicks off if any role is older than 5 min.
             const STALE: i64 = 300;
-            let (reviewing, mentioned, github) = {
+            let (reviewing, mentioned, github, authored) = {
                 let cache = state.cache.lock().await;
                 (
                     cache.get_mentions("reviewer")?,
                     cache.get_mentions("mentioned")?,
                     cache.get_mentions("github")?,
+                    cache.get_mention_keys("authored")?,
                 )
             };
             let age_r = state.cache.lock().await.mentions_age_secs("reviewer")?;
             let age_m = state.cache.lock().await.mentions_age_secs("mentioned")?;
             let age_g = state.cache.lock().await.mentions_age_secs("github")?;
+            let age_a = state.cache.lock().await.mentions_age_secs("authored")?;
             let stale = age_r.map(|a| a > STALE).unwrap_or(true)
                 || age_m.map(|a| a > STALE).unwrap_or(true)
-                || age_g.map(|a| a > STALE).unwrap_or(true);
+                || age_g.map(|a| a > STALE).unwrap_or(true)
+                || age_a.map(|a| a > STALE).unwrap_or(true);
             if reviewing.is_empty() && mentioned.is_empty() && github.is_empty() {
                 refresh_my_mentions(&state).await;
                 let _ = refresh_github_mentions(&state).await;
@@ -441,6 +458,7 @@ async fn dispatch(
                     reviewing: cache.get_mentions("reviewer")?,
                     mentioned: cache.get_mentions("mentioned")?,
                     github: cache.get_mentions("github")?,
+                    authored: cache.get_mention_keys("authored")?,
                 });
             }
             if stale {
@@ -450,7 +468,7 @@ async fn dispatch(
                     let _ = refresh_github_mentions(&s2).await;
                 });
             }
-            Ok(Response::MyMentions { reviewing, mentioned, github })
+            Ok(Response::MyMentions { reviewing, mentioned, github, authored })
         }
 
         Request::SetGithubHandle { account_id, handle } => {
@@ -467,8 +485,14 @@ async fn dispatch(
         }
 
         Request::ListPrComments { ticket_key } => {
-            let items = state.cache.lock().await.get_pr_comments(&ticket_key)?;
-            Ok(Response::PrComments { items })
+            let cache = state.cache.lock().await;
+            let items = cache.get_pr_comments(&ticket_key)?;
+            // Prefer the canonical link table; fall back to the first cached
+            // comment's URL so older data (pre-ticket_prs) still works.
+            let pr_link = cache
+                .get_ticket_pr_url(&ticket_key)?
+                .or_else(|| items.first().map(|c| c.pr_url.clone()));
+            Ok(Response::PrComments { items, pr_link })
         }
 
         Request::SetupDevQaWorktree { ticket_key, repo, pr_number } => {
@@ -684,6 +708,12 @@ async fn dispatch(
             Ok(Response::Transitions { items })
         }
 
+        Request::ListStatuses => {
+            let api = JiraApi::from_jira_cli_config()?;
+            let items = api.statuses().await?;
+            Ok(Response::Statuses { items })
+        }
+
         Request::CreateTicket { project, issue_type, summary, body, parent } => {
             let key = state
                 .jira
@@ -780,6 +810,21 @@ async fn dispatch(
             let k2 = key.clone();
             tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
             Ok(Response::Ok)
+        }
+
+        Request::EditDescription { key, body } => {
+            state.jira.edit_description(&key, &body).await?;
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            Ok(Response::Ok)
+        }
+
+        Request::ImproveDescription { summary, body } => {
+            info!(summary_len = summary.len(), body_len = body.len(), "claude tighten requested");
+            let improved = jui_core::claude::improve_description(&summary, &body).await?;
+            info!(out_len = improved.len(), "claude tighten done");
+            Ok(Response::Improved { body: improved })
         }
 
         Request::EditPriority { key, priority } => {
@@ -1178,6 +1223,9 @@ async fn create_pull_request(
     github::push_branch(&worktree, &head_branch).await?;
     let pr = github::create_pr(&worktree, "develop", &head_branch, title, body).await?;
     info!(%ticket_key, url = pr.url, number = pr.number, "PR created");
+    if let Ok(repo) = github::repo_slug(&worktree).await {
+        let _ = state.cache.lock().await.upsert_ticket_pr(ticket_key, &pr.url, pr.number, &repo);
+    }
 
     // 5. Request reviewer on GitHub side.
     if let Some(handle) = &reviewer_gh {
@@ -1433,6 +1481,35 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
             let _ = cache.upsert_tickets(&tickets_to_cache);
         }
         let _ = cache.upsert_mentions("github", &keys);
+        // Record the canonical PR URL for each ticket — surfaces in the
+        // Detail view even when the PR has zero comments.
+        for (k, pr) in &pr_for_key {
+            let _ = cache.upsert_ticket_pr(k, &pr.url, pr.number, &pr.repo);
+        }
+    }
+
+    // Authored-by-me open PRs. Map back to ticket keys via branch name; no
+    // ticket fetch (the user's own tickets are loaded by the main list).
+    let authored = github::search_authored_open().await.unwrap_or_default();
+    let mut authored_keys: Vec<String> = Vec::new();
+    let mut seen_a: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Pairs of (ticket_key, &PrSummary) — used to upsert the PR url so the
+    // Detail view can render it even when there are no PR comments yet.
+    let mut authored_pr_for_key: Vec<(String, &jui_core::github::PrSummary)> = Vec::new();
+    for pr in &authored {
+        if let Some(key) = jui_core::scm::extract_ticket_key(&pr.head_branch) {
+            if seen_a.insert(key.clone()) {
+                authored_keys.push(key.clone());
+                authored_pr_for_key.push((key, pr));
+            }
+        }
+    }
+    {
+        let mut cache = state.cache.lock().await;
+        let _ = cache.upsert_mentions("authored", &authored_keys);
+        for (k, pr) in &authored_pr_for_key {
+            let _ = cache.upsert_ticket_pr(k, &pr.url, pr.number, &pr.repo);
+        }
     }
 
     // Fetch PR comments for each tied ticket. One round trip per PR — this is

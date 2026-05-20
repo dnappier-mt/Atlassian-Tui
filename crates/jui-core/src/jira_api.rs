@@ -88,6 +88,38 @@ impl JiraApi {
         }
     }
 
+    /// Fetch the instance's full set of issue statuses (workflow nodes across
+    /// every project) via `/rest/api/3/status`. Deduplicated and alpha-sorted.
+    pub async fn statuses(&self) -> Result<Vec<String>> {
+        let token = std::env::var("JIRA_API_TOKEN").context("JIRA_API_TOKEN not set")?;
+        let url = format!("{}/rest/api/3/status", self.server);
+        let out = Command::new("curl")
+            .args([
+                "-sS", "--fail-with-body",
+                "-H", "Accept: application/json",
+                "-u", &format!("{}:{}", self.login, token),
+                &url,
+            ])
+            .output()
+            .await
+            .context("invoking curl")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "curl failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let v: Value = serde_json::from_slice(&out.stdout).context("parsing statuses JSON")?;
+        let arr = v.as_array().cloned().unwrap_or_default();
+        let mut seen = std::collections::BTreeSet::new();
+        for s in arr {
+            if let Some(name) = s.get("name").and_then(|x| x.as_str()) {
+                seen.insert(name.to_string());
+            }
+        }
+        Ok(seen.into_iter().collect())
+    }
+
     pub async fn list_transitions(&self, key: &str) -> Result<Vec<TransitionOption>> {
         let token = std::env::var("JIRA_API_TOKEN")
             .context("JIRA_API_TOKEN not set; needed for transitions list")?;

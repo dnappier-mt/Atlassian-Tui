@@ -115,6 +115,65 @@ pub enum Mode {
     /// pickers + a final `gh pr create` step that comments back on the Jira
     /// ticket and transitions it to Code Review.
     PrCreate(PrCreateForm),
+    /// User-editable list of Jira statuses considered "in flight" (the set
+    /// that drives the start/stop hint label). Persists to
+    /// `GlobalConfig.workflow.active_statuses`.
+    ActiveStatusConfig(ActiveStatusForm),
+    /// General settings page: workflow defaults the user can tweak without
+    /// editing `config.toml` by hand. Opens with `,` from the List view.
+    Settings(SettingsForm),
+}
+
+/// Editable settings rows. Each row maps to one field on `WorkflowConfig`.
+/// Selection moves between rows; `i`/`Enter` opens a status picker populated
+/// from Jira; Enter on the picker commits and persists immediately.
+pub struct SettingsForm {
+    pub selected: usize,
+    pub default_create_status: String,
+    pub all_mine_exclude_status: String,
+    /// `Some` while the picker overlay is open.
+    pub picker: Option<StatusPicker>,
+}
+
+/// Status-picker overlay state. Loaded asynchronously: `loading` true while
+/// the daemon round-trip is in flight; the user can already type a query.
+pub struct StatusPicker {
+    /// Which SettingsForm row this picker is editing (0 = default_create,
+    /// 1 = all_mine_exclude).
+    pub row: usize,
+    pub query: String,
+    pub all: Vec<String>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+impl StatusPicker {
+    /// Lowercased substring filter; case-insensitive. Empty query returns all.
+    pub fn filtered(&self) -> Vec<&str> {
+        if self.query.trim().is_empty() {
+            return self.all.iter().map(String::as_str).collect();
+        }
+        let q = self.query.to_ascii_lowercase();
+        self.all
+            .iter()
+            .filter(|s| s.to_ascii_lowercase().contains(&q))
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+impl SettingsForm {
+    pub const ROW_COUNT: usize = 2;
+}
+
+pub struct ActiveStatusForm {
+    pub items: Vec<String>,
+    pub selected: usize,
+    /// Two-press delete guard — the index of the row pending removal, or None.
+    pub pending_remove: Option<usize>,
+    /// When `Some`, the user is typing a new status; on Enter we push and save.
+    pub adding: Option<String>,
 }
 
 pub struct PrCreateForm {
@@ -203,6 +262,10 @@ pub struct TreeNode {
     /// Role badge for the leaf source. Ancestors that are themselves not in any
     /// of the three sets get `None` and render with no badge.
     pub role: Option<MentionRole>,
+    /// True when the user has an open PR authored against this ticket. Used
+    /// to sort assigned-with-PR rows below assigned-without and to render the
+    /// `[PR]` indicator.
+    pub has_my_open_pr: bool,
 }
 
 pub struct TreeForm {
@@ -558,6 +621,70 @@ impl CreateForm {
 pub struct EditForm {
     pub key: String,
     pub summary: String,
+    pub description: String,
+    pub original_summary: String,
+    pub original_description: String,
+    /// 0 = summary, 1 = description.
+    pub field: u8,
+    /// Pending Claude rewrite of `description`. When Some, the UI shows it below the
+    /// current body and intercepts y/n to accept/reject.
+    pub suggestion: Option<String>,
+    /// Byte offset of the caret within `summary` / `description` — one each so
+    /// switching panes preserves position. Always sits on a char boundary.
+    pub summary_cursor: usize,
+    pub description_cursor: usize,
+}
+
+/// Caret helpers. Treat the buffer as a flat `&str`; offsets are byte indices
+/// that always land on UTF-8 char boundaries.
+pub fn edit_left(s: &str, cur: usize) -> usize {
+    if cur == 0 { return 0; }
+    let mut new = cur - 1;
+    while new > 0 && !s.is_char_boundary(new) { new -= 1; }
+    new
+}
+
+pub fn edit_right(s: &str, cur: usize) -> usize {
+    if cur >= s.len() { return s.len(); }
+    let mut new = cur + 1;
+    while new < s.len() && !s.is_char_boundary(new) { new += 1; }
+    new
+}
+
+pub fn edit_line_start(s: &str, cur: usize) -> usize {
+    s[..cur].rfind('\n').map(|i| i + 1).unwrap_or(0)
+}
+
+pub fn edit_line_end(s: &str, cur: usize) -> usize {
+    s[cur..].find('\n').map(|i| cur + i).unwrap_or(s.len())
+}
+
+fn step_forward_chars(s: &str, mut pos: usize, end: usize, mut chars: usize) -> usize {
+    while chars > 0 && pos < end {
+        pos += 1;
+        while pos < s.len() && !s.is_char_boundary(pos) { pos += 1; }
+        chars -= 1;
+    }
+    pos
+}
+
+pub fn edit_up(s: &str, cur: usize) -> usize {
+    let cur_ls = edit_line_start(s, cur);
+    if cur_ls == 0 { return 0; }
+    let col = s[cur_ls..cur].chars().count();
+    let prev_nl = cur_ls - 1;
+    let prev_ls = edit_line_start(s, prev_nl);
+    step_forward_chars(s, prev_ls, prev_nl, col)
+}
+
+pub fn edit_down(s: &str, cur: usize) -> usize {
+    let cur_le = edit_line_end(s, cur);
+    if cur_le == s.len() { return s.len(); }
+    let cur_ls = edit_line_start(s, cur);
+    let col = s[cur_ls..cur].chars().count();
+    let next_ls = cur_le + 1;
+    let next_le = edit_line_end(s, next_ls);
+    step_forward_chars(s, next_ls, next_le, col)
 }
 
 pub struct CommentForm {
@@ -610,6 +737,31 @@ pub struct App {
     /// ticket is tied to a GitHub PR.
     pub pr_comments: Vec<jui_core::github::PrComment>,
     pub pr_comment_selected: usize,
+    /// Canonical PR URL tied to the currently-displayed detail ticket.
+    /// `None` when no PR is associated. Populated alongside `pr_comments`.
+    pub detail_pr_link: Option<String>,
+    /// In-flight Claude "tighten description" task. Set by
+    /// `improve_edit_description`, drained by `main_loop` once the daemon
+    /// replies — so the UI keeps redrawing (and the user can see the
+    /// "asking claude…" indicator) while the request is outstanding.
+    pub pending_improve: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>>,
+    /// Jira statuses the user treats as "in flight" (drives the start/stop
+    /// hint label and the start-work shortcut). Loaded from
+    /// `GlobalConfig.workflow.active_statuses`; editable in
+    /// `Mode::ActiveStatusConfig` and persisted back to the same file.
+    pub active_statuses: Vec<String>,
+    /// Status applied to newly-created tickets via a post-create transition.
+    /// Mirrors `GlobalConfig.workflow.default_create_status`; editable from
+    /// `Mode::Settings`.
+    pub default_create_status: String,
+    /// Status excluded by the `M`-toggle on the main list. Mirrors
+    /// `GlobalConfig.workflow.all_mine_exclude_status`; editable from
+    /// `Mode::Settings`.
+    pub all_mine_exclude_status: String,
+    /// When true, the next `refresh()` uses an "all my tickets" JQL that drops
+    /// the `statusCategory != Done` filter and replaces it with a single
+    /// `status != "<all_mine_exclude_status>"` clause. Off by default.
+    pub show_all_mine: bool,
     /// User-managed PR review state per ticket key (Awaiting / Reviewing /
     /// Completed). Loaded from the daemon on refresh.
     pub pr_user_states: std::collections::HashMap<String, PrUserState>,
@@ -619,6 +771,10 @@ pub struct App {
     /// Tickets where the user has been @-mentioned in Jira text (description /
     /// comments). Disjoint from `reviewing_tickets` and `github_tickets`.
     pub mentioned_tickets: Vec<Ticket>,
+    /// Set of ticket keys where the user has an open PR they authored.
+    /// Populated by `refresh_mentioned`; drives the `[PR]` indicator and
+    /// secondary sort in the tree view.
+    pub my_authored_pr_keys: std::collections::HashSet<String>,
     /// Selection index across the **combined** Reviewer + Mentioned list when
     /// the bottom section of the List view is focused.
     pub mentioned_selected: usize,
@@ -710,9 +866,25 @@ impl App {
             github_tickets: Vec::new(),
             pr_comments: Vec::new(),
             pr_comment_selected: 0,
+            detail_pr_link: None,
+            pending_improve: None,
+            active_statuses: {
+                let cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
+                cfg.workflow.active_statuses
+            },
+            default_create_status: jui_core::config::GlobalConfig::load()
+                .unwrap_or_default()
+                .workflow
+                .default_create_status,
+            all_mine_exclude_status: jui_core::config::GlobalConfig::load()
+                .unwrap_or_default()
+                .workflow
+                .all_mine_exclude_status,
+            show_all_mine: false,
             pr_user_states: std::collections::HashMap::new(),
             show_completed_prs: false,
             mentioned_tickets: Vec::new(),
+            my_authored_pr_keys: std::collections::HashSet::new(),
             mentioned_selected: 0,
             list_focus: ListFocus::Active,
             pending_delete: None,
@@ -802,10 +974,11 @@ impl App {
     pub async fn refresh_mentioned(&mut self) -> Result<()> {
         let mut s = ipc::connect().await?;
         match ipc::send_request(&mut s, &Request::ListMyMentions).await? {
-            Response::MyMentions { reviewing, mentioned, github } => {
+            Response::MyMentions { reviewing, mentioned, github, authored } => {
                 self.reviewing_tickets = reviewing;
                 self.github_tickets = github;
                 self.mentioned_tickets = mentioned;
+                self.my_authored_pr_keys = authored.into_iter().collect();
                 let total = self.reviewing_tickets.len()
                     + self.github_tickets.len()
                     + self.mentioned_tickets.len();
@@ -1153,7 +1326,24 @@ impl App {
 
     pub async fn refresh(&mut self) -> Result<()> {
         let mut s = ipc::connect().await?;
-        match ipc::send_request(&mut s, &Request::ListTickets { jql: None, limit: 100 }).await? {
+        // When the `M`-toggle is on, swap the daemon's default JQL for one that
+        // drops the `statusCategory != Done` filter and excludes only the
+        // configured terminal status (typically "Firmware Closed"). Empty
+        // exclude value falls back to a plain assignee-only JQL.
+        let jql = if self.show_all_mine {
+            let exclude = self.all_mine_exclude_status.trim();
+            if exclude.is_empty() {
+                Some("assignee = currentUser()".to_string())
+            } else {
+                let escaped = exclude.replace('"', "\\\"");
+                Some(format!(
+                    "assignee = currentUser() AND status != \"{escaped}\""
+                ))
+            }
+        } else {
+            None
+        };
+        match ipc::send_request(&mut s, &Request::ListTickets { jql, limit: 100 }).await? {
             Response::Tickets { items } => {
                 // Augment the user's assigned-tickets list with phantom rows for any
                 // subtasks they're not assigned to. Each ticket's `subtasks` field
@@ -1264,15 +1454,17 @@ impl App {
         // PR comments — only present when the daemon's github-mentions refresh
         // has tied this ticket to a PR. Empty otherwise.
         let mut s = ipc::connect().await?;
-        if let Ok(Response::PrComments { items }) =
+        if let Ok(Response::PrComments { items, pr_link }) =
             ipc::send_request(&mut s, &Request::ListPrComments { ticket_key: key }).await
         {
             self.pr_comments = items;
             self.pr_comment_selected =
                 self.pr_comment_selected.min(self.pr_comments.len().saturating_sub(1));
+            self.detail_pr_link = pr_link;
         } else {
             self.pr_comments.clear();
             self.pr_comment_selected = 0;
+            self.detail_pr_link = None;
         }
         Ok(())
     }
@@ -1291,7 +1483,7 @@ impl App {
         let Some(t) = ticket else { return Ok(()) };
 
         // If work is already in progress on this ticket, treat `s` as "stop" instead.
-        if is_ticket_started(&t) {
+        if ticket_status_active(&t.status, &self.active_statuses) {
             return self.stop_work().await;
         }
 
@@ -1476,7 +1668,9 @@ impl App {
             }
         }
 
-        // 2. SCM branch switch.
+        // 2. SCM branch switch. Daemon resolves the worktree anchor from the
+        // ticket's linked project (cached); `cwd` is only the fallback when
+        // the ticket has no linked project on file.
         let cwd = std::env::current_dir()?;
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
@@ -1753,6 +1947,53 @@ impl App {
                 _ => {}
             }
         }
+        // Post-create transition to the configured default status (e.g. "Firmware
+        // Backlog"). Best-effort: the new ticket lives in the project's initial
+        // state ("Reported") otherwise, which falls outside some default
+        // filters and would hide the ticket from the user's list. Empty config
+        // value skips this step.
+        let target = self.default_create_status.trim().to_string();
+        if !target.is_empty() {
+            let mut s = ipc::connect().await?;
+            let tr_resp = ipc::send_request(
+                &mut s,
+                &Request::ListTransitions { key: new_key.clone() },
+            )
+            .await?;
+            if let Response::Transitions { items } = tr_resp {
+                let matched = items.iter().find(|tr| {
+                    tr.to_status
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case(&target))
+                        .unwrap_or(false)
+                        || tr.name.eq_ignore_ascii_case(&target)
+                });
+                if let Some(tr) = matched {
+                    let mut s = ipc::connect().await?;
+                    match ipc::send_request(
+                        &mut s,
+                        &Request::Transition {
+                            key: new_key.clone(),
+                            to: tr.name.clone(),
+                        },
+                    )
+                    .await?
+                    {
+                        Response::Ok => extras.push("status"),
+                        Response::Err { message } => {
+                            self.status = format!(
+                                "created {new_key}, but transition to \"{target}\" failed: {message}"
+                            );
+                        }
+                        _ => {}
+                    }
+                } else {
+                    self.status = format!(
+                        "created {new_key}, but no transition leads to \"{target}\""
+                    );
+                }
+            }
+        }
         if self.status.is_empty() || !self.status.starts_with("created ") {
             self.status = if extras.is_empty() {
                 format!("created {new_key}")
@@ -1765,18 +2006,106 @@ impl App {
         Ok(())
     }
 
+    pub async fn improve_edit_description(&mut self) -> Result<()> {
+        let (summary, body) = {
+            let Mode::Edit(form) = &self.mode else { return Ok(()) };
+            (form.summary.clone(), form.description.clone())
+        };
+        if body.trim().is_empty() {
+            self.status = "nothing to improve — description empty".into();
+            return Ok(());
+        }
+        if self.pending_improve.is_some() {
+            self.status = "claude already running — wait…".into();
+            return Ok(());
+        }
+        // Fire-and-forget task. `main_loop` polls the receiver each tick so
+        // the UI redraws while we wait — the daemon call can take 10–30s.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_improve = Some(rx);
+        self.status = "asking claude to tighten description…".into();
+        tokio::spawn(async move {
+            let result: anyhow::Result<String> = async {
+                let mut s = ipc::connect().await?;
+                let req = Request::ImproveDescription { summary, body };
+                match ipc::send_request(&mut s, &req).await? {
+                    Response::Improved { body } => Ok(body),
+                    Response::Err { message } => Err(anyhow::anyhow!("{message}")),
+                    _ => Err(anyhow::anyhow!("unexpected response")),
+                }
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        Ok(())
+    }
+
+    /// Non-blocking drain for `pending_improve`. Called from `main_loop` each
+    /// tick; either applies the suggestion or surfaces an error. Returns
+    /// `true` when something changed (so the loop can force-redraw if it cares).
+    pub fn poll_pending_improve(&mut self) -> bool {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let Some(rx) = self.pending_improve.as_mut() else { return false };
+        match rx.try_recv() {
+            Ok(Ok(body)) => {
+                if let Mode::Edit(form) = &mut self.mode {
+                    form.suggestion = Some(body);
+                }
+                self.status = "claude rewrite ready — y to accept, n to reject".into();
+                self.pending_improve = None;
+                true
+            }
+            Ok(Err(e)) => {
+                self.status = format!("err: {e:#}");
+                self.pending_improve = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Closed) => {
+                self.status = "claude task dropped".into();
+                self.pending_improve = None;
+                true
+            }
+        }
+    }
+
     pub async fn submit_edit(&mut self) -> Result<()> {
         let Mode::Edit(form) = &self.mode else { return Ok(()) };
-        let req = Request::EditSummary { key: form.key.clone(), summary: form.summary.clone() };
-        let mut s = ipc::connect().await?;
-        match ipc::send_request(&mut s, &req).await? {
-            Response::Ok => {
-                self.status = format!("edited {}", form.key);
-                self.mode = Mode::Detail;
-                self.load_detail().await?;
+        let key = form.key.clone();
+        let sum_changed = form.summary != form.original_summary;
+        let desc_changed = form.description != form.original_description;
+        if !sum_changed && !desc_changed {
+            self.mode = Mode::Detail;
+            return Ok(());
+        }
+        let summary = form.summary.clone();
+        let description = form.description.clone();
+
+        let mut errs: Vec<String> = Vec::new();
+        if sum_changed {
+            let mut s = ipc::connect().await?;
+            let req = Request::EditSummary { key: key.clone(), summary };
+            match ipc::send_request(&mut s, &req).await? {
+                Response::Ok => {}
+                Response::Err { message } => errs.push(format!("summary: {message}")),
+                _ => errs.push("summary: unexpected response".into()),
             }
-            Response::Err { message } => self.status = format!("err: {message}"),
-            _ => self.status = "unexpected response".into(),
+        }
+        if desc_changed {
+            let mut s = ipc::connect().await?;
+            let req = Request::EditDescription { key: key.clone(), body: description };
+            match ipc::send_request(&mut s, &req).await? {
+                Response::Ok => {}
+                Response::Err { message } => errs.push(format!("description: {message}")),
+                _ => errs.push("description: unexpected response".into()),
+            }
+        }
+        if errs.is_empty() {
+            self.status = format!("edited {key}");
+            self.mode = Mode::Detail;
+            self.load_detail().await?;
+        } else {
+            self.status = format!("err: {}", errs.join("; "));
         }
         Ok(())
     }
@@ -2650,6 +2979,7 @@ change, look for regressions, and report findings to me directly here.
             };
             let role = role_for(&key);
             let is_mine = role.is_some();
+            let has_my_open_pr = self.my_authored_pr_keys.contains(&key);
             by_key.insert(
                 key,
                 TreeNode {
@@ -2663,6 +2993,7 @@ change, look for regressions, and report findings to me directly here.
                     expanded: true,
                     is_mine,
                     role,
+                    has_my_open_pr,
                 },
             );
         }
@@ -2671,6 +3002,7 @@ change, look for regressions, and report findings to me directly here.
         // silently lose context.
         for k in &seed {
             let role = role_for(k);
+            let has_my_open_pr = self.my_authored_pr_keys.contains(k);
             by_key.entry(k.clone()).or_insert(TreeNode {
                 key: k.clone(),
                 summary: String::new(),
@@ -2682,6 +3014,7 @@ change, look for regressions, and report findings to me directly here.
                 expanded: true,
                 is_mine: role.is_some(),
                 role,
+                has_my_open_pr,
             });
         }
 
@@ -2708,19 +3041,27 @@ change, look for regressions, and report findings to me directly here.
             roots.push(i);
         }
 
-        // Sort roots: Epics first, then by key.
+        // Sort roots: Epics first, then assigned-without-PR before
+        // assigned-with-PR (so "ready to pick up" surfaces above tickets you
+        // already have work-in-flight on), then by key.
         roots.sort_by(|&a, &b| {
             let aep = is_epic(&nodes[a]);
             let bep = is_epic(&nodes[b]);
-            bep.cmp(&aep).then_with(|| nodes[a].key.cmp(&nodes[b].key))
+            let pa = nodes[a].has_my_open_pr as u8;
+            let pb = nodes[b].has_my_open_pr as u8;
+            bep.cmp(&aep)
+                .then_with(|| pa.cmp(&pb))
+                .then_with(|| nodes[a].key.cmp(&nodes[b].key))
         });
         // Sort each node's children, in priority order:
         //   1. Completed PRs sink to the very bottom.
         //   2. GitHub-mention rows sink under non-GitHub siblings (your own
         //      sub-tasks under a Story show first; PRs you're reviewing
         //      from someone else's branch on the same Story trail behind).
-        //   3. Issue-type weight (Story < Task < Sub-task).
-        //   4. Ticket key (stable visual order).
+        //   3. Tickets with an open PR you authored sink under tickets without
+        //      one — surfaces "ready to pick up" siblings first.
+        //   4. Issue-type weight (Story < Task < Sub-task).
+        //   5. Ticket key (stable visual order).
         let states_snap = self.pr_user_states.clone();
         let is_done = |k: &str| -> bool {
             states_snap.get(k).copied() == Some(PrUserState::Completed)
@@ -2732,8 +3073,11 @@ change, look for regressions, and report findings to me directly here.
                 let db = is_done(&nodes[b].key) as u8;
                 let ga = matches!(nodes[a].role, Some(MentionRole::Github)) as u8;
                 let gb = matches!(nodes[b].role, Some(MentionRole::Github)) as u8;
+                let pa = nodes[a].has_my_open_pr as u8;
+                let pb = nodes[b].has_my_open_pr as u8;
                 da.cmp(&db)
                     .then_with(|| ga.cmp(&gb))
+                    .then_with(|| pa.cmp(&pb))
                     .then_with(|| type_weight(&nodes[a]).cmp(&type_weight(&nodes[b])))
                     .then_with(|| nodes[a].key.cmp(&nodes[b].key))
             });
@@ -2754,6 +3098,117 @@ change, look for regressions, and report findings to me directly here.
         recompute_tree_visible(&mut form);
         self.mode = Mode::Tree(form);
         self.status = "tree".into();
+        Ok(())
+    }
+
+    /// Open the workflow-status editor. Lists `active_statuses` from the
+    /// in-memory app state (loaded from config at startup).
+    pub fn open_active_status_config(&mut self) {
+        self.mode = Mode::ActiveStatusConfig(ActiveStatusForm {
+            items: self.active_statuses.clone(),
+            selected: 0,
+            pending_remove: None,
+            adding: None,
+        });
+        self.status = "workflow statuses — i: add · d×2: delete · esc: close".into();
+    }
+
+    /// Open the general Settings page. Values are seeded from the cached
+    /// fields on `App`; commits write through `save_settings`.
+    pub fn open_settings(&mut self) {
+        self.mode = Mode::Settings(SettingsForm {
+            selected: 0,
+            default_create_status: self.default_create_status.clone(),
+            all_mine_exclude_status: self.all_mine_exclude_status.clone(),
+            picker: None,
+        });
+        self.status = "settings — i/enter: pick status · j/k: move · esc: close".into();
+    }
+
+    /// Open the status-picker overlay for the active settings row and kick off
+    /// a daemon round-trip to fetch every Jira status. The current value is
+    /// pre-selected once results arrive.
+    pub async fn open_settings_picker(&mut self) -> Result<()> {
+        let (row, current) = if let Mode::Settings(form) = &self.mode {
+            let cur = match form.selected {
+                0 => form.default_create_status.clone(),
+                1 => form.all_mine_exclude_status.clone(),
+                _ => String::new(),
+            };
+            (form.selected, cur)
+        } else {
+            return Ok(());
+        };
+        if let Mode::Settings(form) = &mut self.mode {
+            form.picker = Some(StatusPicker {
+                row,
+                query: String::new(),
+                all: Vec::new(),
+                selected: 0,
+                loading: true,
+                error: None,
+            });
+        }
+        self.status = "fetching statuses…".into();
+        let resp = {
+            let mut s = ipc::connect().await?;
+            ipc::send_request(&mut s, &Request::ListStatuses).await?
+        };
+        if let Mode::Settings(form) = &mut self.mode {
+            let Some(p) = form.picker.as_mut() else { return Ok(()) };
+            p.loading = false;
+            match resp {
+                Response::Statuses { items } => {
+                    if let Some(pos) = items
+                        .iter()
+                        .position(|s| s.eq_ignore_ascii_case(&current))
+                    {
+                        p.selected = pos;
+                    }
+                    p.all = items;
+                    self.status =
+                        "type: filter · j/k: move · enter: pick · esc: cancel".into();
+                }
+                Response::Err { message } => {
+                    p.error = Some(message.clone());
+                    self.status = format!("status fetch failed: {message}");
+                }
+                _ => {
+                    p.error = Some("unexpected response".into());
+                    self.status = "unexpected response".into();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Persist the current settings form back to `GlobalConfig.workflow` and
+    /// refresh the cached fields on `App`.
+    pub fn save_settings(&mut self) -> Result<()> {
+        let (create, exclude) = if let Mode::Settings(form) = &self.mode {
+            (form.default_create_status.clone(), form.all_mine_exclude_status.clone())
+        } else {
+            return Ok(());
+        };
+        let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
+        cfg.workflow.default_create_status = create.clone();
+        cfg.workflow.all_mine_exclude_status = exclude.clone();
+        cfg.save()?;
+        self.default_create_status = create;
+        self.all_mine_exclude_status = exclude;
+        Ok(())
+    }
+
+    /// Persist the current form's items back to `GlobalConfig.workflow` and
+    /// refresh the app's in-memory copy. Called after every add/delete so the
+    /// user doesn't have to remember a "save" key.
+    pub fn save_active_statuses(&mut self) -> Result<()> {
+        let Mode::ActiveStatusConfig(form) = &self.mode else { return Ok(()) };
+        let items = form.items.clone();
+        let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
+        cfg.workflow.active_statuses = items.clone();
+        cfg.save()?;
+        self.active_statuses = items;
         Ok(())
     }
 
@@ -3338,24 +3793,14 @@ pub fn ticket_has_pr(app: &App) -> bool {
     })
 }
 
-pub fn is_ticket_started(t: &Ticket) -> bool {
-    let inactive = [
-        "open", "backlog", "to do", "todo", "selected for development",
-        "done", "resolved", "closed",
-    ];
-    let s = t.status.to_ascii_lowercase();
-    let status_active = !inactive.iter().any(|x| *x == s);
-    if status_active {
-        return true;
-    }
-    // Worktree probe — local truth, useful when the user resumed a ticket the daemon
-    // hasn't transitioned (or the Jira workflow uses non-standard status names).
-    if let Ok(cwd) = std::env::current_dir() {
-        if let Some(path) = jui_core::scm::worktree_path_for_slug(&cwd, &t.branch_slug()) {
-            if path.exists() { return true; }
-        }
-    }
-    false
+/// True when `t.status` matches one of the user-configured active workflow
+/// states (case-insensitive). Configured via `Mode::ActiveStatusConfig` →
+/// `GlobalConfig.workflow.active_statuses`.
+pub fn ticket_status_active(status: &str, active_statuses: &[String]) -> bool {
+    let s = status.to_ascii_lowercase();
+    active_statuses
+        .iter()
+        .any(|cand| cand.to_ascii_lowercase() == s)
 }
 
 fn is_epic(n: &TreeNode) -> bool {
@@ -4053,6 +4498,9 @@ async fn main_loop<B: ratatui::backend::Backend>(
                 form.viewport_height = sz.height.saturating_sub(5) as usize;
             }
         }
+        // Drain any background "claude tighten" task that finished. The
+        // 200ms poll cadence below is enough — no need to shorten it.
+        app.poll_pending_improve();
         term.draw(|f| ui::draw(f, app))?;
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
@@ -4070,6 +4518,94 @@ async fn main_loop<B: ratatui::backend::Backend>(
         if app.should_quit {
             break;
         }
+    }
+    Ok(())
+}
+
+async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<()> {
+    // Picker overlay first — when active, only it gets keys.
+    let picker_open = matches!(&app.mode, Mode::Settings(f) if f.picker.is_some());
+    if picker_open {
+        // Snapshot the commit info while holding the borrow, then apply commit
+        // after dropping it (save_settings re-borrows app).
+        let mut commit: Option<(usize, String)> = None;
+        if let Mode::Settings(form) = &mut app.mode {
+            let Some(p) = form.picker.as_mut() else { return Ok(()) };
+            match code {
+                KeyCode::Esc => {
+                    form.picker = None;
+                    app.status = "pick cancelled".into();
+                    return Ok(());
+                }
+                KeyCode::Down => {
+                    let n = p.filtered().len();
+                    if n > 0 { p.selected = (p.selected + 1).min(n - 1); }
+                    return Ok(());
+                }
+                KeyCode::Up => {
+                    p.selected = p.selected.saturating_sub(1);
+                    return Ok(());
+                }
+                KeyCode::Backspace => {
+                    p.query.pop();
+                    p.selected = 0;
+                    return Ok(());
+                }
+                KeyCode::Enter => {
+                    let val = p.filtered().get(p.selected).map(|s| s.to_string());
+                    let Some(val) = val else {
+                        app.status = "no matching status".into();
+                        return Ok(());
+                    };
+                    commit = Some((p.row, val));
+                }
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                    p.query.push(c);
+                    p.selected = 0;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
+        if let Some((row, val)) = commit {
+            if let Mode::Settings(form) = &mut app.mode {
+                form.picker = None;
+                let label = match row {
+                    0 => { form.default_create_status = val.clone(); "default-create" }
+                    1 => { form.all_mine_exclude_status = val.clone(); "all-mine-exclude" }
+                    _ => "",
+                };
+                let l = label.to_string();
+                if let Err(e) = app.save_settings() {
+                    app.status = format!("save err: {e:#}");
+                } else {
+                    app.status = format!("{l} = \"{val}\"");
+                }
+            }
+            return Ok(());
+        }
+        return Ok(());
+    }
+    // Navigation mode (picker closed).
+    let mut open_picker = false;
+    if let Mode::Settings(form) = &mut app.mode {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.mode = Mode::List;
+                return Ok(());
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                form.selected = (form.selected + 1).min(SettingsForm::ROW_COUNT - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+            }
+            KeyCode::Char('i') | KeyCode::Enter => { open_picker = true; }
+            _ => {}
+        }
+    }
+    if open_picker {
+        app.open_settings_picker().await?;
     }
     Ok(())
 }
@@ -4363,10 +4899,17 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             | Mode::ConfluencePages(_)
             | Mode::AssignPicker(_)
             | Mode::PrCreate(_)
+            | Mode::ActiveStatusConfig(_)
+            | Mode::Settings(_)
     );
     if !in_text_input && matches!(code, KeyCode::Char('?')) {
         app.show_help = true;
         return Ok(());
+    }
+    // Settings has its own dispatch so we can call async picker fetches
+    // without holding a borrow on `app.mode` through the outer match.
+    if matches!(&app.mode, Mode::Settings(_)) {
+        return settings_keys(app, code, mods).await;
     }
     match &mut app.mode {
         Mode::List => match code {
@@ -4429,6 +4972,17 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 app.mode = Mode::Kanban;
             }
             KeyCode::Char('p') => { app.open_projects().await?; }
+            KeyCode::Char('W') => { app.open_active_status_config(); }
+            KeyCode::Char(',') => { app.open_settings(); }
+            KeyCode::Char('M') => {
+                app.show_all_mine = !app.show_all_mine;
+                app.status = if app.show_all_mine {
+                    "showing ALL assigned to me · r: refresh".into()
+                } else {
+                    "showing active work · r: refresh".into()
+                };
+                app.refresh().await?;
+            }
             KeyCode::Char('f') => { app.open_confluence_spaces().await?; }
             KeyCode::Char('T') => { app.open_tree().await?; }
             KeyCode::Tab => {
@@ -4470,6 +5024,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             KeyCode::Enter => {
                 if app.current_ticket().is_some() {
                     app.detail_origin = DetailOrigin::List;
+                    app.detail_focus = DetailFocus::Info;
                     app.load_detail().await?;
                     app.mode = Mode::Detail;
                 }
@@ -4496,6 +5051,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             KeyCode::Enter => {
                 if app.current_ticket().is_some() {
                     app.detail_origin = DetailOrigin::Archive;
+                    app.detail_focus = DetailFocus::Info;
                     app.load_detail().await?;
                     app.mode = Mode::Detail;
                 }
@@ -4562,6 +5118,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         app.kanban_minimized.remove(&app.kanban_col);
                     } else if app.current_ticket().is_some() {
                         app.detail_origin = DetailOrigin::Kanban;
+                        app.detail_focus = DetailFocus::Info;
                         app.load_detail().await?;
                         app.mode = Mode::Detail;
                     }
@@ -4821,9 +5378,19 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 KeyCode::Char('e') => {
                     if let Some(t) = &app.detail {
+                        let desc = t.description.clone().unwrap_or_default();
+                        let s_cur = t.summary.len();
+                        let d_cur = desc.len();
                         app.mode = Mode::Edit(EditForm {
                             key: t.key.clone(),
                             summary: t.summary.clone(),
+                            description: desc.clone(),
+                            original_summary: t.summary.clone(),
+                            original_description: desc,
+                            field: 0,
+                            suggestion: None,
+                            summary_cursor: s_cur,
+                            description_cursor: d_cur,
                         });
                     }
                     return Ok(());
@@ -5023,9 +5590,19 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             match code {
             KeyCode::Char('e') => {
                 if let Some(t) = &app.detail {
+                    let desc = t.description.clone().unwrap_or_default();
+                    let s_cur = t.summary.len();
+                    let d_cur = desc.len();
                     app.mode = Mode::Edit(EditForm {
                         key: t.key.clone(),
                         summary: t.summary.clone(),
+                        description: desc.clone(),
+                        original_summary: t.summary.clone(),
+                        original_description: desc,
+                        field: 0,
+                        suggestion: None,
+                        summary_cursor: s_cur,
+                        description_cursor: d_cur,
                     });
                 }
             }
@@ -5148,13 +5725,97 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 _ => {}
             }
         },
-        Mode::Edit(form) => match code {
-            KeyCode::Esc => app.mode = Mode::Detail,
-            KeyCode::Enter => app.submit_edit().await?,
-            KeyCode::Backspace => { form.summary.pop(); }
-            KeyCode::Char(c) => form.summary.push(c),
-            _ => {}
-        },
+        Mode::Edit(form) => {
+            // When a Claude suggestion is pending, intercept y/n first.
+            if form.suggestion.is_some() {
+                match code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        if let Some(s) = form.suggestion.take() {
+                            form.description = s;
+                            form.description_cursor = form.description.len();
+                            form.field = 1;
+                        }
+                        app.status = "accepted claude rewrite".into();
+                        return Ok(());
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        form.suggestion = None;
+                        app.status = "rejected claude rewrite".into();
+                        return Ok(());
+                    }
+                    _ => {
+                        // Any other key: drop the suggestion and fall through so normal
+                        // editing isn't blocked.
+                        form.suggestion = None;
+                    }
+                }
+            }
+            let is_desc = form.field == 1;
+            let (cur, cursor): (&mut String, &mut usize) = if is_desc {
+                (&mut form.description, &mut form.description_cursor)
+            } else {
+                (&mut form.summary, &mut form.summary_cursor)
+            };
+            // Clamp the cursor in case the buffer shrank under us (paranoia
+            // — accepted-suggestion path already resets, but cheap).
+            if *cursor > cur.len() { *cursor = cur.len(); }
+            match code {
+                KeyCode::Esc => app.mode = Mode::Detail,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    form.field = if form.field == 0 { 1 } else { 0 };
+                }
+                KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => app.submit_edit().await?,
+                KeyCode::F(5) => app.submit_edit().await?,
+                KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => app.submit_edit().await?,
+                // Ctrl+R or F6: ask Claude to tighten the description (works
+                // from either field). F6 is the unambiguous fallback for
+                // terminals that swallow Ctrl+R.
+                KeyCode::Char('r') if mods.contains(KeyModifiers::CONTROL) => {
+                    app.improve_edit_description().await?;
+                }
+                KeyCode::F(6) => {
+                    app.improve_edit_description().await?;
+                }
+                // Cursor navigation.
+                KeyCode::Left => { *cursor = edit_left(cur, *cursor); }
+                KeyCode::Right => { *cursor = edit_right(cur, *cursor); }
+                KeyCode::Up => {
+                    if is_desc { *cursor = edit_up(cur, *cursor); }
+                }
+                KeyCode::Down => {
+                    if is_desc { *cursor = edit_down(cur, *cursor); }
+                }
+                KeyCode::Home => { *cursor = edit_line_start(cur, *cursor); }
+                KeyCode::End => { *cursor = edit_line_end(cur, *cursor); }
+                // Enter in summary submits (single-line); in description inserts newline.
+                KeyCode::Enter => {
+                    if !is_desc {
+                        app.submit_edit().await?;
+                    } else {
+                        cur.insert(*cursor, '\n');
+                        *cursor += 1;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if *cursor > 0 {
+                        let prev = edit_left(cur, *cursor);
+                        cur.replace_range(prev..*cursor, "");
+                        *cursor = prev;
+                    }
+                }
+                KeyCode::Delete => {
+                    if *cursor < cur.len() {
+                        let nxt = edit_right(cur, *cursor);
+                        cur.replace_range(*cursor..nxt, "");
+                    }
+                }
+                KeyCode::Char(c) => {
+                    cur.insert(*cursor, c);
+                    *cursor += c.len_utf8();
+                }
+                _ => {}
+            }
+        }
         Mode::Comment(form) => match code {
             KeyCode::Esc => app.mode = Mode::Detail,
             KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => app.submit_comment().await?,
@@ -5864,6 +6525,86 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 _ => {}
             }
+        }
+        Mode::ActiveStatusConfig(form) => {
+            // Two-press 'd' guard: any other key clears the pending row.
+            if !matches!(code, KeyCode::Char('d')) {
+                form.pending_remove = None;
+            }
+            if let Some(buf) = form.adding.as_mut() {
+                // Inline add-input mode.
+                match code {
+                    KeyCode::Esc => {
+                        form.adding = None;
+                        app.status = "add cancelled".into();
+                    }
+                    KeyCode::Enter => {
+                        let val = buf.trim().to_string();
+                        if val.is_empty() {
+                            form.adding = None;
+                        } else if form
+                            .items
+                            .iter()
+                            .any(|s| s.eq_ignore_ascii_case(&val))
+                        {
+                            app.status = format!("\"{val}\" already in list");
+                            form.adding = None;
+                        } else {
+                            form.items.push(val.clone());
+                            form.selected = form.items.len() - 1;
+                            form.adding = None;
+                            if let Err(e) = app.save_active_statuses() {
+                                app.status = format!("save err: {e:#}");
+                            } else {
+                                app.status = format!("added \"{val}\"");
+                            }
+                        }
+                    }
+                    KeyCode::Backspace => { buf.pop(); }
+                    KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => buf.push(c),
+                    _ => {}
+                }
+                return Ok(());
+            }
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::List,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !form.items.is_empty() {
+                        form.selected = (form.selected + 1).min(form.items.len() - 1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    form.selected = form.selected.saturating_sub(1);
+                }
+                KeyCode::Char('i') | KeyCode::Char('a') => {
+                    form.adding = Some(String::new());
+                    app.status = "type new status · enter: add · esc: cancel".into();
+                }
+                KeyCode::Char('d') => {
+                    if form.items.is_empty() { return Ok(()); }
+                    let idx = form.selected.min(form.items.len() - 1);
+                    if form.pending_remove == Some(idx) {
+                        let removed = form.items.remove(idx);
+                        form.pending_remove = None;
+                        if form.selected >= form.items.len() && !form.items.is_empty() {
+                            form.selected = form.items.len() - 1;
+                        }
+                        if let Err(e) = app.save_active_statuses() {
+                            app.status = format!("save err: {e:#}");
+                        } else {
+                            app.status = format!("removed \"{removed}\"");
+                        }
+                    } else {
+                        form.pending_remove = Some(idx);
+                        app.status = "press 'd' again to remove this status".into();
+                    }
+                }
+                _ => {}
+            }
+        }
+        Mode::Settings(_) => {
+            // Handled out-of-band so we can drop the outer borrow on `app.mode`
+            // before invoking async picker fetches.
         }
     }
     Ok(())
