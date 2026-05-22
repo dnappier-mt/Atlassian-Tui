@@ -36,6 +36,11 @@ pub enum Request {
         body: String,
         reviewer_account_id: Option<String>,
         devqa_account_id: Option<String>,
+        /// Git remote to push to. `None` means "use the value cached for this
+        /// project (or die loudly so the TUI runs its picker)" — daemon
+        /// resolves it. Set when the TUI already ran the picker for this PR.
+        #[serde(default)]
+        push_remote: Option<String>,
     },
     /// Persist a Jira `account_id` → GitHub handle mapping. Used when the user
     /// picks a teammate in the PR-create modal who isn't yet in the map.
@@ -104,6 +109,26 @@ pub enum Request {
     /// Fetch the instance's full set of status names (deduped, alpha-sorted).
     /// Used by the Settings status-pickers.
     ListStatuses,
+    /// Resolve the on-disk worktree path for a ticket's first linked project.
+    /// Used by flows (PR review gate, comment chat) that need to spawn Claude
+    /// inside the worktree without going through the full StartWork dance.
+    GetTicketWorktree { ticket_key: String },
+    /// Persisted PR-draft handling. Lets the user resume a review-gated PR
+    /// across restarts so an aborted `/review` doesn't lose the form state.
+    GetPrDraft { ticket_key: String },
+    SavePrDraft { ticket_key: String, draft: crate::cache::PrDraft },
+    DeletePrDraft { ticket_key: String },
+    /// Run `/review` headlessly against the ticket's worktree, attached to the
+    /// ticket's stored Claude session (created if missing). Returns the raw
+    /// markdown Claude printed so the TUI can render it inline.
+    CodeReview { ticket_key: String },
+    /// `git remote -v` parsed against the ticket's worktree (or linked project
+    /// root if the worktree dir is missing). Returns (name, fetch_url) pairs.
+    ListWorktreeRemotes { ticket_key: String },
+    /// Per-project preferred push remote — saved once during the PR-create
+    /// picker; reused on subsequent PRs for the same linked project.
+    GetPushRemote { ticket_key: String },
+    SetPushRemote { ticket_key: String, remote_name: String },
     CreateTicket {
         project: String,
         issue_type: String,
@@ -174,6 +199,18 @@ pub enum Response {
     Status { status: DaemonStatus },
     Transitions { items: Vec<TransitionOption> },
     Statuses { items: Vec<String> },
+    /// `path = None` when no linked project or the slug's worktree dir is
+    /// missing; caller surfaces the appropriate hint to the user.
+    TicketWorktree { path: Option<PathBuf> },
+    /// `draft = None` when no in-flight PR draft is on file for this ticket.
+    PrDraft { draft: Option<crate::cache::PrDraft> },
+    /// Reply for `CodeReview`. Markdown body from `claude -p /review`.
+    ReviewOutput { markdown: String },
+    /// Reply for `ListWorktreeRemotes`.
+    Remotes { items: Vec<(String, String)> },
+    /// Reply for `GetPushRemote`. `name = None` means no override on file
+    /// (caller falls back to the picker flow).
+    PushRemote { name: Option<String> },
     Comments { items: Vec<Comment> },
     Priorities { items: Vec<String> },
     Implementation { markdown: String, project_paths: Vec<String>, updated_at: String },

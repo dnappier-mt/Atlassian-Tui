@@ -198,6 +198,52 @@ pub struct PrCreateForm {
     /// While `Some`, the modal collects the handle and submits via
     /// `Request::SetGithubHandle`, then re-tries.
     pub pending_handle: Option<PendingHandle>,
+    /// Pre-submit review gate state. Submit (Ctrl-S) starts in `Pending`,
+    /// which kicks off a headless Claude `/review` and flips to `Reviewing`.
+    /// From `Reviewing`, the user presses `y` to actually fire the PR, `f`
+    /// to open an interactive fix-session pane, `R` to re-run the review,
+    /// or `Esc` to reset.
+    pub review_state: PrReviewState,
+    /// Most recent `/review` markdown shown in the modal. `None` while a run
+    /// is in flight or before the first run.
+    pub review_output: Option<String>,
+    /// Vertical scroll offset (in display rows) for the review pane.
+    pub review_scroll: usize,
+    /// Byte offsets into `title` / `body` for the caret. Maintained on UTF-8
+    /// char boundaries — mirrors the Edit-mode pattern.
+    pub title_cursor: usize,
+    pub body_cursor: usize,
+    /// Claude's rewrite of `body`. While `Some`, the modal shows the original
+    /// alongside the suggestion with y/n keys to accept or reject.
+    pub suggestion: Option<String>,
+    /// When set, the user is picking which git remote to push to. Preempts
+    /// the normal form keys until they confirm or Esc.
+    pub remote_pick: Option<RemotePickerForm>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RemotePickerForm {
+    /// (remote name, fetch URL)
+    pub items: Vec<(String, String)>,
+    pub selected: usize,
+}
+
+/// Result of resolving which git remote to push to before a PR submit.
+pub enum PushRemoteOutcome {
+    /// Caller should pass this remote name through to the daemon.
+    Use(String),
+    /// Picker is now showing on the form; caller must return without
+    /// submitting. The user re-presses y after picking.
+    PickerOpened,
+    /// No remotes found at all (or list failed) — caller continues with
+    /// `None`; daemon will fall back to "origin" and surface its own error.
+    NoneAvailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrReviewState {
+    Pending,
+    Reviewing,
 }
 
 #[derive(Clone)]
@@ -745,6 +791,16 @@ pub struct App {
     /// replies — so the UI keeps redrawing (and the user can see the
     /// "asking claude…" indicator) while the request is outstanding.
     pub pending_improve: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>>,
+    /// In-flight `/review` task spawned by `run_pr_review`. The result either
+    /// populates `PrCreateForm.review_output` or surfaces an error in the
+    /// status bar. Drained from `main_loop` each tick.
+    pub pending_pr_review: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>>,
+    /// In-flight `improve_pr_body` task. Drained from `main_loop` each tick;
+    /// the result populates `PrCreateForm.suggestion`.
+    pub pending_pr_body_improve: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>>,
+    /// Frame counter advanced once per draw tick (~200 ms). Drives spinner
+    /// animation for long-running tasks like `/review` and the body rewrite.
+    pub spinner_tick: usize,
     /// Jira statuses the user treats as "in flight" (drives the start/stop
     /// hint label and the start-work shortcut). Loaded from
     /// `GlobalConfig.workflow.active_statuses`; editable in
@@ -868,6 +924,9 @@ impl App {
             pr_comment_selected: 0,
             detail_pr_link: None,
             pending_improve: None,
+            pending_pr_review: None,
+            pending_pr_body_improve: None,
+            spinner_tick: 0,
             active_statuses: {
                 let cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
                 cfg.workflow.active_statuses
@@ -932,6 +991,13 @@ impl App {
 
     /// Lookup the user's review state for a ticket. Default `Awaiting` when
     /// the ticket has never been touched.
+    /// Spinner glyph for the current frame. Rotates a braille pattern so any
+    /// "working…" surface in the UI (review, rewrite, etc.) shows motion.
+    pub fn spinner_glyph(&self) -> char {
+        const FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        FRAMES[self.spinner_tick % FRAMES.len()]
+    }
+
     pub fn pr_state(&self, ticket_key: &str) -> PrUserState {
         self.pr_user_states
             .get(ticket_key)
@@ -2040,6 +2106,73 @@ impl App {
         Ok(())
     }
 
+    /// Ask Claude to tighten the current PR body. Result lands in
+    /// `PrCreateForm.suggestion` for the user to accept/reject. No-op when
+    /// not in `PrCreate` or the body is empty.
+    pub async fn improve_pr_body(&mut self) -> Result<()> {
+        let (title, body) = {
+            let Mode::PrCreate(f) = &self.mode else { return Ok(()) };
+            (f.title.clone(), f.body.clone())
+        };
+        if body.trim().is_empty() {
+            self.status = "nothing to improve — body empty".into();
+            return Ok(());
+        }
+        if self.pending_pr_body_improve.is_some() {
+            self.status = "claude already running — wait…".into();
+            return Ok(());
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_pr_body_improve = Some(rx);
+        self.status = "asking claude to tighten PR body…".into();
+        // Reuse ImproveDescription on the daemon — same semantics: rewrite a
+        // free-form body, keep facts, drop filler. Title doubles as context
+        // (the daemon's prompt names it "Summary").
+        tokio::spawn(async move {
+            let result: anyhow::Result<String> = async {
+                let mut s = ipc::connect().await?;
+                let req = Request::ImproveDescription { summary: title, body };
+                match ipc::send_request(&mut s, &req).await? {
+                    Response::Improved { body } => Ok(body),
+                    Response::Err { message } => Err(anyhow::anyhow!("{message}")),
+                    _ => Err(anyhow::anyhow!("unexpected response")),
+                }
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        Ok(())
+    }
+
+    /// Non-blocking drain for `pending_pr_body_improve`. Called from
+    /// `main_loop` each tick. Drops the suggestion onto the form so the
+    /// modal can show the y/n prompt, or surfaces an error in the status bar.
+    pub fn poll_pending_pr_body_improve(&mut self) -> bool {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let Some(rx) = self.pending_pr_body_improve.as_mut() else { return false };
+        match rx.try_recv() {
+            Ok(Ok(body)) => {
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.suggestion = Some(body);
+                }
+                self.status = "claude rewrite ready — y to accept, n to reject".into();
+                self.pending_pr_body_improve = None;
+                true
+            }
+            Ok(Err(e)) => {
+                self.status = format!("improve failed: {e:#}");
+                self.pending_pr_body_improve = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Closed) => {
+                self.status = "improve task dropped".into();
+                self.pending_pr_body_improve = None;
+                true
+            }
+        }
+    }
+
     /// Non-blocking drain for `pending_improve`. Called from `main_loop` each
     /// tick; either applies the suggestion or surfaces an error. Returns
     /// `true` when something changed (so the loop can force-redraw if it cares).
@@ -2725,12 +2858,29 @@ change, look for regressions, and report findings to me directly here.
 
     pub async fn open_pr_create(&mut self) -> Result<()> {
         let Some(t) = self.detail.as_ref() else { return Ok(()) };
+        let key = t.key.clone();
         let title = format!("{}: {}", t.key, t.summary);
         let body = String::from(
             "## Summary\n\n- \n\n## Test plan\n\n- [ ] \n",
         );
-        self.mode = Mode::PrCreate(PrCreateForm {
-            key: t.key.clone(),
+        // Look for a persisted draft so a /review that was interrupted by a
+        // restart / crash / closed tmux pane is recoverable.
+        let draft = {
+            let mut s = ipc::connect().await?;
+            match ipc::send_request(
+                &mut s,
+                &Request::GetPrDraft { ticket_key: key.clone() },
+            )
+            .await?
+            {
+                Response::PrDraft { draft } => draft,
+                _ => None,
+            }
+        };
+        let title_cursor = title.len();
+        let body_cursor = body.len();
+        let mut form = PrCreateForm {
+            key: key.clone(),
             title,
             body,
             reviewer_query: String::new(),
@@ -2745,7 +2895,82 @@ change, look for regressions, and report findings to me directly here.
             busy: false,
             error: None,
             pending_handle: None,
-        });
+            review_state: PrReviewState::Pending,
+            review_output: None,
+            review_scroll: 0,
+            title_cursor,
+            body_cursor,
+            suggestion: None,
+            remote_pick: None,
+        };
+        let mut restored_state: Option<&'static str> = None;
+        if let Some(d) = draft {
+            form.title = d.title;
+            form.body = d.body;
+            form.title_cursor = form.title.len();
+            form.body_cursor = form.body.len();
+            if let (Some(id), Some(name)) = (d.reviewer_account_id, d.reviewer_display_name) {
+                form.reviewer = Some((name, id));
+            }
+            if let (Some(id), Some(name)) = (d.devqa_account_id, d.devqa_display_name) {
+                form.devqa = Some((name, id));
+            }
+            form.review_output = d.review_output;
+            form.review_state = if d.review_state.eq_ignore_ascii_case("reviewing") {
+                restored_state = Some("reviewing");
+                PrReviewState::Reviewing
+            } else {
+                restored_state = Some("pending");
+                PrReviewState::Pending
+            };
+        }
+        self.mode = Mode::PrCreate(form);
+        if let Some(s) = restored_state {
+            self.status = if s == "reviewing" {
+                "resumed PR draft · review previously started · y submit · f fix · R re-run review".into()
+            } else {
+                "resumed PR draft · ^S to run /review".into()
+            };
+        }
+        Ok(())
+    }
+
+    /// Persist the in-flight PR draft so a restart or dropped tmux pane
+    /// doesn't lose the user's review-gated submit.
+    pub async fn save_pr_draft(&mut self) -> Result<()> {
+        let Mode::PrCreate(f) = &self.mode else { return Ok(()) };
+        let draft = jui_core::cache::PrDraft {
+            title: f.title.clone(),
+            body: f.body.clone(),
+            reviewer_account_id: f.reviewer.as_ref().map(|(_, id)| id.clone()),
+            reviewer_display_name: f.reviewer.as_ref().map(|(name, _)| name.clone()),
+            devqa_account_id: f.devqa.as_ref().map(|(_, id)| id.clone()),
+            devqa_display_name: f.devqa.as_ref().map(|(name, _)| name.clone()),
+            review_state: match f.review_state {
+                PrReviewState::Pending => "pending".into(),
+                PrReviewState::Reviewing => "reviewing".into(),
+            },
+            review_output: f.review_output.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        };
+        let key = f.key.clone();
+        let mut s = ipc::connect().await?;
+        let _ = ipc::send_request(
+            &mut s,
+            &Request::SavePrDraft { ticket_key: key, draft },
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Clear the persisted draft after a successful PR submit.
+    pub async fn delete_pr_draft(&mut self, ticket_key: &str) -> Result<()> {
+        let mut s = ipc::connect().await?;
+        let _ = ipc::send_request(
+            &mut s,
+            &Request::DeletePrDraft { ticket_key: ticket_key.to_string() },
+        )
+        .await?;
         Ok(())
     }
 
@@ -2772,6 +2997,258 @@ change, look for regressions, and report findings to me directly here.
         Ok(())
     }
 
+    /// Submit-key handler for the PR-create modal. The pre-submit review
+    /// gate is currently shelved — submit goes straight through. Toggle back
+    /// on by restoring the `review_state`-aware match below.
+    pub async fn pr_submit_pressed(&mut self) -> Result<()> {
+        self.submit_pr_create().await
+    }
+
+    /// Fire a headless `claude -p /review` against the ticket's worktree.
+    /// The result lands in `PrCreateForm.review_output` and the modal pane
+    /// renders it inline — no tmux pane swap required. Re-callable from `R`
+    /// in `Reviewing` to refresh the review.
+    pub async fn run_pr_review(&mut self) -> Result<()> {
+        let key = match &self.mode {
+            Mode::PrCreate(f) => f.key.clone(),
+            _ => return Ok(()),
+        };
+        if self.pending_pr_review.is_some() {
+            self.status = "review already running — wait…".into();
+            return Ok(());
+        }
+        // Flip the form into `Reviewing` immediately so the modal can render
+        // the "running…" placeholder. Clear any previous output + scroll.
+        if let Mode::PrCreate(f) = &mut self.mode {
+            f.review_state = PrReviewState::Reviewing;
+            f.review_output = None;
+            f.review_scroll = 0;
+            f.error = None;
+        }
+        // Persist what we have so a restart mid-run lands back in Reviewing
+        // (with no output yet) instead of losing the form.
+        let _ = self.save_pr_draft().await;
+        // Fire-and-forget: main_loop drains the receiver. The /review call
+        // is long-running (the daemon waits on `claude -p`), so the TUI
+        // must stay responsive while it runs.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_pr_review = Some(rx);
+        self.status = "claude /review running… (esc to cancel after it returns)".into();
+        let ticket_key = key.clone();
+        tokio::spawn(async move {
+            let result: anyhow::Result<String> = async {
+                let mut s = ipc::connect().await?;
+                let req = Request::CodeReview { ticket_key };
+                match ipc::send_request(&mut s, &req).await? {
+                    Response::ReviewOutput { markdown } => Ok(markdown),
+                    Response::Err { message } => Err(anyhow::anyhow!("{message}")),
+                    _ => Err(anyhow::anyhow!("unexpected response")),
+                }
+            }
+            .await;
+            let _ = tx.send(result);
+        });
+        Ok(())
+    }
+
+    /// Non-blocking drain for `pending_pr_review`. Called from `main_loop`
+    /// each tick. Stores the markdown on the form and persists the draft so
+    /// a restart can still see it. Returns `true` when something changed.
+    pub fn poll_pending_pr_review(&mut self) -> bool {
+        use tokio::sync::oneshot::error::TryRecvError;
+        let Some(rx) = self.pending_pr_review.as_mut() else { return false };
+        match rx.try_recv() {
+            Ok(Ok(md)) => {
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.review_output = Some(md);
+                    f.review_scroll = 0;
+                }
+                self.pending_pr_review = None;
+                self.status =
+                    "review ready · y submit · f fix session · R re-run · esc back".into();
+                // Best-effort save with the new output. Spawn so we don't
+                // block the UI thread on an IPC round-trip.
+                let snapshot = if let Mode::PrCreate(f) = &self.mode {
+                    Some((f.key.clone(), self.snapshot_pr_draft()))
+                } else { None };
+                if let Some((key, draft)) = snapshot {
+                    tokio::spawn(async move {
+                        if let Ok(mut s) = ipc::connect().await {
+                            let _ = ipc::send_request(
+                                &mut s,
+                                &Request::SavePrDraft { ticket_key: key, draft },
+                            )
+                            .await;
+                        }
+                    });
+                }
+                true
+            }
+            Ok(Err(e)) => {
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.error = Some(format!("{e:#}"));
+                }
+                self.pending_pr_review = None;
+                self.status = format!("review failed: {e:#}");
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Closed) => {
+                self.pending_pr_review = None;
+                self.status = "review task dropped".into();
+                true
+            }
+        }
+    }
+
+    /// Snapshot the current PrCreate form as a PrDraft. Caller must have
+    /// already verified `self.mode` is `PrCreate`.
+    fn snapshot_pr_draft(&self) -> jui_core::cache::PrDraft {
+        let f = match &self.mode {
+            Mode::PrCreate(f) => f,
+            _ => unreachable!("snapshot_pr_draft called outside PrCreate"),
+        };
+        jui_core::cache::PrDraft {
+            title: f.title.clone(),
+            body: f.body.clone(),
+            reviewer_account_id: f.reviewer.as_ref().map(|(_, id)| id.clone()),
+            reviewer_display_name: f.reviewer.as_ref().map(|(name, _)| name.clone()),
+            devqa_account_id: f.devqa.as_ref().map(|(_, id)| id.clone()),
+            devqa_display_name: f.devqa.as_ref().map(|(name, _)| name.clone()),
+            review_state: match f.review_state {
+                PrReviewState::Pending => "pending".into(),
+                PrReviewState::Reviewing => "reviewing".into(),
+            },
+            review_output: f.review_output.clone(),
+            updated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    /// Open a follow-up Claude pane on the same ticket (no `/review`), so the
+    /// user can resolve issues the review surfaced. Stays in `Reviewing` so a
+    /// subsequent `y` still submits the PR.
+    pub async fn open_pr_fix_session(&mut self) -> Result<()> {
+        let key = match &self.mode {
+            Mode::PrCreate(f) => f.key.clone(),
+            _ => return Ok(()),
+        };
+        let worktree = match self.ticket_worktree(&key).await? {
+            Some(p) => p,
+            None => {
+                self.status = "no worktree on file".into();
+                return Ok(());
+            }
+        };
+        self.spawn_claude_pane(&key, &worktree, None).await?;
+        self.status = "fix-session pane opened · resolve, then y to submit".into();
+        Ok(())
+    }
+
+    /// Resolve which git remote to push to for this ticket.
+    /// `Use(name)` → caller passes it through. `PickerOpened` → caller must
+    /// return; picker handles the next y-press. `NoneAvailable` → no remotes
+    /// found at all, let the daemon error out on its own.
+    pub async fn resolve_push_remote(&mut self, ticket_key: &str) -> Result<PushRemoteOutcome> {
+        // 1. Cached value wins.
+        let cached = {
+            let mut s = ipc::connect().await?;
+            match ipc::send_request(
+                &mut s,
+                &Request::GetPushRemote { ticket_key: ticket_key.to_string() },
+            )
+            .await?
+            {
+                Response::PushRemote { name } => name,
+                _ => None,
+            }
+        };
+        if let Some(name) = cached {
+            return Ok(PushRemoteOutcome::Use(name));
+        }
+        // 2. No cached value — list remotes.
+        let remotes: Vec<(String, String)> = {
+            let mut s = ipc::connect().await?;
+            match ipc::send_request(
+                &mut s,
+                &Request::ListWorktreeRemotes { ticket_key: ticket_key.to_string() },
+            )
+            .await?
+            {
+                Response::Remotes { items } => items,
+                Response::Err { message } => {
+                    if let Mode::PrCreate(f) = &mut self.mode {
+                        f.error = Some(format!("remote list failed: {message}"));
+                    }
+                    return Ok(PushRemoteOutcome::NoneAvailable);
+                }
+                _ => Vec::new(),
+            }
+        };
+        match remotes.len() {
+            0 => Ok(PushRemoteOutcome::NoneAvailable),
+            1 => {
+                // Single remote — auto-pick + persist so we don't ask again.
+                let name = remotes[0].0.clone();
+                let mut s = ipc::connect().await?;
+                let _ = ipc::send_request(
+                    &mut s,
+                    &Request::SetPushRemote {
+                        ticket_key: ticket_key.to_string(),
+                        remote_name: name.clone(),
+                    },
+                )
+                .await?;
+                Ok(PushRemoteOutcome::Use(name))
+            }
+            _ => {
+                // Multiple — pop the picker. Default selection prefers a
+                // non-"origin" remote (assumption: user's fork). Falls back to
+                // index 0 if every remote is named "origin" somehow.
+                let default = remotes
+                    .iter()
+                    .position(|(n, _)| n != "origin")
+                    .unwrap_or(0);
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.remote_pick = Some(RemotePickerForm {
+                        items: remotes,
+                        selected: default,
+                    });
+                    f.error = None;
+                }
+                self.status =
+                    "pick push remote · j/k: move · enter: save+push · esc: cancel".into();
+                Ok(PushRemoteOutcome::PickerOpened)
+            }
+        }
+    }
+
+    /// Commit the remote-picker selection: persist it for this project, close
+    /// the overlay, and re-fire submit so the PR goes through with the chosen
+    /// remote already cached.
+    pub async fn commit_remote_pick(&mut self) -> Result<()> {
+        let (ticket_key, remote_name) = {
+            let Mode::PrCreate(f) = &self.mode else { return Ok(()) };
+            let Some(picker) = f.remote_pick.as_ref() else { return Ok(()) };
+            let Some((name, _)) = picker.items.get(picker.selected) else { return Ok(()) };
+            (f.key.clone(), name.clone())
+        };
+        let mut s = ipc::connect().await?;
+        let _ = ipc::send_request(
+            &mut s,
+            &Request::SetPushRemote {
+                ticket_key: ticket_key.clone(),
+                remote_name: remote_name.clone(),
+            },
+        )
+        .await?;
+        if let Mode::PrCreate(f) = &mut self.mode {
+            f.remote_pick = None;
+        }
+        self.status = format!("push remote saved: {remote_name}");
+        // Re-fire submit — cached value picks up the new choice.
+        self.submit_pr_create().await
+    }
+
     pub async fn submit_pr_create(&mut self) -> Result<()> {
         // Snapshot all the form data we need so we can hold a `&mut self`
         // borrow during the async call without colliding with reads of
@@ -2792,21 +3269,32 @@ change, look for regressions, and report findings to me directly here.
             }
             return Ok(());
         }
+        // Resolve push remote before the daemon round-trip. Cached → use it.
+        // Otherwise list remotes: 1 = auto-pick; >1 = open the picker and bail
+        // (user re-presses y after picking).
+        let push_remote = match self.resolve_push_remote(&key).await? {
+            PushRemoteOutcome::Use(name) => Some(name),
+            PushRemoteOutcome::PickerOpened => return Ok(()),
+            PushRemoteOutcome::NoneAvailable => None, // daemon will fall back to "origin"
+        };
         if let Mode::PrCreate(f) = &mut self.mode {
             f.busy = true;
             f.error = None;
         }
         let req = Request::CreatePullRequest {
-            ticket_key: key,
+            ticket_key: key.clone(),
             title,
             body,
             reviewer_account_id: reviewer_id,
             devqa_account_id: devqa_id,
+            push_remote,
         };
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(&mut s, &req).await;
         match resp {
             Ok(Response::PullRequestCreated { url, number }) => {
+                // PR is live — the draft is no longer in flight.
+                let _ = self.delete_pr_draft(&key).await;
                 self.status = format!("PR #{number} opened: {url}");
                 self.mode = Mode::Detail;
                 self.load_detail().await?;
@@ -3111,6 +3599,148 @@ change, look for regressions, and report findings to me directly here.
             adding: None,
         });
         self.status = "workflow statuses — i: add · d×2: delete · esc: close".into();
+    }
+
+    /// Open a Claude session about the currently-selected PR comment. Resumes
+    /// the ticket's stored session id (or starts fresh) and seeds the pane
+    /// with `Copilot suggested this in code review: "<body>". What are your
+    /// thoughts?` so the conversation begins in context.
+    pub async fn chat_about_pr_comment(&mut self) -> Result<()> {
+        let Some(ticket) = self.detail.as_ref().map(|t| t.key.clone()) else {
+            self.status = "no ticket open".into();
+            return Ok(());
+        };
+        let Some(comment) = self.pr_comments.get(self.pr_comment_selected).cloned() else {
+            self.status = "no PR comment selected".into();
+            return Ok(());
+        };
+        let worktree = match self.ticket_worktree(&ticket).await? {
+            Some(p) => p,
+            None => {
+                self.status =
+                    "no worktree on file — start work (s) or link a project (P) first".into();
+                return Ok(());
+            }
+        };
+        let author = if comment.author.is_empty() { "Reviewer".to_string() } else { comment.author.clone() };
+        let prompt = format!(
+            "{author} suggested this in code review:\n\n\"\"\"\n{body}\n\"\"\"\n\nWhat are your thoughts?",
+            body = comment.body.trim(),
+        );
+        self.spawn_claude_pane(&ticket, &worktree, Some(&prompt)).await?;
+        self.status = format!("claude opened on PR comment by {author}");
+        Ok(())
+    }
+
+    /// Spawn (or resume) Claude Code in a tmux pane rooted at `worktree`,
+    /// reusing the ticket's stored session id. When `initial_input` is set,
+    /// a detached subshell sleeps 4s and `tmux send-keys` it as the first
+    /// line so commands like `/review` or a question fire automatically.
+    /// Returns the new pane id (best-effort; empty on failure).
+    pub async fn spawn_claude_pane(
+        &mut self,
+        ticket_key: &str,
+        worktree: &std::path::Path,
+        initial_input: Option<&str>,
+    ) -> Result<String> {
+        if std::env::var("TMUX").is_err() {
+            self.status = format!(
+                "not in tmux — run: cd {} && claude --resume",
+                worktree.display()
+            );
+            return Ok(String::new());
+        }
+        // Get or create the session id so future pane spawns share context.
+        let existing = {
+            let mut s = ipc::connect().await?;
+            match ipc::send_request(
+                &mut s,
+                &Request::GetClaudeSession { ticket_key: ticket_key.to_string() },
+            )
+            .await?
+            {
+                Response::ClaudeSession { session_id } => session_id,
+                _ => None,
+            }
+        };
+        let session_arg = if let Some(id) = existing.clone() {
+            format!("--resume {}", id)
+        } else {
+            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
+            let mut s = ipc::connect().await?;
+            let _ = ipc::send_request(
+                &mut s,
+                &Request::SaveClaudeSession {
+                    ticket_key: ticket_key.to_string(),
+                    session_id: new_id.clone(),
+                },
+            )
+            .await?;
+            format!("--session-id {new_id}")
+        };
+        let cmd = format!(
+            "cd {} && claude {}",
+            shell_escape(&worktree.display().to_string()),
+            session_arg,
+        );
+        let width = tmux_window_width().unwrap_or(0);
+        let pane = if width >= 400 {
+            let out = std::process::Command::new("tmux")
+                .args(["split-window", "-h", "-P", "-F", "#{pane_id}"])
+                .arg(format!("sh -lc {}", shell_escape(&cmd)))
+                .output()?;
+            if !out.status.success() {
+                self.status = format!(
+                    "tmux split failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return Ok(String::new());
+            }
+            let _ = std::process::Command::new("tmux")
+                .args(["select-layout", "even-horizontal"])
+                .status();
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        } else {
+            let out = std::process::Command::new("tmux")
+                .args(["new-window", "-P", "-F", "#{pane_id}"])
+                .arg(format!("sh -lc {}", shell_escape(&cmd)))
+                .output()?;
+            if !out.status.success() {
+                self.status = format!(
+                    "tmux new-window failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return Ok(String::new());
+            }
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        // Detached send-keys after a settle delay so Claude has the REPL up.
+        if let Some(input) = initial_input {
+            let send_cmd = format!(
+                "(sleep 4; tmux send-keys -t {pane} {escaped} Enter) >/dev/null 2>&1 &",
+                pane = pane,
+                escaped = shell_escape(input),
+            );
+            let _ = std::process::Command::new("sh").arg("-c").arg(&send_cmd).spawn();
+        }
+        Ok(pane)
+    }
+
+    /// Ask the daemon for the on-disk worktree path tied to a ticket. Falls
+    /// back to `None` when no linked project or the worktree dir is missing.
+    pub async fn ticket_worktree(&mut self, ticket_key: &str) -> Result<Option<std::path::PathBuf>> {
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(
+            &mut s,
+            &Request::GetTicketWorktree { ticket_key: ticket_key.to_string() },
+        )
+        .await?;
+        Ok(match resp {
+            Response::TicketWorktree { path } => path,
+            _ => None,
+        })
     }
 
     /// Open the general Settings page. Values are seeded from the cached
@@ -4501,6 +5131,10 @@ async fn main_loop<B: ratatui::backend::Backend>(
         // Drain any background "claude tighten" task that finished. The
         // 200ms poll cadence below is enough — no need to shorten it.
         app.poll_pending_improve();
+        app.poll_pending_pr_review();
+        app.poll_pending_pr_body_improve();
+        // Animate the spinner once per draw tick.
+        app.spinner_tick = app.spinner_tick.wrapping_add(1);
         term.draw(|f| ui::draw(f, app))?;
         if event::poll(Duration::from_millis(200))? {
             if let Event::Key(k) = event::read()? {
@@ -5580,6 +6214,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         KeyCode::Char('k') | KeyCode::Up => {
                             app.pr_comment_selected = app.pr_comment_selected.saturating_sub(1);
                         }
+                        KeyCode::Char('c') => {
+                            app.chat_about_pr_comment().await?;
+                        }
                         _ => {}
                     }
                     return Ok(());
@@ -6382,6 +7019,37 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             _ => {}
         },
         Mode::PrCreate(_) => {
+            // Remote-picker sub-modal preempts everything else.
+            let in_remote_pick = matches!(&app.mode, Mode::PrCreate(f) if f.remote_pick.is_some());
+            if in_remote_pick {
+                match code {
+                    KeyCode::Esc => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            f.remote_pick = None;
+                        }
+                        app.status = "remote pick cancelled".into();
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            if let Some(p) = &mut f.remote_pick {
+                                if !p.items.is_empty() {
+                                    p.selected = (p.selected + 1).min(p.items.len() - 1);
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            if let Some(p) = &mut f.remote_pick {
+                                p.selected = p.selected.saturating_sub(1);
+                            }
+                        }
+                    }
+                    KeyCode::Enter => { app.commit_remote_pick().await?; }
+                    _ => {}
+                }
+                return Ok(());
+            }
             // Pending-handle sub-modal: collect a github handle, then continue.
             let in_pending = matches!(&app.mode, Mode::PrCreate(f) if f.pending_handle.is_some());
             if in_pending {
@@ -6402,6 +7070,69 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 return Ok(());
             }
+            // While the review gate is up, the form is read-only — `y`, `f`,
+            // and `Esc` are the only keys that do anything until the user
+            // decides to submit, fix, or back out.
+            let in_review = matches!(&app.mode, Mode::PrCreate(f) if f.review_state == PrReviewState::Reviewing);
+            if in_review {
+                // While the /review call is in flight, only Esc has any
+                // effect — y/f/R would race the result. Esc clears the
+                // pending receiver so the dropped value cancels the task on
+                // the daemon side via connection close.
+                let pending = app.pending_pr_review.is_some();
+                match code {
+                    KeyCode::Esc => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            f.review_state = PrReviewState::Pending;
+                            f.review_output = None;
+                            f.review_scroll = 0;
+                        }
+                        app.pending_pr_review = None;
+                        let _ = app.save_pr_draft().await;
+                        app.status = "review cancelled — keep editing".into();
+                    }
+                    _ if pending => {
+                        // Swallow all other keys until the review returns.
+                    }
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        app.submit_pr_create().await?;
+                    }
+                    KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                        app.submit_pr_create().await?;
+                    }
+                    KeyCode::F(5) => app.submit_pr_create().await?,
+                    KeyCode::Char('f') | KeyCode::Char('F') => {
+                        app.open_pr_fix_session().await?;
+                    }
+                    KeyCode::Char('R') => {
+                        // Re-run /review headlessly; result replaces the
+                        // current pane content.
+                        app.run_pr_review().await?;
+                    }
+                    KeyCode::PageDown | KeyCode::Char('J') => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            f.review_scroll = f.review_scroll.saturating_add(10);
+                        }
+                    }
+                    KeyCode::PageUp | KeyCode::Char('K') => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            f.review_scroll = f.review_scroll.saturating_sub(10);
+                        }
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            f.review_scroll = f.review_scroll.saturating_add(1);
+                        }
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        if let Mode::PrCreate(f) = &mut app.mode {
+                            f.review_scroll = f.review_scroll.saturating_sub(1);
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
             match code {
                 KeyCode::Esc => app.mode = Mode::Detail,
                 KeyCode::Tab => {
@@ -6414,17 +7145,49 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         f.field = if f.field == 0 { PrCreateForm::FIELD_COUNT - 1 } else { f.field - 1 };
                     }
                 }
-                KeyCode::F(5) => app.submit_pr_create().await?,
+                KeyCode::F(5) => app.pr_submit_pressed().await?,
                 KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
-                    app.submit_pr_create().await?;
+                    app.pr_submit_pressed().await?;
                 }
                 KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
-                    app.submit_pr_create().await?;
+                    app.pr_submit_pressed().await?;
                 }
-                // Up/Down navigate picker dropdowns when on the reviewer/devqa fields.
+                // Suggestion accept/reject preempts everything else when a
+                // Claude rewrite is on screen.
+                KeyCode::Char('y') | KeyCode::Char('Y') if matches!(&app.mode, Mode::PrCreate(f) if f.suggestion.is_some()) => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        if let Some(s) = f.suggestion.take() {
+                            f.body = s;
+                            f.body_cursor = f.body.len();
+                            f.field = 1;
+                            app.status = "body replaced with claude rewrite".into();
+                        }
+                    }
+                    return Ok(());
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') if matches!(&app.mode, Mode::PrCreate(f) if f.suggestion.is_some()) => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        f.suggestion = None;
+                    }
+                    app.status = "rewrite rejected".into();
+                    return Ok(());
+                }
+                // Ctrl-R / F6: ask Claude to tighten the body. Only meaningful
+                // on the body field; runs there or surfaces an error.
+                KeyCode::Char('r') if mods.contains(KeyModifiers::CONTROL) => {
+                    app.improve_pr_body().await?;
+                    return Ok(());
+                }
+                KeyCode::F(6) => {
+                    app.improve_pr_body().await?;
+                    return Ok(());
+                }
+                // Up/Down: body field navigates lines; picker fields navigate
+                // the dropdown; title is single-line so Up/Down is a no-op.
                 KeyCode::Up => {
                     if let Mode::PrCreate(f) = &mut app.mode {
                         match f.field {
+                            1 => f.body_cursor = edit_up(&f.body, f.body_cursor),
                             2 => f.reviewer_picker_selected = f.reviewer_picker_selected.saturating_sub(1),
                             3 => f.devqa_picker_selected = f.devqa_picker_selected.saturating_sub(1),
                             _ => {}
@@ -6434,6 +7197,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 KeyCode::Down => {
                     if let Mode::PrCreate(f) = &mut app.mode {
                         match f.field {
+                            1 => f.body_cursor = edit_down(&f.body, f.body_cursor),
                             2 => {
                                 if !f.reviewer_results.is_empty() {
                                     f.reviewer_picker_selected =
@@ -6446,6 +7210,44 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                                         (f.devqa_picker_selected + 1).min(f.devqa_results.len() - 1);
                                 }
                             }
+                            _ => {}
+                        }
+                    }
+                }
+                // Caret moves on title/body. Picker fields keep their text
+                // implicitly via the query state — no cursor needed there.
+                KeyCode::Left => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            0 => f.title_cursor = edit_left(&f.title, f.title_cursor),
+                            1 => f.body_cursor = edit_left(&f.body, f.body_cursor),
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Right => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            0 => f.title_cursor = edit_right(&f.title, f.title_cursor),
+                            1 => f.body_cursor = edit_right(&f.body, f.body_cursor),
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::Home => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            0 => f.title_cursor = 0,
+                            1 => f.body_cursor = edit_line_start(&f.body, f.body_cursor),
+                            _ => {}
+                        }
+                    }
+                }
+                KeyCode::End => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            0 => f.title_cursor = f.title.len(),
+                            1 => f.body_cursor = edit_line_end(&f.body, f.body_cursor),
                             _ => {}
                         }
                     }
@@ -6475,24 +7277,39 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         }
                     }
                     if !picked {
-                        // Body field treats Enter as newline; other fields advance.
+                        // Body field inserts newline at caret; other fields advance.
                         if let Mode::PrCreate(f) = &mut app.mode {
-                            if f.field == 1 { f.body.push('\n'); }
-                            else { f.field = (f.field + 1) % PrCreateForm::FIELD_COUNT; }
+                            if f.field == 1 {
+                                f.body.insert(f.body_cursor, '\n');
+                                f.body_cursor += 1;
+                            } else {
+                                f.field = (f.field + 1) % PrCreateForm::FIELD_COUNT;
+                            }
                         }
                     }
                 }
                 KeyCode::Backspace => {
                     if let Mode::PrCreate(f) = &mut app.mode {
                         match f.field {
-                            0 => { f.title.pop(); }
-                            1 => { f.body.pop(); }
+                            0 => {
+                                if f.title_cursor > 0 {
+                                    let prev = edit_left(&f.title, f.title_cursor);
+                                    f.title.replace_range(prev..f.title_cursor, "");
+                                    f.title_cursor = prev;
+                                }
+                            }
+                            1 => {
+                                if f.body_cursor > 0 {
+                                    let prev = edit_left(&f.body, f.body_cursor);
+                                    f.body.replace_range(prev..f.body_cursor, "");
+                                    f.body_cursor = prev;
+                                }
+                            }
                             2 => { f.reviewer_query.pop(); }
                             3 => { f.devqa_query.pop(); }
                             _ => {}
                         }
                     }
-                    // Re-search if on a picker field.
                     let q = if let Mode::PrCreate(f) = &app.mode {
                         match f.field {
                             2 => Some((true, f.reviewer_query.clone())),
@@ -6504,11 +7321,36 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         if query.len() >= 2 { app.refresh_pr_picker(rev).await?; }
                     }
                 }
+                KeyCode::Delete => {
+                    if let Mode::PrCreate(f) = &mut app.mode {
+                        match f.field {
+                            0 => {
+                                if f.title_cursor < f.title.len() {
+                                    let nxt = edit_right(&f.title, f.title_cursor);
+                                    f.title.replace_range(f.title_cursor..nxt, "");
+                                }
+                            }
+                            1 => {
+                                if f.body_cursor < f.body.len() {
+                                    let nxt = edit_right(&f.body, f.body_cursor);
+                                    f.body.replace_range(f.body_cursor..nxt, "");
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
                     if let Mode::PrCreate(f) = &mut app.mode {
                         match f.field {
-                            0 => f.title.push(c),
-                            1 => f.body.push(c),
+                            0 => {
+                                f.title.insert(f.title_cursor, c);
+                                f.title_cursor += c.len_utf8();
+                            }
+                            1 => {
+                                f.body.insert(f.body_cursor, c);
+                                f.body_cursor += c.len_utf8();
+                            }
                             2 => f.reviewer_query.push(c),
                             3 => f.devqa_query.push(c),
                             _ => {}

@@ -515,6 +515,7 @@ async fn dispatch(
             body,
             reviewer_account_id,
             devqa_account_id,
+            push_remote,
         } => {
             create_pull_request(
                 &state,
@@ -523,6 +524,7 @@ async fn dispatch(
                 &body,
                 reviewer_account_id.as_deref(),
                 devqa_account_id.as_deref(),
+                push_remote.as_deref(),
             )
             .await
         }
@@ -712,6 +714,135 @@ async fn dispatch(
             let api = JiraApi::from_jira_cli_config()?;
             let items = api.statuses().await?;
             Ok(Response::Statuses { items })
+        }
+
+        Request::GetPrDraft { ticket_key } => {
+            let draft = state.cache.lock().await.get_pr_draft(&ticket_key)?;
+            Ok(Response::PrDraft { draft })
+        }
+        Request::SavePrDraft { ticket_key, draft } => {
+            state.cache.lock().await.upsert_pr_draft(&ticket_key, &draft)?;
+            Ok(Response::Ok)
+        }
+        Request::DeletePrDraft { ticket_key } => {
+            state.cache.lock().await.delete_pr_draft(&ticket_key)?;
+            Ok(Response::Ok)
+        }
+
+        Request::ListWorktreeRemotes { ticket_key } => {
+            // Resolve worktree (with project-root fallback, like /review).
+            let project_path = {
+                let cache = state.cache.lock().await;
+                cache.linked_paths(&ticket_key)?.into_iter().next()
+            };
+            let Some(project_path) = project_path else {
+                return Ok(Response::Err {
+                    message: format!("no linked project for {ticket_key}"),
+                });
+            };
+            let ticket = match state.jira.view(&ticket_key).await {
+                Ok(t) => Some(t),
+                Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
+            };
+            let path = ticket
+                .as_ref()
+                .and_then(|t| jui_core::scm::worktree_path_for_slug(&project_path, &t.branch_slug()))
+                .filter(|w| w.exists())
+                .unwrap_or(project_path);
+            let items = jui_core::github::list_remotes(&path).await?;
+            Ok(Response::Remotes { items })
+        }
+
+        Request::GetPushRemote { ticket_key } => {
+            let project_path = {
+                let cache = state.cache.lock().await;
+                cache.linked_paths(&ticket_key)?.into_iter().next()
+            };
+            let Some(p) = project_path else {
+                return Ok(Response::PushRemote { name: None });
+            };
+            let name = state.cache.lock().await.get_push_remote(&p)?;
+            Ok(Response::PushRemote { name })
+        }
+
+        Request::SetPushRemote { ticket_key, remote_name } => {
+            let project_path = {
+                let cache = state.cache.lock().await;
+                cache.linked_paths(&ticket_key)?.into_iter().next()
+            };
+            let Some(p) = project_path else {
+                return Ok(Response::Err {
+                    message: format!("no linked project for {ticket_key}"),
+                });
+            };
+            state.cache.lock().await.set_push_remote(&p, &remote_name)?;
+            Ok(Response::Ok)
+        }
+
+        Request::CodeReview { ticket_key } => {
+            // Resolve worktree the same way the PR-create flow does. Falls
+            // back to the linked project root when the per-ticket worktree
+            // is missing so `/review` still works on tickets the user hasn't
+            // explicitly `s`-started (or whose summary changed after the
+            // worktree was created and no longer matches the slug).
+            let project_path = {
+                let cache = state.cache.lock().await;
+                cache.linked_paths(&ticket_key)?.into_iter().next()
+            };
+            let ticket = match state.jira.view(&ticket_key).await {
+                Ok(t) => Some(t),
+                Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
+            };
+            let Some(project_path) = project_path else {
+                return Ok(Response::Err {
+                    message: format!(
+                        "no linked project for {ticket_key} — link a repo (L) first"
+                    ),
+                });
+            };
+            let worktree = ticket
+                .as_ref()
+                .and_then(|t| jui_core::scm::worktree_path_for_slug(&project_path, &t.branch_slug()))
+                .filter(|w| w.exists())
+                .unwrap_or(project_path);
+            // Reuse the ticket's Claude session so the review turn lands in
+            // the same conversation history fix-sessions resume into.
+            let (session_id, resume) = match state.cache.lock().await.get_claude_session(&ticket_key)? {
+                Some(id) => (id, true),
+                None => {
+                    let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+                        .map(|s| s.trim().to_string())
+                        .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
+                    state.cache.lock().await.set_claude_session(&ticket_key, &new_id)?;
+                    (new_id, false)
+                }
+            };
+            let markdown = jui_core::claude::code_review(&session_id, resume, &worktree).await?;
+            Ok(Response::ReviewOutput { markdown })
+        }
+
+        Request::GetTicketWorktree { ticket_key } => {
+            // Read the first linked project + the ticket so we can build the
+            // branch slug. Returns the per-ticket worktree when it exists;
+            // otherwise falls back to the linked project root so downstream
+            // flows (PR-comment chat, fix-sessions) still have a sensible
+            // cwd to spawn Claude in.
+            let project_path = {
+                let cache = state.cache.lock().await;
+                cache.linked_paths(&ticket_key)?.into_iter().next()
+            };
+            let ticket = match state.jira.view(&ticket_key).await {
+                Ok(t) => Some(t),
+                Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
+            };
+            let path = project_path.map(|p| {
+                ticket
+                    .as_ref()
+                    .and_then(|t| jui_core::scm::worktree_path_for_slug(&p, &t.branch_slug()))
+                    .filter(|w| w.exists())
+                    .unwrap_or(p)
+            });
+            Ok(Response::TicketWorktree { path })
         }
 
         Request::CreateTicket { project, issue_type, summary, body, parent } => {
@@ -1156,6 +1287,7 @@ async fn create_pull_request(
     body: &str,
     reviewer_account_id: Option<&str>,
     devqa_account_id: Option<&str>,
+    push_remote: Option<&str>,
 ) -> Result<Response> {
     use jui_core::github;
     use jui_core::users_map::UsersMap;
@@ -1176,18 +1308,18 @@ async fn create_pull_request(
         let cache = state.cache.lock().await;
         cache.linked_paths(ticket_key)?.into_iter().next()
     };
-    let worktree = project_path
-        .as_deref()
-        .and_then(|p| jui_core::scm::worktree_path_for_slug(p, &slug))
-        .ok_or_else(|| anyhow::anyhow!(
-            "no linked project for {ticket_key}; link a repo first (P pane in detail)"
-        ))?;
-    if !worktree.exists() {
+    let Some(project_path) = project_path else {
         return Err(anyhow::anyhow!(
-            "worktree {} does not exist — did you `s start` the ticket?",
-            worktree.display()
+            "no linked project for {ticket_key}; link a repo first (P pane in detail)"
         ));
-    }
+    };
+    // Prefer the per-ticket worktree when it exists; otherwise fall back to
+    // the linked project root and push from whatever branch is checked out
+    // there. Matches the /review-side fallback so a ticket the user never
+    // explicitly `s`-started still produces a PR.
+    let worktree = jui_core::scm::worktree_path_for_slug(&project_path, &slug)
+        .filter(|w| w.exists())
+        .unwrap_or_else(|| project_path.clone());
 
     // 2. Discover repo + branch via gh.
     let repo = github::repo_slug(&worktree).await?;
@@ -1219,9 +1351,49 @@ async fn create_pull_request(
         }
     }
 
-    // 4. Push and create PR.
-    github::push_branch(&worktree, &head_branch).await?;
-    let pr = github::create_pr(&worktree, "develop", &head_branch, title, body).await?;
+    // 4. Resolve push remote — explicit arg wins, then cached per-project
+    //    pref, then fall back to "origin". Persist the explicit choice so
+    //    the next PR for this project skips the picker.
+    let remote = if let Some(r) = push_remote {
+        let _ = state.cache.lock().await.set_push_remote(&project_path, r);
+        r.to_string()
+    } else if let Ok(Some(r)) = state.cache.lock().await.get_push_remote(&project_path) {
+        r
+    } else {
+        "origin".to_string()
+    };
+    info!(%ticket_key, %remote, "pushing branch");
+    // Push and create PR.
+    github::push_branch(&worktree, &head_branch, &remote).await?;
+    // Cross-fork PR support: derive the fork owner from the push remote's
+    // URL whenever it doesn't match the upstream slug. `gh pr create --head`
+    // needs `<owner>:<branch>` form when the branch lives on a different
+    // fork, otherwise it looks up the branch on the target repo (upstream)
+    // and bails with "No commits between …".
+    let head_owner: Option<String> = jui_core::scm::gh_slug_for_remote(&worktree, &remote)
+        .and_then(|push_slug| {
+            if push_slug == repo {
+                None
+            } else {
+                push_slug.split('/').next().map(|s| s.to_string())
+            }
+        });
+    // Append `DevQA: @<gh-handle>` to the PR body so GitHub notifies the
+    // DevQA user — they're not a formal reviewer (so `--add-reviewer`
+    // doesn't apply), but the @-mention triggers the bell on their account.
+    let pr_body = match &devqa_gh {
+        Some(h) => format!("{}\n\nDevQA: @{}", body.trim_end(), h),
+        None => body.to_string(),
+    };
+    let pr = github::create_pr(
+        &worktree,
+        "develop",
+        &head_branch,
+        head_owner.as_deref(),
+        title,
+        &pr_body,
+    )
+    .await?;
     info!(%ticket_key, url = pr.url, number = pr.number, "PR created");
     if let Ok(repo) = github::repo_slug(&worktree).await {
         let _ = state.cache.lock().await.upsert_ticket_pr(ticket_key, &pr.url, pr.number, &repo);
@@ -1234,12 +1406,13 @@ async fn create_pull_request(
         }
     }
 
-    // 6. Comment on Jira with PR URL + role tags.
+    // 6. Comment on Jira with PR URL + role tags. Use `\n\n` between rows
+    // because Jira ADF collapses single newlines into a space — each
+    // logical line needs its own paragraph break to render separately.
     let mut comment = format!("PR: {}\n\n", pr.url);
-    if let Some(h) = &reviewer_gh { comment.push_str(&format!("Reviewer: @{h}\n")); }
-    if let Some(h) = &devqa_gh { comment.push_str(&format!("DevQA: @{h}\n")); }
+    if let Some(h) = &reviewer_gh { comment.push_str(&format!("Reviewer: @{h}\n\n")); }
+    if let Some(h) = &devqa_gh { comment.push_str(&format!("DevQA: @{h}\n\n")); }
     if !body.trim().is_empty() {
-        comment.push('\n');
         comment.push_str(body);
     }
     if let Err(e) = state.jira.add_comment(ticket_key, &comment).await {
@@ -1520,19 +1693,32 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
     let mut total_comments = 0usize;
     let mut auto_completed = 0usize;
     for (ticket_key, pr) in &pr_for_key {
+        // Fetch all three comment surfaces: top-level issue thread, inline
+        // review comments (where Copilot leaves its line-by-line feedback),
+        // and review summaries. Merge + sort oldest-first so they read as
+        // a single conversation in the pane.
+        let mut merged: Vec<(String, String, String)> = Vec::new();
         match jui_core::github::pr_comments(&pr.repo, pr.number).await {
-            Ok(items) => {
-                total_comments += items.len();
-                let _ = state.cache.lock().await.upsert_pr_comments(
-                    ticket_key,
-                    &pr.url,
-                    pr.number,
-                    &pr.repo,
-                    &items,
-                );
-            }
-            Err(e) => warn!(repo = %pr.repo, number = pr.number, "pr comments fetch: {e:#}"),
+            Ok(items) => merged.extend(items),
+            Err(e) => warn!(repo = %pr.repo, number = pr.number, "issue comments fetch: {e:#}"),
         }
+        match jui_core::github::pr_review_comments(&pr.repo, pr.number).await {
+            Ok(items) => merged.extend(items),
+            Err(e) => warn!(repo = %pr.repo, number = pr.number, "review comments fetch: {e:#}"),
+        }
+        match jui_core::github::pr_reviews(&pr.repo, pr.number).await {
+            Ok(items) => merged.extend(items),
+            Err(e) => warn!(repo = %pr.repo, number = pr.number, "reviews fetch: {e:#}"),
+        }
+        merged.sort_by(|a, b| a.1.cmp(&b.1));
+        total_comments += merged.len();
+        let _ = state.cache.lock().await.upsert_pr_comments(
+            ticket_key,
+            &pr.url,
+            pr.number,
+            &pr.repo,
+            &merged,
+        );
 
         if let Some(login) = &my_login {
             if let Ok(Some(state_str)) =

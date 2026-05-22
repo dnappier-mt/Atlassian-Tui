@@ -81,38 +81,79 @@ pub async fn current_branch(path: &Path) -> Result<String> {
     Ok(s)
 }
 
-/// `git push -u origin <branch>`. Returns the captured stderr on failure (gh's
-/// useful messages tend to land there).
-pub async fn push_branch(path: &Path, branch: &str) -> Result<()> {
+/// `git push -u <remote> <branch>`. Returns the captured stderr on failure
+/// (gh's useful messages tend to land there). Caller picks the remote — in
+/// fork workflows pushing to `origin` (= upstream) fails with "Write access
+/// not granted", so the daemon resolves the user's preferred remote first.
+pub async fn push_branch(path: &Path, branch: &str, remote: &str) -> Result<()> {
     let out = Command::new("git")
-        .args(["push", "-u", "origin", branch])
+        .args(["push", "-u", remote, branch])
         .current_dir(path)
         .output()
         .await
         .context("running git push")?;
     if !out.status.success() {
         return Err(anyhow!(
-            "git push failed: {}",
+            "git push to {remote} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
     Ok(())
 }
 
-/// `gh pr create --base <base> --head <head> --title <t> --body <b>`. `gh`
-/// figures out fork→upstream when run inside a fork clone.
+/// `git remote -v` parsed into (name, fetch_url) pairs. The push URL is
+/// usually identical; we return fetch since that's what `gh` matches against.
+pub async fn list_remotes(path: &Path) -> Result<Vec<(String, String)>> {
+    let out = Command::new("git")
+        .args(["remote", "-v"])
+        .current_dir(path)
+        .output()
+        .await
+        .context("running git remote -v")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "git remote -v failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut out_remotes: Vec<(String, String)> = Vec::new();
+    for line in stdout.lines() {
+        // Each line: "<name>\t<url> (fetch|push)"
+        if !line.contains("(fetch)") { continue; }
+        let mut parts = line.split_whitespace();
+        let Some(name) = parts.next() else { continue };
+        let Some(url) = parts.next() else { continue };
+        if !out_remotes.iter().any(|(n, _)| n == name) {
+            out_remotes.push((name.to_string(), url.to_string()));
+        }
+    }
+    Ok(out_remotes)
+}
+
+/// `gh pr create --base <base> --head <head> --title <t> --body <b>`.
+///
+/// When `head_owner` is `Some` (cross-fork PR), the head ref is rewritten to
+/// `<owner>:<branch>` so GitHub knows the branch lives on a fork — without
+/// this, `gh` looks up the branch on the *target* repo (upstream) and fails
+/// with "No commits between …" because the branch only exists on the fork.
 pub async fn create_pr(
     path: &Path,
     base: &str,
-    head: &str,
+    head_branch: &str,
+    head_owner: Option<&str>,
     title: &str,
     body: &str,
 ) -> Result<CreatedPr> {
+    let head_ref = match head_owner {
+        Some(owner) => format!("{owner}:{head_branch}"),
+        None => head_branch.to_string(),
+    };
     let out = Command::new("gh")
         .args([
             "pr", "create",
             "--base", base,
-            "--head", head,
+            "--head", &head_ref,
             "--title", title,
             "--body", body,
         ])
@@ -162,6 +203,13 @@ pub async fn add_reviewer(path: &Path, pr_number: u64, gh_handle: &str) -> Resul
         ));
     }
     Ok(())
+}
+
+/// Open PRs the user authored (`--author=@me`). Used to flag Jira tickets
+/// where the user has already sent the PR — those rows sort below
+/// not-yet-PR'd tickets in the tree.
+pub async fn search_authored_open() -> Result<Vec<PrSummary>> {
+    run_search(&["--author", "@me"]).await
 }
 
 /// Open PRs the user is involved with as a reviewer — covers BOTH:
@@ -381,6 +429,123 @@ pub async fn pr_comments(repo: &str, number: u64) -> Result<Vec<(String, String,
         };
         for c in comments {
             all.push((c.user.login, c.created_at, c.body));
+        }
+    }
+    Ok(all)
+}
+
+/// Per-line review comments on a PR (the kind Copilot and human reviewers
+/// leave inline on the diff). The body is prefixed with `[path:line] ` so
+/// the source location is visible in the flat PR-comments pane.
+pub async fn pr_review_comments(repo: &str, number: u64) -> Result<Vec<(String, String, String)>> {
+    let path = format!("repos/{}/pulls/{}/comments?per_page=100", repo, number);
+    let out = Command::new("gh")
+        .args(["api", "--paginate", &path])
+        .output()
+        .await
+        .context("running gh api repos/.../pulls/N/comments")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api review comments failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct GhReviewComment {
+        user: GhUser,
+        created_at: String,
+        body: String,
+        #[serde(default)]
+        path: Option<String>,
+        #[serde(default)]
+        line: Option<u64>,
+    }
+    #[derive(Deserialize)]
+    struct GhUser { login: String }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut all: Vec<(String, String, String)> = Vec::new();
+    for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
+        if chunk.is_empty() { continue; }
+        let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
+            chunk
+        } else if chunk.starts_with('[') {
+            format!("{chunk}]")
+        } else if chunk.ends_with(']') {
+            format!("[{chunk}")
+        } else {
+            format!("[{chunk}]")
+        };
+        let comments: Vec<GhReviewComment> = match serde_json::from_str(&chunk) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for c in comments {
+            let loc = match (c.path.as_deref(), c.line) {
+                (Some(p), Some(l)) => format!("[{p}:{l}] "),
+                (Some(p), None) => format!("[{p}] "),
+                _ => String::new(),
+            };
+            all.push((c.user.login, c.created_at, format!("{loc}{}", c.body)));
+        }
+    }
+    Ok(all)
+}
+
+/// Top-level reviews on a PR (the `gh pr review` wrappers). Returns only
+/// reviews that carry an actual body — reviews that just record APPROVED /
+/// CHANGES_REQUESTED with no commentary aren't useful in the pane.
+pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<(String, String, String)>> {
+    let path = format!("repos/{}/pulls/{}/reviews?per_page=100", repo, number);
+    let out = Command::new("gh")
+        .args(["api", "--paginate", &path])
+        .output()
+        .await
+        .context("running gh api repos/.../pulls/N/reviews")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api reviews failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct GhReview {
+        user: Option<GhUser>,
+        #[serde(default)]
+        submitted_at: Option<String>,
+        #[serde(default)]
+        body: String,
+        #[serde(default)]
+        state: String,
+    }
+    #[derive(Deserialize)]
+    struct GhUser { login: String }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let mut all: Vec<(String, String, String)> = Vec::new();
+    for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
+        if chunk.is_empty() { continue; }
+        let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
+            chunk
+        } else if chunk.starts_with('[') {
+            format!("{chunk}]")
+        } else if chunk.ends_with(']') {
+            format!("[{chunk}")
+        } else {
+            format!("[{chunk}]")
+        };
+        let reviews: Vec<GhReview> = match serde_json::from_str(&chunk) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        for r in reviews {
+            if r.body.trim().is_empty() { continue; }
+            let Some(user) = r.user else { continue };
+            let when = r.submitted_at.unwrap_or_default();
+            let tag = if r.state.is_empty() {
+                String::new()
+            } else {
+                format!("[review · {}] ", r.state.to_ascii_lowercase())
+            };
+            all.push((user.login, when, format!("{tag}{}", r.body)));
         }
     }
     Ok(all)

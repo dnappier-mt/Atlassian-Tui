@@ -8,6 +8,29 @@ pub struct Cache {
     conn: Connection,
 }
 
+/// In-flight PR draft persisted in `pr_drafts`. Lets the user resume a
+/// review-gated PR after a restart so the `/review` step doesn't vanish on a
+/// dropped tmux pane or app crash.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PrDraft {
+    pub title: String,
+    pub body: String,
+    pub reviewer_account_id: Option<String>,
+    pub reviewer_display_name: Option<String>,
+    pub devqa_account_id: Option<String>,
+    pub devqa_display_name: Option<String>,
+    /// "pending" before the user has run `/review`; "reviewing" once the
+    /// review pane has been spawned at least once. Empty string treated as
+    /// "pending" on read.
+    pub review_state: String,
+    /// Markdown body Claude returned from the most recent `/review`. Persisted
+    /// so a restart surfaces the previous review immediately without re-running
+    /// the headless call.
+    #[serde(default)]
+    pub review_output: Option<String>,
+    pub updated_at: String,
+}
+
 impl Cache {
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
@@ -146,6 +169,40 @@ impl Cache {
                 ticket_key TEXT PRIMARY KEY,
                 state      TEXT NOT NULL,        -- 'awaiting' | 'reviewing' | 'completed'
                 updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ticket_prs (
+                ticket_key TEXT PRIMARY KEY,
+                pr_url     TEXT NOT NULL,
+                pr_number  INTEGER NOT NULL,
+                repo       TEXT NOT NULL,
+                cached_at  INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pr_drafts (
+                ticket_key            TEXT PRIMARY KEY,
+                title                 TEXT NOT NULL,
+                body                  TEXT NOT NULL,
+                reviewer_account_id   TEXT,
+                reviewer_display_name TEXT,
+                devqa_account_id      TEXT,
+                devqa_display_name    TEXT,
+                review_state          TEXT NOT NULL,
+                updated_at            TEXT NOT NULL
+            );
+            "#,
+        )?;
+        // Idempotent migration — adds the column on databases created before
+        // the in-modal review pane landed. Error ignored when the column
+        // already exists.
+        let _ = conn.execute("ALTER TABLE pr_drafts ADD COLUMN review_output TEXT", []);
+        // Per-project push remote — saved once after the user picks via the
+        // remote picker during PR submit; reused on subsequent PRs for the
+        // same linked project so they don't get re-prompted.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS project_push_remotes (
+                project_path TEXT PRIMARY KEY,
+                remote_name  TEXT NOT NULL,
+                updated_at   TEXT NOT NULL
             );
             "#,
         )?;
@@ -333,6 +390,41 @@ impl Cache {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Record the canonical PR for a ticket. Single PR per ticket (last writer
+    /// wins) — matches the daemon's first-PR-only dedupe in the refresh loop.
+    pub fn upsert_ticket_pr(
+        &mut self,
+        ticket_key: &str,
+        pr_url: &str,
+        pr_number: u64,
+        repo: &str,
+    ) -> Result<()> {
+        let now = chrono::Utc::now().timestamp();
+        self.conn.execute(
+            r#"INSERT INTO ticket_prs (ticket_key, pr_url, pr_number, repo, cached_at)
+               VALUES (?1, ?2, ?3, ?4, ?5)
+               ON CONFLICT(ticket_key) DO UPDATE SET
+                 pr_url=excluded.pr_url,
+                 pr_number=excluded.pr_number,
+                 repo=excluded.repo,
+                 cached_at=excluded.cached_at"#,
+            params![ticket_key, pr_url, pr_number as i64, repo, now],
+        )?;
+        Ok(())
+    }
+
+    /// Cached PR url for `ticket_key`, or `None` if no PR was ever seen.
+    pub fn get_ticket_pr_url(&self, ticket_key: &str) -> Result<Option<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pr_url FROM ticket_prs WHERE ticket_key = ?1",
+        )?;
+        let mut rows = stmt.query([ticket_key])?;
+        if let Some(row) = rows.next()? {
+            return Ok(Some(row.get::<_, String>(0)?));
+        }
+        Ok(None)
+    }
+
     pub fn get_pr_comments(&self, ticket_key: &str) -> Result<Vec<crate::github::PrComment>> {
         let mut stmt = self.conn.prepare(
             r#"SELECT pr_url, pr_number, repo, author, created, body
@@ -460,6 +552,19 @@ impl Cache {
             }
         }
         Ok(out)
+    }
+
+    /// Raw cached mention keys for the given role (no Ticket join — used for
+    /// roles like `"authored"` where the caller only needs the key set).
+    pub fn get_mention_keys(&self, role: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ticket_key FROM mentions WHERE role = ?1 ORDER BY idx",
+        )?;
+        let keys: Vec<String> = stmt
+            .query_map([role], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(keys)
     }
 
     /// Age of the freshest mention row for the given role (cache freshness check).
@@ -699,6 +804,111 @@ impl Cache {
              VALUES (?1, ?2, ?3, ?3)
              ON CONFLICT(ticket_key) DO UPDATE SET last_used_at = excluded.last_used_at",
             params![ticket_key, session_id, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_pr_draft(&self, ticket_key: &str) -> Result<Option<PrDraft>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT title, body, reviewer_account_id, reviewer_display_name,
+                    devqa_account_id, devqa_display_name, review_state,
+                    review_output, updated_at
+             FROM pr_drafts
+             WHERE ticket_key = ?1",
+        )?;
+        let mut rows = stmt.query_map([ticket_key], |r| {
+            Ok(PrDraft {
+                title: r.get(0)?,
+                body: r.get(1)?,
+                reviewer_account_id: r.get(2)?,
+                reviewer_display_name: r.get(3)?,
+                devqa_account_id: r.get(4)?,
+                devqa_display_name: r.get(5)?,
+                review_state: r.get(6)?,
+                review_output: r.get(7)?,
+                updated_at: r.get(8)?,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn upsert_pr_draft(&self, ticket_key: &str, draft: &PrDraft) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT INTO pr_drafts (
+                 ticket_key, title, body,
+                 reviewer_account_id, reviewer_display_name,
+                 devqa_account_id, devqa_display_name,
+                 review_state, review_output, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(ticket_key) DO UPDATE SET
+                 title = excluded.title,
+                 body = excluded.body,
+                 reviewer_account_id = excluded.reviewer_account_id,
+                 reviewer_display_name = excluded.reviewer_display_name,
+                 devqa_account_id = excluded.devqa_account_id,
+                 devqa_display_name = excluded.devqa_display_name,
+                 review_state = excluded.review_state,
+                 review_output = excluded.review_output,
+                 updated_at = excluded.updated_at",
+            params![
+                ticket_key,
+                draft.title,
+                draft.body,
+                draft.reviewer_account_id,
+                draft.reviewer_display_name,
+                draft.devqa_account_id,
+                draft.devqa_display_name,
+                draft.review_state,
+                draft.review_output,
+                now,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_pr_draft(&self, ticket_key: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM pr_drafts WHERE ticket_key = ?1",
+            params![ticket_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_push_remote(&self, project_path: &Path) -> Result<Option<String>> {
+        let key = project_path.to_string_lossy();
+        let mut stmt = self.conn.prepare(
+            "SELECT remote_name FROM project_push_remotes WHERE project_path = ?1",
+        )?;
+        let mut rows = stmt.query_map([key.as_ref()], |r| r.get::<_, String>(0))?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn set_push_remote(&self, project_path: &Path, remote_name: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        let key = project_path.to_string_lossy();
+        self.conn.execute(
+            "INSERT INTO project_push_remotes (project_path, remote_name, updated_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(project_path) DO UPDATE SET
+                 remote_name = excluded.remote_name,
+                 updated_at  = excluded.updated_at",
+            params![key.as_ref(), remote_name, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_push_remote(&self, project_path: &Path) -> Result<()> {
+        let key = project_path.to_string_lossy();
+        self.conn.execute(
+            "DELETE FROM project_push_remotes WHERE project_path = ?1",
+            params![key.as_ref()],
         )?;
         Ok(())
     }

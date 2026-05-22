@@ -165,6 +165,97 @@ async fn run_claude_with_dirs(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Ask Claude to rewrite a Jira description more tightly. Returns the improved body
+/// as plain text (preserves blank lines / bullets if present). The summary is passed
+/// as context only — do not modify it.
+pub async fn improve_description(summary: &str, body: &str) -> Result<String> {
+    if which::which("claude").is_err() {
+        return Err(anyhow!("`claude` CLI not on PATH"));
+    }
+    let prompt = format!(
+        "You are tightening a Jira ticket description. Rewrite the description below to \
+be clearer, more concise, and better organized. Keep the same meaning and any \
+concrete details (file paths, error messages, ticket keys, commands). Drop filler, \
+hedging, and repetition. Prefer short bullets when it helps scanning, otherwise short \
+paragraphs. Do NOT invent facts not present in the original.\n\
+\n\
+# Summary (context only — do not modify)\n\
+{summary}\n\
+\n\
+# Original description\n\
+{body}\n\
+\n\
+# Output\n\
+Reply with ONLY the rewritten description — no preamble, no \"Sure, here's...\", no \
+code fences, no commentary. Plain text or Markdown body only.",
+        summary = summary,
+        body = body,
+    );
+    let result = tokio::time::timeout(Duration::from_secs(120), run_claude(&prompt))
+        .await
+        .map_err(|_| anyhow!("claude timed out after 120s"))??;
+    Ok(result.trim().to_string())
+}
+
+/// Run a pre-PR code review headlessly against the given worktree, attached
+/// to the supplied Claude session id so the review turn becomes part of the
+/// conversation history. `resume = true` continues an existing session;
+/// otherwise a fresh session is created with `--session-id <id>`. Returns
+/// the raw markdown Claude printed.
+///
+/// Uses a plain prompt instead of the `/review` slash command so the review
+/// works *before* a GitHub PR exists — `/review` requires `gh pr view` to
+/// find an open PR, which is exactly what our review-gate runs ahead of.
+pub async fn code_review(
+    session_id: &str,
+    resume: bool,
+    worktree: &std::path::Path,
+) -> Result<String> {
+    if which::which("claude").is_err() && tokio::fs::metadata("/usr/local/bin/claude").await.is_err() {
+        return Err(anyhow!("`claude` CLI not on PATH"));
+    }
+    let prompt = "You are reviewing a pre-PR branch in a git worktree (cwd). \
+Inspect the changes by running:\n\
+  - `git symbolic-ref refs/remotes/origin/HEAD` (default branch; fall back to `origin/main` or `origin/develop` if it's not set)\n\
+  - `git diff <default>...HEAD`  (committed changes vs the default branch)\n\
+  - `git diff` and `git diff --staged`  (uncommitted work)\n\
+\n\
+Then write a concise code review covering, in priority order:\n\
+  1. Bugs and logic errors\n\
+  2. Security and data-integrity issues\n\
+  3. Missing tests or test gaps\n\
+  4. Clarity / style nits worth fixing before merge\n\
+\n\
+Skip preamble. Group findings by file when it helps. Quote the offending \
+line. If something would block merge, mark it BLOCKER. If the diff is clean, \
+say so in one sentence and stop.";
+    let mut cmd = Command::new("claude");
+    cmd.current_dir(worktree);
+    cmd.args(["-p", "--output-format", "text"]);
+    if resume {
+        cmd.args(["--resume", session_id]);
+    } else {
+        cmd.args(["--session-id", session_id]);
+    }
+    cmd.arg(prompt);
+    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    // Reviews can be heavy on large diffs; 5 min cap.
+    let fut = async {
+        let out = cmd.output().await.context("invoking claude review")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "claude exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok::<_, anyhow::Error>(String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    tokio::time::timeout(Duration::from_secs(300), fut)
+        .await
+        .map_err(|_| anyhow!("claude review timed out after 5m"))?
+}
+
 async fn run_claude(prompt: &str) -> Result<String> {
     let out = Command::new("claude")
         .args(["-p", "--output-format", "text"])

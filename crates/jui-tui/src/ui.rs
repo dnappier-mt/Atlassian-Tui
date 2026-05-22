@@ -2507,6 +2507,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             DetailFocus::PrComments => vec![
                 ("tab", "next pane"),
                 ("j/k", "move"),
+                ("c", "ask claude"),
                 ("esc", "back"),
             ],
             DetailFocus::Comments => vec![
@@ -2632,13 +2633,41 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("y/enter", "confirm"),
             ("n/esc", "cancel"),
         ],
-        Mode::PrCreate(_) => vec![
-            ("tab", "field"),
-            ("type", "edit/search"),
-            ("↑/↓", "pick"),
-            ("F5/^S", "submit"),
-            ("esc", "cancel"),
-        ],
+        Mode::PrCreate(form) => {
+            if form.remote_pick.is_some() {
+                return vec![
+                    ("j/k", "move"),
+                    ("enter", "save + push"),
+                    ("esc", "cancel"),
+                ];
+            }
+            if form.review_state == crate::app::PrReviewState::Reviewing {
+                if app.pending_pr_review.is_some() {
+                    vec![
+                        ("…", "running /review"),
+                        ("esc", "cancel"),
+                    ]
+                } else {
+                    vec![
+                        ("j/k · PgUp/PgDn", "scroll"),
+                        ("y", "submit"),
+                        ("f", "fix session"),
+                        ("R", "re-run review"),
+                        ("esc", "back to editing"),
+                    ]
+                }
+            } else {
+                vec![
+                    ("tab", "field"),
+                    ("type", "edit/search"),
+                    ("←/→", "caret"),
+                    ("↑/↓", "line/pick"),
+                    ("^R/F6", "claude rewrite"),
+                    ("F5/^S", "submit PR"),
+                    ("esc", "cancel"),
+                ]
+            }
+        }
     }
 }
 
@@ -2684,6 +2713,58 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Remote-picker sub-modal preempts the main form.
+    if let Some(p) = &form.remote_pick {
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  where should jui PUSH your branch?",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  (must be a fork you can write to — usually NOT `origin`)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+        lines.push(Line::from(""));
+        for (i, (name, url)) in p.items.iter().enumerate() {
+            let prefix = if i == p.selected { "  ▶ " } else { "    " };
+            let style = if i == p.selected {
+                Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            // Flag `origin` so the user notices when they're about to push
+            // to what's almost certainly upstream (no write access in a fork
+            // workflow). Doesn't block selection — some setups DO have
+            // origin = fork.
+            let warn_tag = if name == "origin" {
+                Span::styled(
+                    "  ← likely upstream (read-only)",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            };
+            lines.push(Line::from(vec![
+                Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
+                Span::styled(format!("{name:<12}"), style.fg(Color::Cyan)),
+                Span::styled(url.clone(), style.fg(Color::DarkGray)),
+                warn_tag,
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  PR target is always origin/develop — this only controls WHERE the branch pushes.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "  j/k move · enter save+push · esc cancel · (saved per project)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+        f.render_widget(Paragraph::new(lines), inner);
+        return;
+    }
+
     // Pending-handle sub-modal preempts the main form.
     if let Some(p) = &form.pending_handle {
         let lines = vec![
@@ -2721,33 +2802,92 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
 
-    // Title field
-    lines.push(Line::from(vec![
+    // Title field — split around the cursor so the caret renders inline.
+    let title_cursor = form.title_cursor.min(form.title.len());
+    let (title_pre, title_post) = form.title.split_at(title_cursor);
+    let title_style = if cur == 0 {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else { Style::default() };
+    let mut title_spans = vec![
         label(0, "title"),
         Span::raw(" "),
-        Span::styled(form.title.clone(), if cur == 0 {
-            Style::default().add_modifier(Modifier::BOLD)
-        } else { Style::default() }),
-        if cur == 0 { Span::styled("█", Style::default().fg(Color::Yellow)) } else { Span::raw("") },
-    ]));
+        Span::styled(title_pre.to_string(), title_style),
+    ];
+    if cur == 0 {
+        title_spans.push(Span::styled("▏", Style::default().fg(Color::Yellow)));
+    }
+    title_spans.push(Span::styled(title_post.to_string(), title_style));
+    lines.push(Line::from(title_spans));
     lines.push(Line::from(""));
 
-    // Body field — multi-line
-    lines.push(Line::from(vec![label(1, "body"), Span::raw(" (Enter inserts newline)")]));
-    for (i, ln) in form.body.lines().enumerate() {
-        let mut spans = vec![Span::raw("  "), Span::raw(ln.to_string())];
-        if cur == 1 && i == form.body.lines().count().saturating_sub(1) {
-            spans.push(Span::styled("█", Style::default().fg(Color::Yellow)));
-        }
-        lines.push(Line::from(spans));
+    // Body field — multi-line. Walk by byte offset so we can splice a caret
+    // glyph in at the cursor regardless of which line it lands on.
+    let mut body_label_spans = vec![
+        label(1, "body"),
+        Span::raw(" (Enter inserts newline · ^R for claude rewrite)"),
+    ];
+    if app.pending_pr_body_improve.is_some() {
+        body_label_spans.push(Span::raw("  "));
+        body_label_spans.push(Span::styled(
+            app.spinner_glyph().to_string(),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ));
+        body_label_spans.push(Span::styled(
+            " asking claude…",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+        ));
     }
-    if form.body.is_empty() && cur == 1 {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled("█", Style::default().fg(Color::Yellow)),
-        ]));
+    lines.push(Line::from(body_label_spans));
+    {
+        let body = form.body.as_str();
+        let body_cursor = form.body_cursor.min(body.len());
+        let body_lines: Vec<&str> = if body.is_empty() {
+            vec![""]
+        } else {
+            // Preserve trailing empty line so a caret after a final '\n' has somewhere to go.
+            let mut v: Vec<&str> = body.split('\n').collect();
+            if v.is_empty() { v.push(""); }
+            v
+        };
+        let mut offset = 0usize;
+        for ln in body_lines.iter() {
+            let line_end = offset + ln.len();
+            let mut spans = vec![Span::raw("  ")];
+            if cur == 1 && body_cursor >= offset && body_cursor <= line_end {
+                let rel = body_cursor - offset;
+                let (pre, post) = ln.split_at(rel.min(ln.len()));
+                spans.push(Span::raw(pre.to_string()));
+                spans.push(Span::styled("▏", Style::default().fg(Color::Yellow)));
+                spans.push(Span::raw(post.to_string()));
+            } else {
+                spans.push(Span::raw((*ln).to_string()));
+            }
+            lines.push(Line::from(spans));
+            offset = line_end + 1; // +1 for the consumed '\n'
+        }
     }
     lines.push(Line::from(""));
+
+    // Suggestion overlay — shows Claude's rewrite with accept/reject hint.
+    if let Some(s) = &form.suggestion {
+        lines.push(Line::from(Span::styled(
+            "  ── claude rewrite (y accept · n reject) ─────────────────────",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        for ln in s.lines().take(20) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(ln.to_string(), Style::default().fg(Color::Cyan)),
+            ]));
+        }
+        if s.lines().count() > 20 {
+            lines.push(Line::from(Span::styled(
+                "  … (truncated; accept to insert in full)",
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
 
     // Reviewer field
     let reviewer_text = match &form.reviewer {
@@ -2834,6 +2974,37 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
             "  submitting…",
             Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
         )));
+    } else if form.review_state == crate::app::PrReviewState::Reviewing {
+        // Headline + hint live above the review pane; the pane itself is
+        // drawn separately below so it can be scrolled independently.
+        let pending = app.pending_pr_review.is_some();
+        if pending {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    app.spinner_glyph().to_string(),
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    " claude review running… (esc cancels)",
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+                ),
+            ]));
+        } else if form.review_output.is_some() {
+            lines.push(Line::from(Span::styled(
+                "  /review output (j/k or PgUp/PgDn to scroll):",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                "  no review output yet — press R to run",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        lines.push(Line::from(Span::styled(
+            "  y submit · f fix session · R re-run review · esc back to editing",
+            Style::default().fg(Color::DarkGray),
+        )));
     } else {
         lines.push(Line::from(Span::styled(
             "  Tab next field · F5 / Ctrl-S submits · Esc cancels",
@@ -2841,7 +3012,52 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         )));
     }
     let _ = PrCreateForm::FIELD_COUNT; // assert constant references compile
-    f.render_widget(Paragraph::new(lines), inner);
+
+    // Reserve the bottom half of `inner` for the review pane while in
+    // Reviewing so the output has room to breathe without colliding with
+    // the form rows above.
+    if form.review_state == crate::app::PrReviewState::Reviewing {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length((lines.len() as u16).min(inner.height / 2)), Constraint::Min(3)])
+            .split(inner);
+        f.render_widget(Paragraph::new(lines), split[0]);
+        draw_pr_review_pane(f, split[1], form);
+    } else {
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+fn draw_pr_review_pane(f: &mut Frame, area: Rect, form: &crate::app::PrCreateForm) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            " claude /review ",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let Some(md) = &form.review_output else {
+        let placeholder = if form.review_scroll > 0 {
+            "(empty)"
+        } else {
+            "(no output yet — press R to run /review)"
+        };
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                placeholder,
+                Style::default().fg(Color::DarkGray),
+            )),
+            inner,
+        );
+        return;
+    };
+    let p = Paragraph::new(md.clone())
+        .wrap(Wrap { trim: false })
+        .scroll((form.review_scroll as u16, 0));
+    f.render_widget(p, inner);
 }
 
 /// Greedy whitespace-aware wrap for long error/status messages in modals.
