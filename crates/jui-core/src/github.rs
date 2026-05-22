@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::process::Command;
 
-/// One issue-level comment on a GitHub PR. Tied back to its Jira ticket via
+/// One comment from a GitHub PR. Tied back to its Jira ticket via
 /// `ticket_key` (the daemon resolves the key from the PR's branch name when
-/// caching).
+/// caching). The reply flow routes on `kind`: "issue" (top-level thread),
+/// "review" (per-line on the diff — supports threaded replies), or
+/// "review_wrapper" (the body of a PR review).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrComment {
     pub ticket_key: String,
@@ -19,6 +21,43 @@ pub struct PrComment {
     pub author: String,
     pub created: String,
     pub body: String,
+    /// GitHub's numeric comment id (as a string for IPC simplicity).
+    /// Empty when the row was cached pre-migration.
+    #[serde(default)]
+    pub comment_id: String,
+    /// "issue" | "review" | "review_wrapper". Defaulted to "issue" when
+    /// loaded from a pre-migration row.
+    #[serde(default = "default_pr_comment_kind")]
+    pub kind: String,
+    /// True for review-thread comments whose thread is resolved on GitHub.
+    /// Always false for "issue" and "review_wrapper" kinds — they don't
+    /// belong to a thread.
+    #[serde(default)]
+    pub is_resolved: bool,
+    /// Parent comment's id when this row is a threaded reply (only set for
+    /// `kind = "review"`). Empty string = top-level. Drives the indent +
+    /// `↳` decoration in the PR Comments pane.
+    #[serde(default)]
+    pub in_reply_to_id: String,
+}
+
+fn default_pr_comment_kind() -> String { "issue".to_string() }
+
+/// What the github::pr_* fetchers return before the daemon enriches with
+/// ticket_key / pr_url / pr_number / repo. Five fields keep the fetch
+/// helpers focused; the daemon promotes these into `PrComment`s.
+#[derive(Debug, Clone)]
+pub struct FetchedComment {
+    pub id: String,
+    pub kind: String,
+    pub author: String,
+    pub created: String,
+    pub body: String,
+    /// Filled in for `kind = "review"` after the GraphQL thread-state lookup.
+    /// Other kinds always carry `false`.
+    pub is_resolved: bool,
+    /// Parent's REST id for review replies; empty for top-level / non-review.
+    pub in_reply_to_id: String,
 }
 
 /// One PR summary as returned by `gh search prs ... --json` or
@@ -392,7 +431,7 @@ pub async fn notifications() -> Result<Vec<PrSummary>> {
 
 /// Issue-level comments on a PR (the conversation thread, not per-line review
 /// comments). Returns oldest-first.
-pub async fn pr_comments(repo: &str, number: u64) -> Result<Vec<(String, String, String)>> {
+pub async fn pr_comments(repo: &str, number: u64) -> Result<Vec<FetchedComment>> {
     let path = format!("repos/{}/issues/{}/comments?per_page=100", repo, number);
     let out = Command::new("gh")
         .args(["api", "--paginate", &path])
@@ -406,12 +445,12 @@ pub async fn pr_comments(repo: &str, number: u64) -> Result<Vec<(String, String,
         ));
     }
     #[derive(Deserialize)]
-    struct GhComment { user: GhUser, created_at: String, body: String }
+    struct GhComment { id: u64, user: GhUser, created_at: String, body: String }
     #[derive(Deserialize)]
     struct GhUser { login: String }
     // `--paginate` concatenates JSON arrays; split on `][` like in notifications().
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut all: Vec<(String, String, String)> = Vec::new();
+    let mut all: Vec<FetchedComment> = Vec::new();
     for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
         if chunk.is_empty() { continue; }
         let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
@@ -428,7 +467,15 @@ pub async fn pr_comments(repo: &str, number: u64) -> Result<Vec<(String, String,
             Err(_) => continue,
         };
         for c in comments {
-            all.push((c.user.login, c.created_at, c.body));
+            all.push(FetchedComment {
+                id: c.id.to_string(),
+                kind: "issue".to_string(),
+                author: c.user.login,
+                created: c.created_at,
+                body: c.body,
+                is_resolved: false,
+                in_reply_to_id: String::new(),
+            });
         }
     }
     Ok(all)
@@ -437,7 +484,7 @@ pub async fn pr_comments(repo: &str, number: u64) -> Result<Vec<(String, String,
 /// Per-line review comments on a PR (the kind Copilot and human reviewers
 /// leave inline on the diff). The body is prefixed with `[path:line] ` so
 /// the source location is visible in the flat PR-comments pane.
-pub async fn pr_review_comments(repo: &str, number: u64) -> Result<Vec<(String, String, String)>> {
+pub async fn pr_review_comments(repo: &str, number: u64) -> Result<Vec<FetchedComment>> {
     let path = format!("repos/{}/pulls/{}/comments?per_page=100", repo, number);
     let out = Command::new("gh")
         .args(["api", "--paginate", &path])
@@ -452,6 +499,7 @@ pub async fn pr_review_comments(repo: &str, number: u64) -> Result<Vec<(String, 
     }
     #[derive(Deserialize)]
     struct GhReviewComment {
+        id: u64,
         user: GhUser,
         created_at: String,
         body: String,
@@ -459,11 +507,13 @@ pub async fn pr_review_comments(repo: &str, number: u64) -> Result<Vec<(String, 
         path: Option<String>,
         #[serde(default)]
         line: Option<u64>,
+        #[serde(default)]
+        in_reply_to_id: Option<u64>,
     }
     #[derive(Deserialize)]
     struct GhUser { login: String }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut all: Vec<(String, String, String)> = Vec::new();
+    let mut all: Vec<FetchedComment> = Vec::new();
     for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
         if chunk.is_empty() { continue; }
         let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
@@ -485,7 +535,15 @@ pub async fn pr_review_comments(repo: &str, number: u64) -> Result<Vec<(String, 
                 (Some(p), None) => format!("[{p}] "),
                 _ => String::new(),
             };
-            all.push((c.user.login, c.created_at, format!("{loc}{}", c.body)));
+            all.push(FetchedComment {
+                id: c.id.to_string(),
+                kind: "review".to_string(),
+                author: c.user.login,
+                created: c.created_at,
+                body: format!("{loc}{}", c.body),
+                is_resolved: false,
+                in_reply_to_id: c.in_reply_to_id.map(|n| n.to_string()).unwrap_or_default(),
+            });
         }
     }
     Ok(all)
@@ -494,7 +552,7 @@ pub async fn pr_review_comments(repo: &str, number: u64) -> Result<Vec<(String, 
 /// Top-level reviews on a PR (the `gh pr review` wrappers). Returns only
 /// reviews that carry an actual body — reviews that just record APPROVED /
 /// CHANGES_REQUESTED with no commentary aren't useful in the pane.
-pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<(String, String, String)>> {
+pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<FetchedComment>> {
     let path = format!("repos/{}/pulls/{}/reviews?per_page=100", repo, number);
     let out = Command::new("gh")
         .args(["api", "--paginate", &path])
@@ -509,6 +567,7 @@ pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<(String, String, 
     }
     #[derive(Deserialize)]
     struct GhReview {
+        id: u64,
         user: Option<GhUser>,
         #[serde(default)]
         submitted_at: Option<String>,
@@ -520,7 +579,7 @@ pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<(String, String, 
     #[derive(Deserialize)]
     struct GhUser { login: String }
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let mut all: Vec<(String, String, String)> = Vec::new();
+    let mut all: Vec<FetchedComment> = Vec::new();
     for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
         if chunk.is_empty() { continue; }
         let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
@@ -545,7 +604,15 @@ pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<(String, String, 
             } else {
                 format!("[review · {}] ", r.state.to_ascii_lowercase())
             };
-            all.push((user.login, when, format!("{tag}{}", r.body)));
+            all.push(FetchedComment {
+                id: r.id.to_string(),
+                kind: "review_wrapper".to_string(),
+                author: user.login,
+                created: when,
+                body: format!("{tag}{}", r.body),
+                is_resolved: false,
+                in_reply_to_id: String::new(),
+            });
         }
     }
     Ok(all)
@@ -629,6 +696,191 @@ pub async fn post_pr_comment(repo: &str, number: u64, body: &str) -> Result<()> 
     if !out.status.success() {
         return Err(anyhow!(
             "gh pr comment failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Map of review-comment REST `databaseId` → `isResolved` for every comment
+/// in every review thread on the PR. The merge pass uses this to flag
+/// `kind = "review"` cached comments. Empty map on any GraphQL failure —
+/// caller treats those as unresolved (worst case the user sees a thread
+/// they thought was hidden, never the other way around).
+pub async fn review_thread_resolution_map(
+    repo: &str,
+    number: u64,
+) -> Result<std::collections::HashMap<String, bool>> {
+    let (owner, name) = repo.split_once('/')
+        .ok_or_else(|| anyhow!("repo must be `<owner>/<name>`, got: {repo}"))?;
+    let query = format!(
+        "query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ \
+            pullRequest(number: {number}) {{ \
+                reviewThreads(first: 100) {{ \
+                    nodes {{ isResolved comments(first: 100) {{ nodes {{ databaseId }} }} }} \
+                }} \
+            }} \
+        }} }}",
+    );
+    let out = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .output()
+        .await
+        .context("running gh api graphql (resolution map)")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api graphql failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct Resp { data: Data }
+    #[derive(Deserialize)]
+    struct Data { repository: Repo }
+    #[derive(Deserialize)]
+    struct Repo { #[serde(rename = "pullRequest")] pull_request: Pr }
+    #[derive(Deserialize)]
+    struct Pr { #[serde(rename = "reviewThreads")] review_threads: Threads }
+    #[derive(Deserialize)]
+    struct Threads { nodes: Vec<Thread> }
+    #[derive(Deserialize)]
+    struct Thread {
+        #[serde(rename = "isResolved")] is_resolved: bool,
+        comments: ThreadComments,
+    }
+    #[derive(Deserialize)]
+    struct ThreadComments { nodes: Vec<ThreadComment> }
+    #[derive(Deserialize)]
+    struct ThreadComment { #[serde(rename = "databaseId")] database_id: Option<i64> }
+    let resp: Resp = serde_json::from_slice(&out.stdout)
+        .context("parsing reviewThreads JSON")?;
+    let mut map = std::collections::HashMap::new();
+    for t in resp.data.repository.pull_request.review_threads.nodes {
+        for c in t.comments.nodes {
+            if let Some(id) = c.database_id {
+                map.insert(id.to_string(), t.is_resolved);
+            }
+        }
+    }
+    Ok(map)
+}
+
+/// Mark a review-comment thread as resolved on GitHub (the "Resolve
+/// conversation" button). Only works for inline review comments — issue
+/// comments and review wrappers have no thread to resolve.
+///
+/// GitHub doesn't expose thread resolution in REST, so we go through
+/// GraphQL: query the PR's `reviewThreads`, find the thread whose comments
+/// contain the given REST `databaseId`, then call `resolveReviewThread`
+/// with that thread's GraphQL node id.
+pub async fn resolve_review_thread(
+    repo: &str,
+    number: u64,
+    comment_id: &str,
+) -> Result<()> {
+    let (owner, name) = repo.split_once('/')
+        .ok_or_else(|| anyhow!("repo must be `<owner>/<name>`, got: {repo}"))?;
+    let target_db_id: i64 = comment_id.parse()
+        .with_context(|| format!("comment_id must be numeric, got: {comment_id}"))?;
+    // 1. List threads. Single query is enough for normal PRs (<100 threads).
+    let query = format!(
+        "query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ \
+            pullRequest(number: {number}) {{ \
+                reviewThreads(first: 100) {{ \
+                    nodes {{ id isResolved comments(first: 100) {{ nodes {{ databaseId }} }} }} \
+                }} \
+            }} \
+        }} }}",
+    );
+    let out = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={query}")])
+        .output()
+        .await
+        .context("running gh api graphql (list threads)")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api graphql failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    #[derive(Deserialize)]
+    struct Resp { data: Data }
+    #[derive(Deserialize)]
+    struct Data { repository: Repo }
+    #[derive(Deserialize)]
+    struct Repo { #[serde(rename = "pullRequest")] pull_request: Pr }
+    #[derive(Deserialize)]
+    struct Pr { #[serde(rename = "reviewThreads")] review_threads: Threads }
+    #[derive(Deserialize)]
+    struct Threads { nodes: Vec<Thread> }
+    #[derive(Deserialize)]
+    struct Thread {
+        id: String,
+        #[serde(rename = "isResolved")] is_resolved: bool,
+        comments: ThreadComments,
+    }
+    #[derive(Deserialize)]
+    struct ThreadComments { nodes: Vec<ThreadComment> }
+    #[derive(Deserialize)]
+    struct ThreadComment { #[serde(rename = "databaseId")] database_id: Option<i64> }
+    let resp: Resp = serde_json::from_slice(&out.stdout)
+        .context("parsing reviewThreads JSON")?;
+    let thread = resp.data.repository.pull_request.review_threads.nodes
+        .into_iter()
+        .find(|t| t.comments.nodes.iter().any(|c| c.database_id == Some(target_db_id)));
+    let Some(thread) = thread else {
+        return Err(anyhow!(
+            "no review thread contains comment {comment_id} (not a review comment?)"
+        ));
+    };
+    if thread.is_resolved {
+        return Ok(()); // idempotent — already done
+    }
+    // 2. Resolve it.
+    let mutation = format!(
+        "mutation {{ resolveReviewThread(input: {{ threadId: \"{}\" }}) {{ \
+            thread {{ isResolved }} \
+        }} }}",
+        thread.id,
+    );
+    let out = Command::new("gh")
+        .args(["api", "graphql", "-f", &format!("query={mutation}")])
+        .output()
+        .await
+        .context("running gh api graphql (resolve mutation)")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api graphql resolve failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// Post a threaded reply to a per-line review comment. Uses the dedicated
+/// `/pulls/{n}/comments/{id}/replies` endpoint so the new comment lands
+/// inline on the same conversation, not as a fresh top-level review.
+pub async fn post_review_comment_reply(
+    repo: &str,
+    number: u64,
+    parent_id: &str,
+    body: &str,
+) -> Result<()> {
+    let path = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, parent_id);
+    let out = Command::new("gh")
+        .args([
+            "api",
+            "--method", "POST",
+            "-H", "Accept: application/vnd.github+json",
+            &path,
+            "-f", &format!("body={body}"),
+        ])
+        .output()
+        .await
+        .context("running gh api .../comments/<id>/replies")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api reply failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }

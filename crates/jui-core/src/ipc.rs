@@ -52,6 +52,18 @@ pub enum Request {
     /// ticket is associated with an open PR — daemon populates during the
     /// github-mentions refresh).
     ListPrComments { ticket_key: String },
+    /// Reply to a GitHub PR comment. `parent_kind = "review"` uses the
+    /// threaded reply endpoint; otherwise the body is posted as a new
+    /// top-level issue comment on the PR.
+    ReplyToPrComment {
+        ticket_key: String,
+        parent_kind: String,
+        parent_id: String,
+        body: String,
+    },
+    /// Mark the review thread containing the given comment as resolved.
+    /// Only meaningful for `kind = "review"` comments; other kinds error.
+    ResolvePrComment { ticket_key: String, comment_id: String },
     /// Set up a DevQA worktree for the given PR: locate the user's local clone
     /// of `repo`, fetch `pull/<pr_number>/head` into a local branch, and
     /// `git worktree add` it at `<repo>/../<repo>-worktrees/<ticket_key>-devqa`.

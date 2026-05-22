@@ -122,6 +122,9 @@ pub enum Mode {
     /// General settings page: workflow defaults the user can tweak without
     /// editing `config.toml` by hand. Opens with `,` from the List view.
     Settings(SettingsForm),
+    /// Compose a reply to a GitHub PR comment. Opened with `r` from the
+    /// PR Comments pane in Detail view.
+    PrCommentReply(PrCommentReplyForm),
 }
 
 /// Editable settings rows. Each row maps to one field on `WorkflowConfig`.
@@ -739,6 +742,21 @@ pub struct CommentForm {
     pub reply_to: Option<ReplyContext>,
 }
 
+/// Reply form for the GitHub PR Comments pane. Carries the parent comment's
+/// kind + id so the daemon can route to the threaded reply endpoint when
+/// applicable; falls back to a top-level PR comment otherwise.
+pub struct PrCommentReplyForm {
+    pub ticket_key: String,
+    pub parent_kind: String,
+    pub parent_id: String,
+    pub parent_author: String,
+    pub parent_body: String,
+    pub body: String,
+    pub body_cursor: usize,
+    pub busy: bool,
+    pub error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct ReplyContext {
     pub parent_author: String,
@@ -824,6 +842,10 @@ pub struct App {
     /// When false, Completed PRs are filtered out of the bottom List section
     /// and Tree mode. Toggle with `K` in the bottom List section.
     pub show_completed_prs: bool,
+    /// When false, resolved PR review threads are hidden in the PR Comments
+    /// pane. Toggle with `H` from the pane. Default false — resolved threads
+    /// are "done" and clutter the view otherwise.
+    pub show_resolved_pr_comments: bool,
     /// Tickets where the user has been @-mentioned in Jira text (description /
     /// comments). Disjoint from `reviewing_tickets` and `github_tickets`.
     pub mentioned_tickets: Vec<Ticket>,
@@ -942,6 +964,7 @@ impl App {
             show_all_mine: false,
             pr_user_states: std::collections::HashMap::new(),
             show_completed_prs: false,
+            show_resolved_pr_comments: false,
             mentioned_tickets: Vec::new(),
             my_authored_pr_keys: std::collections::HashSet::new(),
             mentioned_selected: 0,
@@ -991,6 +1014,30 @@ impl App {
 
     /// Lookup the user's review state for a ticket. Default `Awaiting` when
     /// the ticket has never been touched.
+    /// Indices into `pr_comments` honouring the `show_resolved_pr_comments`
+    /// toggle. Resolved comments are filtered out by default; flipping the
+    /// toggle includes them. Selection (`pr_comment_selected`) indexes into
+    /// this slice — translate via `visible_pr_comments()[selected]` to get
+    /// the underlying `pr_comments[real_idx]`.
+    pub fn visible_pr_comments(&self) -> Vec<usize> {
+        self.pr_comments
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| self.show_resolved_pr_comments || !c.is_resolved)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Number of resolved comments currently hidden from the pane. Used by
+    /// the UI to surface a "(N hidden — H to show)" hint when applicable.
+    pub fn hidden_pr_comment_count(&self) -> usize {
+        if self.show_resolved_pr_comments {
+            0
+        } else {
+            self.pr_comments.iter().filter(|c| c.is_resolved).count()
+        }
+    }
+
     /// Spinner glyph for the current frame. Rotates a braille pattern so any
     /// "working…" surface in the UI (review, rewrite, etc.) shows motion.
     pub fn spinner_glyph(&self) -> char {
@@ -1524,8 +1571,10 @@ impl App {
             ipc::send_request(&mut s, &Request::ListPrComments { ticket_key: key }).await
         {
             self.pr_comments = items;
+            // Index into the visible-list (resolved filter may hide some).
+            let v = self.visible_pr_comments();
             self.pr_comment_selected =
-                self.pr_comment_selected.min(self.pr_comments.len().saturating_sub(1));
+                self.pr_comment_selected.min(v.len().saturating_sub(1));
             self.detail_pr_link = pr_link;
         } else {
             self.pr_comments.clear();
@@ -3601,6 +3650,180 @@ change, look for regressions, and report findings to me directly here.
         self.status = "workflow statuses — i: add · d×2: delete · esc: close".into();
     }
 
+    /// Mark the currently-selected PR review thread as resolved on GitHub.
+    /// Issue-thread / review-wrapper comments don't belong to a thread, so
+    /// we surface an error in the status bar without round-tripping.
+    pub async fn resolve_selected_pr_comment(&mut self) -> Result<()> {
+        let Some(ticket) = self.detail.as_ref().map(|t| t.key.clone()) else {
+            self.status = "no ticket open".into();
+            return Ok(());
+        };
+        let visible = self.visible_pr_comments();
+        let Some(&real_idx) = visible.get(self.pr_comment_selected) else {
+            self.status = "no PR comment selected".into();
+            return Ok(());
+        };
+        let Some(c) = self.pr_comments.get(real_idx).cloned() else {
+            self.status = "no PR comment selected".into();
+            return Ok(());
+        };
+        if !c.kind.eq_ignore_ascii_case("review") {
+            self.status = format!(
+                "can't resolve a `{}` comment — only inline review threads are resolvable",
+                c.kind
+            );
+            return Ok(());
+        }
+        if c.comment_id.is_empty() {
+            self.status =
+                "comment id missing (cached before migration) — wait for next refresh and retry".into();
+            return Ok(());
+        }
+        self.status = "resolving thread…".into();
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(
+            &mut s,
+            &Request::ResolvePrComment {
+                ticket_key: ticket.clone(),
+                comment_id: c.comment_id.clone(),
+            },
+        )
+        .await;
+        match resp {
+            Ok(Response::Ok) => {
+                self.status = format!("resolved thread for comment {}", c.comment_id);
+                // Optimistically mark locally so the hide-resolved filter
+                // hides it on next draw, before the async daemon refresh
+                // lands. Any comment in the same thread shares the state —
+                // safest approximation is to flip just this row; the next
+                // refresh fills in any siblings.
+                if let Some(local) = self.pr_comments.get_mut(real_idx) {
+                    local.is_resolved = true;
+                }
+                // Best-effort re-fetch so siblings + new replies show up.
+                let mut s = ipc::connect().await?;
+                if let Ok(Response::PrComments { items, pr_link }) =
+                    ipc::send_request(&mut s, &Request::ListPrComments { ticket_key: ticket }).await
+                {
+                    self.pr_comments = items;
+                    self.detail_pr_link = pr_link;
+                    let v = self.visible_pr_comments();
+                    if !v.is_empty() {
+                        self.pr_comment_selected = self.pr_comment_selected.min(v.len() - 1);
+                    } else {
+                        self.pr_comment_selected = 0;
+                    }
+                }
+            }
+            Ok(Response::Err { message }) => {
+                self.status = format!("resolve failed: {message}");
+            }
+            Ok(_) => self.status = "unexpected daemon response".into(),
+            Err(e) => self.status = format!("resolve err: {e:#}"),
+        }
+        Ok(())
+    }
+
+    /// Open the reply modal for the currently-selected PR comment. Threaded
+    /// review replies route to GitHub's `/pulls/{n}/comments/{id}/replies`
+    /// endpoint; issue-thread and review_wrapper kinds drop a new top-level
+    /// comment on the PR.
+    pub fn open_pr_comment_reply(&mut self) {
+        let Some(ticket) = self.detail.as_ref().map(|t| t.key.clone()) else {
+            self.status = "no ticket open".into();
+            return;
+        };
+        let visible = self.visible_pr_comments();
+        let Some(&real_idx) = visible.get(self.pr_comment_selected) else {
+            self.status = "no PR comment selected".into();
+            return;
+        };
+        let Some(c) = self.pr_comments.get(real_idx).cloned() else {
+            self.status = "no PR comment selected".into();
+            return;
+        };
+        self.mode = Mode::PrCommentReply(PrCommentReplyForm {
+            ticket_key: ticket,
+            parent_kind: c.kind,
+            parent_id: c.comment_id,
+            parent_author: c.author,
+            parent_body: c.body,
+            body: String::new(),
+            body_cursor: 0,
+            busy: false,
+            error: None,
+        });
+        self.status = "type reply · ^S / F5 submit · esc cancel".into();
+    }
+
+    pub async fn submit_pr_comment_reply(&mut self) -> Result<()> {
+        let snapshot = if let Mode::PrCommentReply(f) = &self.mode {
+            if f.body.trim().is_empty() {
+                None
+            } else {
+                Some((f.ticket_key.clone(), f.parent_kind.clone(), f.parent_id.clone(), f.body.clone()))
+            }
+        } else {
+            None
+        };
+        let Some((ticket_key, parent_kind, parent_id, body)) = snapshot else {
+            if let Mode::PrCommentReply(f) = &mut self.mode {
+                f.error = Some("reply body is empty".into());
+            }
+            return Ok(());
+        };
+        if let Mode::PrCommentReply(f) = &mut self.mode {
+            f.busy = true;
+            f.error = None;
+        }
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(
+            &mut s,
+            &Request::ReplyToPrComment { ticket_key: ticket_key.clone(), parent_kind, parent_id, body },
+        )
+        .await;
+        match resp {
+            Ok(Response::Ok) => {
+                self.status = "reply posted".into();
+                self.mode = Mode::Detail;
+                // Best-effort: re-pull the merged comment list so the new
+                // row shows up without waiting for the next warmup tick.
+                let mut s = ipc::connect().await?;
+                if let Ok(Response::PrComments { items, pr_link }) =
+                    ipc::send_request(&mut s, &Request::ListPrComments { ticket_key }).await
+                {
+                    self.pr_comments = items;
+                    self.detail_pr_link = pr_link;
+                    let v = self.visible_pr_comments();
+                    if !v.is_empty() {
+                        self.pr_comment_selected = self.pr_comment_selected.min(v.len() - 1);
+                    } else {
+                        self.pr_comment_selected = 0;
+                    }
+                }
+            }
+            Ok(Response::Err { message }) => {
+                if let Mode::PrCommentReply(f) = &mut self.mode {
+                    f.error = Some(message);
+                    f.busy = false;
+                }
+            }
+            Ok(_) => {
+                if let Mode::PrCommentReply(f) = &mut self.mode {
+                    f.error = Some("unexpected daemon response".into());
+                    f.busy = false;
+                }
+            }
+            Err(e) => {
+                if let Mode::PrCommentReply(f) = &mut self.mode {
+                    f.error = Some(format!("{e:#}"));
+                    f.busy = false;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Open a Claude session about the currently-selected PR comment. Resumes
     /// the ticket's stored session id (or starts fresh) and seeds the pane
     /// with `Copilot suggested this in code review: "<body>". What are your
@@ -3610,7 +3833,12 @@ change, look for regressions, and report findings to me directly here.
             self.status = "no ticket open".into();
             return Ok(());
         };
-        let Some(comment) = self.pr_comments.get(self.pr_comment_selected).cloned() else {
+        let visible = self.visible_pr_comments();
+        let Some(&real_idx) = visible.get(self.pr_comment_selected) else {
+            self.status = "no PR comment selected".into();
+            return Ok(());
+        };
+        let Some(comment) = self.pr_comments.get(real_idx).cloned() else {
             self.status = "no PR comment selected".into();
             return Ok(());
         };
@@ -5535,6 +5763,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             | Mode::PrCreate(_)
             | Mode::ActiveStatusConfig(_)
             | Mode::Settings(_)
+            | Mode::PrCommentReply(_)
     );
     if !in_text_input && matches!(code, KeyCode::Char('?')) {
         app.show_help = true;
@@ -6173,7 +6402,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     }
                     return Ok(());
                 }
-                KeyCode::Char('R') => {
+                // Reviewer picker — but only when focus isn't on the PR
+                // Comments pane, where `R` resolves the selected thread.
+                KeyCode::Char('R') if app.detail_focus != DetailFocus::PrComments => {
                     app.open_assign_picker(AssignPurpose::Reviewer).await?;
                     return Ok(());
                 }
@@ -6204,18 +6435,42 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     return Ok(());
                 }
                 DetailFocus::PrComments => {
+                    let visible = app.visible_pr_comments();
                     match code {
                         KeyCode::Char('j') | KeyCode::Down => {
-                            if !app.pr_comments.is_empty() {
+                            if !visible.is_empty() {
                                 app.pr_comment_selected =
-                                    (app.pr_comment_selected + 1).min(app.pr_comments.len() - 1);
+                                    (app.pr_comment_selected + 1).min(visible.len() - 1);
                             }
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             app.pr_comment_selected = app.pr_comment_selected.saturating_sub(1);
                         }
+                        KeyCode::Char('H') => {
+                            app.show_resolved_pr_comments = !app.show_resolved_pr_comments;
+                            // Clamp selection — the visible-list length just
+                            // changed under our feet.
+                            let new_visible = app.visible_pr_comments();
+                            if !new_visible.is_empty() {
+                                app.pr_comment_selected =
+                                    app.pr_comment_selected.min(new_visible.len() - 1);
+                            } else {
+                                app.pr_comment_selected = 0;
+                            }
+                            app.status = if app.show_resolved_pr_comments {
+                                "showing resolved threads".into()
+                            } else {
+                                "hiding resolved threads".into()
+                            };
+                        }
                         KeyCode::Char('c') => {
                             app.chat_about_pr_comment().await?;
+                        }
+                        KeyCode::Char('r') => {
+                            app.open_pr_comment_reply();
+                        }
+                        KeyCode::Char('R') => {
+                            app.resolve_selected_pr_comment().await?;
                         }
                         _ => {}
                     }
@@ -7447,6 +7702,78 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         Mode::Settings(_) => {
             // Handled out-of-band so we can drop the outer borrow on `app.mode`
             // before invoking async picker fetches.
+        }
+        Mode::PrCommentReply(_) => {
+            match code {
+                KeyCode::Esc => app.mode = Mode::Detail,
+                KeyCode::F(5) => app.submit_pr_comment_reply().await?,
+                KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
+                    app.submit_pr_comment_reply().await?;
+                }
+                KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
+                    app.submit_pr_comment_reply().await?;
+                }
+                KeyCode::Enter => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        f.body.insert(f.body_cursor, '\n');
+                        f.body_cursor += 1;
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        if f.body_cursor > 0 {
+                            let prev = edit_left(&f.body, f.body_cursor);
+                            f.body.replace_range(prev..f.body_cursor, "");
+                            f.body_cursor = prev;
+                        }
+                    }
+                }
+                KeyCode::Delete => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        if f.body_cursor < f.body.len() {
+                            let nxt = edit_right(&f.body, f.body_cursor);
+                            f.body.replace_range(f.body_cursor..nxt, "");
+                        }
+                    }
+                }
+                KeyCode::Left => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        f.body_cursor = edit_left(&f.body, f.body_cursor);
+                    }
+                }
+                KeyCode::Right => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        f.body_cursor = edit_right(&f.body, f.body_cursor);
+                    }
+                }
+                KeyCode::Up => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        f.body_cursor = edit_up(&f.body, f.body_cursor);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        f.body_cursor = edit_down(&f.body, f.body_cursor);
+                    }
+                }
+                KeyCode::Home => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        f.body_cursor = edit_line_start(&f.body, f.body_cursor);
+                    }
+                }
+                KeyCode::End => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        f.body_cursor = edit_line_end(&f.body, f.body_cursor);
+                    }
+                }
+                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                    if let Mode::PrCommentReply(f) = &mut app.mode {
+                        f.body.insert(f.body_cursor, c);
+                        f.body_cursor += c.len_utf8();
+                    }
+                }
+                _ => {}
+            }
         }
     }
     Ok(())

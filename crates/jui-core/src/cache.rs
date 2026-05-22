@@ -194,6 +194,19 @@ impl Cache {
         // the in-modal review pane landed. Error ignored when the column
         // already exists.
         let _ = conn.execute("ALTER TABLE pr_drafts ADD COLUMN review_output TEXT", []);
+        // pr_comments grows comment_id + kind so the reply flow can route to
+        // the right GitHub endpoint (issue thread vs threaded review reply).
+        // Both are nullable / defaulted so old rows survive the migration.
+        let _ = conn.execute("ALTER TABLE pr_comments ADD COLUMN comment_id TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE pr_comments ADD COLUMN kind TEXT NOT NULL DEFAULT 'issue'",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE pr_comments ADD COLUMN is_resolved INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute("ALTER TABLE pr_comments ADD COLUMN in_reply_to_id TEXT", []);
         // Per-project push remote — saved once after the user picks via the
         // remote picker during PR submit; reused on subsequent PRs for the
         // same linked project so they don't get re-prompted.
@@ -328,7 +341,7 @@ impl Cache {
         pr_url: &str,
         pr_number: u64,
         repo: &str,
-        items: &[(String, String, String)], // (author, created, body)
+        items: &[crate::github::FetchedComment],
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let tx = self.conn.transaction()?;
@@ -336,20 +349,24 @@ impl Cache {
         {
             let mut stmt = tx.prepare(
                 r#"INSERT INTO pr_comments
-                   (ticket_key, idx, pr_url, pr_number, repo, author, created, body, cached_at)
-                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"#,
+                   (ticket_key, idx, pr_url, pr_number, repo, author, created, body, cached_at, comment_id, kind, is_resolved, in_reply_to_id)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"#,
             )?;
-            for (i, (author, created, body)) in items.iter().enumerate() {
+            for (i, c) in items.iter().enumerate() {
                 stmt.execute(rusqlite::params![
                     ticket_key,
                     i as i64,
                     pr_url,
                     pr_number as i64,
                     repo,
-                    author,
-                    created,
-                    body,
+                    c.author,
+                    c.created,
+                    c.body,
                     now,
+                    c.id,
+                    c.kind,
+                    c.is_resolved as i64,
+                    c.in_reply_to_id,
                 ])?;
             }
         }
@@ -414,6 +431,21 @@ impl Cache {
     }
 
     /// Cached PR url for `ticket_key`, or `None` if no PR was ever seen.
+    /// Repo slug + PR number tied to a ticket, or `None` if no PR is on
+    /// file. Used by the reply flow to route gh API calls.
+    pub fn get_ticket_pr_meta(&self, ticket_key: &str) -> Result<Option<(String, u64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT repo, pr_number FROM ticket_prs WHERE ticket_key = ?1",
+        )?;
+        let mut rows = stmt.query([ticket_key])?;
+        if let Some(row) = rows.next()? {
+            let repo: String = row.get(0)?;
+            let n: i64 = row.get(1)?;
+            return Ok(Some((repo, n as u64)));
+        }
+        Ok(None)
+    }
+
     pub fn get_ticket_pr_url(&self, ticket_key: &str) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT pr_url FROM ticket_prs WHERE ticket_key = ?1",
@@ -427,7 +459,8 @@ impl Cache {
 
     pub fn get_pr_comments(&self, ticket_key: &str) -> Result<Vec<crate::github::PrComment>> {
         let mut stmt = self.conn.prepare(
-            r#"SELECT pr_url, pr_number, repo, author, created, body
+            r#"SELECT pr_url, pr_number, repo, author, created, body,
+                      comment_id, kind, is_resolved, in_reply_to_id
                FROM pr_comments WHERE ticket_key = ?1 ORDER BY idx"#,
         )?;
         let rows = stmt.query_map([ticket_key], |r| {
@@ -439,6 +472,10 @@ impl Cache {
                 author: r.get::<_, String>(3)?,
                 created: r.get::<_, String>(4)?,
                 body: r.get::<_, String>(5)?,
+                comment_id: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+                kind: r.get::<_, String>(7).unwrap_or_else(|_| "issue".to_string()),
+                is_resolved: r.get::<_, i64>(8).unwrap_or(0) != 0,
+                in_reply_to_id: r.get::<_, Option<String>>(9).ok().flatten().unwrap_or_default(),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())

@@ -495,6 +495,64 @@ async fn dispatch(
             Ok(Response::PrComments { items, pr_link })
         }
 
+        Request::ResolvePrComment { ticket_key, comment_id } => {
+            let (repo, number) = {
+                let cache = state.cache.lock().await;
+                match cache.get_ticket_pr_meta(&ticket_key)? {
+                    Some(m) => m,
+                    None => {
+                        return Ok(Response::Err {
+                            message: format!("no PR on file for {ticket_key}"),
+                        });
+                    }
+                }
+            };
+            if let Err(e) = jui_core::github::resolve_review_thread(&repo, number, &comment_id).await {
+                return Ok(Response::Err { message: format!("{e:#}") });
+            }
+            // Async refresh — resolved threads still appear in REST, so the
+            // pane content doesn't change yet, but a refresh keeps things
+            // consistent (replies you might have added land too).
+            let s2 = state.clone();
+            let k2 = ticket_key.clone();
+            tokio::spawn(async move { refresh_pr_comments_for_ticket(&s2, &k2).await; });
+            Ok(Response::Ok)
+        }
+
+        Request::ReplyToPrComment { ticket_key, parent_kind, parent_id, body } => {
+            // Resolve repo + number for the ticket. Prefer the canonical
+            // ticket_prs row; fall back to scanning cached pr_comments for a
+            // matching ticket so older data still routes.
+            let (repo, number) = {
+                let cache = state.cache.lock().await;
+                if let Some((r, n)) = cache.get_ticket_pr_meta(&ticket_key)? {
+                    (r, n)
+                } else if let Some(c) = cache.get_pr_comments(&ticket_key)?.into_iter().next() {
+                    (c.repo, c.pr_number)
+                } else {
+                    return Ok(Response::Err {
+                        message: format!("no PR on file for {ticket_key}"),
+                    });
+                }
+            };
+            let kind = parent_kind.to_ascii_lowercase();
+            let result = if kind == "review" && !parent_id.is_empty() {
+                jui_core::github::post_review_comment_reply(&repo, number, &parent_id, &body).await
+            } else {
+                // issue threads and review_wrapper bodies both land as a fresh
+                // issue comment — GitHub doesn't thread issue comments.
+                jui_core::github::post_pr_comment(&repo, number, &body).await
+            };
+            if let Err(e) = result {
+                return Ok(Response::Err { message: format!("{e:#}") });
+            }
+            // Async refresh so the next ListPrComments call surfaces the new row.
+            let s2 = state.clone();
+            let k2 = ticket_key.clone();
+            tokio::spawn(async move { refresh_pr_comments_for_ticket(&s2, &k2).await; });
+            Ok(Response::Ok)
+        }
+
         Request::SetupDevQaWorktree { ticket_key, repo, pr_number } => {
             setup_devqa_worktree(&state, &ticket_key, &repo, pr_number).await
         }
@@ -1202,6 +1260,49 @@ async fn refresh_ticket_after_mutation(state: &State, key: &str) {
     refresh_comments(state, key).await;
 }
 
+/// Re-fetch the three PR comment surfaces for a ticket and persist the
+/// merged set. Called after a reply succeeds so the pane shows the new
+/// comment without waiting for the next github-mention warmup tick.
+async fn refresh_pr_comments_for_ticket(state: &State, ticket_key: &str) {
+    let meta = match state.cache.lock().await.get_ticket_pr_meta(ticket_key) {
+        Ok(Some(m)) => m,
+        Ok(None) => return,
+        Err(e) => { warn!(%ticket_key, "pr_meta lookup: {e:#}"); return; }
+    };
+    let (repo, number) = meta;
+    let mut merged: Vec<jui_core::github::FetchedComment> = Vec::new();
+    if let Ok(items) = jui_core::github::pr_comments(&repo, number).await {
+        merged.extend(items);
+    }
+    if let Ok(items) = jui_core::github::pr_review_comments(&repo, number).await {
+        merged.extend(items);
+    }
+    if let Ok(items) = jui_core::github::pr_reviews(&repo, number).await {
+        merged.extend(items);
+    }
+    if let Ok(map) = jui_core::github::review_thread_resolution_map(&repo, number).await {
+        for c in merged.iter_mut() {
+            if c.kind == "review" {
+                if let Some(&resolved) = map.get(&c.id) {
+                    c.is_resolved = resolved;
+                }
+            }
+        }
+    }
+    merged.sort_by(|a, b| a.created.cmp(&b.created));
+    // We need the pr_url to satisfy upsert_pr_comments — pull it from the
+    // ticket_prs row written when the PR was created.
+    let pr_url = state.cache.lock().await.get_ticket_pr_url(ticket_key)
+        .ok().flatten().unwrap_or_else(|| {
+            format!("https://github.com/{repo}/pull/{number}")
+        });
+    if let Err(e) = state.cache.lock().await.upsert_pr_comments(
+        ticket_key, &pr_url, number, &repo, &merged,
+    ) {
+        warn!(%ticket_key, "pr comments upsert after reply: {e:#}");
+    }
+}
+
 async fn refresh_comments(state: &State, key: &str) {
     match state.jira.comments(key).await {
         Ok(items) => {
@@ -1697,7 +1798,7 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
         // review comments (where Copilot leaves its line-by-line feedback),
         // and review summaries. Merge + sort oldest-first so they read as
         // a single conversation in the pane.
-        let mut merged: Vec<(String, String, String)> = Vec::new();
+        let mut merged: Vec<jui_core::github::FetchedComment> = Vec::new();
         match jui_core::github::pr_comments(&pr.repo, pr.number).await {
             Ok(items) => merged.extend(items),
             Err(e) => warn!(repo = %pr.repo, number = pr.number, "issue comments fetch: {e:#}"),
@@ -1710,7 +1811,19 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
             Ok(items) => merged.extend(items),
             Err(e) => warn!(repo = %pr.repo, number = pr.number, "reviews fetch: {e:#}"),
         }
-        merged.sort_by(|a, b| a.1.cmp(&b.1));
+        // GraphQL pass — only the `review` kind comments belong to threads
+        // that can be resolved. Failures are non-fatal: comments still cache,
+        // just always marked unresolved.
+        if let Ok(map) = jui_core::github::review_thread_resolution_map(&pr.repo, pr.number).await {
+            for c in merged.iter_mut() {
+                if c.kind == "review" {
+                    if let Some(&resolved) = map.get(&c.id) {
+                        c.is_resolved = resolved;
+                    }
+                }
+            }
+        }
+        merged.sort_by(|a, b| a.created.cmp(&b.created));
         total_comments += merged.len();
         let _ = state.cache.lock().await.upsert_pr_comments(
             ticket_key,

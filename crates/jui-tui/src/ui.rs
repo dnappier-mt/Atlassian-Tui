@@ -56,6 +56,12 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Mode::ActiveStatusConfig(_) => draw_active_status_config(f, chunks[1], app),
         Mode::Settings(_) => draw_settings(f, chunks[1], app),
+        Mode::PrCommentReply(_) => {
+            // Render Detail underneath so the PR-comments context stays
+            // visible behind the modal.
+            draw_detail(f, chunks[1], app);
+            draw_pr_comment_reply(f, app);
+        }
     }
     if !matches!(&app.mode, Mode::PageView(_)) {
         draw_footer(f, chunks[2], app);
@@ -97,6 +103,7 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Mode::PrCreate(_) => "pr",
         Mode::ActiveStatusConfig(_) => "workflow",
         Mode::Settings(_) => "settings",
+        Mode::PrCommentReply(_) => "pr reply",
         Mode::ConfluencePages(form) => {
             conf_pages_label = if form.breadcrumb.is_empty() {
                 format!("confluence / {}", form.space_name)
@@ -1310,12 +1317,19 @@ fn project_link_item(item: &DetailLinkedProject, pending_unlink: bool) -> ListIt
 
 fn draw_detail_pr_comments(f: &mut Frame, area: Rect, app: &App) {
     let focused = app.detail_focus == DetailFocus::PrComments;
-    let count = app.pr_comments.len();
+    let visible_idxs = app.visible_pr_comments();
+    let hidden = app.hidden_pr_comment_count();
+    let visible_count = visible_idxs.len();
     let pr_url = app.pr_comments.first().map(|c| c.pr_url.clone()).unwrap_or_default();
-    let title = if pr_url.is_empty() {
-        format!(" PR comments ({}) ", count)
+    let title_count = if hidden > 0 {
+        format!("{visible_count} · {hidden} hidden")
     } else {
-        format!(" PR comments ({}) · {} ", count, pr_url)
+        format!("{visible_count}")
+    };
+    let title = if pr_url.is_empty() {
+        format!(" PR comments ({}) ", title_count)
+    } else {
+        format!(" PR comments ({}) · {} ", title_count, pr_url)
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1324,7 +1338,18 @@ fn draw_detail_pr_comments(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    if count == 0 {
+    if app.pr_comments.is_empty() {
+        return;
+    }
+    if visible_idxs.is_empty() {
+        // All comments are resolved + hidden — point the user at the toggle.
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                format!("  {hidden} resolved · press H to show"),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            )),
+            inner,
+        );
         return;
     }
 
@@ -1333,33 +1358,56 @@ fn draw_detail_pr_comments(f: &mut Frame, area: Rect, app: &App) {
     let viewport_h = inner.height as usize;
     let wrap_w = inner.width.saturating_sub(2) as usize;
     let mut all: Vec<Line> = Vec::new();
-    // Track which comment each rendered line belongs to so we can highlight
-    // the selected one.
+    // Track which *visible-list* index each rendered line belongs to.
     let mut owner: Vec<usize> = Vec::new();
-    for (i, c) in app.pr_comments.iter().enumerate() {
-        let header_style = if focused && i == app.pr_comment_selected {
+    for (visible_i, &real_idx) in visible_idxs.iter().enumerate() {
+        let c = &app.pr_comments[real_idx];
+        let resolved = c.is_resolved;
+        let is_reply = !c.in_reply_to_id.is_empty();
+        let selected = focused && visible_i == app.pr_comment_selected;
+        let header_style = if selected {
             Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+        } else if resolved {
+            // Dim resolved threads so they recede when the toggle is on.
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+        } else if is_reply {
+            Style::default().fg(Color::Rgb(140, 110, 180)).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::Rgb(180, 130, 220)).add_modifier(Modifier::BOLD)
         };
+        let body_style = if resolved {
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default()
+        };
         let date = c.created.split('T').next().unwrap_or(&c.created);
+        // Indent threaded replies one column-set so they read as nested.
+        let header_indent = if is_reply { "    " } else { "" };
+        let body_indent = if is_reply { "      " } else { "  " };
+        let arrow = if is_reply { "↳ " } else { "" };
+        let resolved_tag = if resolved { "✓ " } else { "" };
         all.push(Line::from(vec![
-            Span::styled(format!("@{} ", c.author), header_style),
+            Span::styled(
+                format!("{header_indent}{arrow}{resolved_tag}@{} ", c.author),
+                header_style,
+            ),
             Span::styled(format!("· {}", date), Style::default().fg(Color::DarkGray)),
         ]));
-        owner.push(i);
+        owner.push(visible_i);
         for ln in c.body.lines() {
             for chunk in wrap_line(ln, wrap_w.max(20)) {
-                all.push(Line::from(Span::raw(format!("  {}", chunk))));
-                owner.push(i);
+                all.push(Line::from(Span::styled(
+                    format!("{body_indent}{}", chunk),
+                    body_style,
+                )));
+                owner.push(visible_i);
             }
         }
         all.push(Line::from(""));
-        owner.push(i);
+        owner.push(visible_i);
     }
 
-    // Pick the start line so the selected comment's header is in view. If the
-    // user scrolled past it, snap up.
+    // Pick the start line so the selected comment's header is in view.
     let target_first_line = owner
         .iter()
         .position(|&o| o == app.pr_comment_selected)
@@ -2507,6 +2555,9 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             DetailFocus::PrComments => vec![
                 ("tab", "next pane"),
                 ("j/k", "move"),
+                ("r", "reply"),
+                ("R", "resolve thread"),
+                ("H", if app.show_resolved_pr_comments { "hide resolved" } else { "show resolved" }),
                 ("c", "ask claude"),
                 ("esc", "back"),
             ],
@@ -2633,6 +2684,12 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("y/enter", "confirm"),
             ("n/esc", "cancel"),
         ],
+        Mode::PrCommentReply(_) => vec![
+            ("type", "edit"),
+            ("←/→/↑/↓", "caret"),
+            ("F5/^S", "submit"),
+            ("esc", "cancel"),
+        ],
         Mode::PrCreate(form) => {
             if form.remote_pick.is_some() {
                 return vec![
@@ -2669,6 +2726,135 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             }
         }
     }
+}
+
+fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
+    use ratatui::layout::{Constraint, Direction, Layout};
+    let Mode::PrCommentReply(form) = &app.mode else { return };
+    let total = f.area();
+    let height = (total.height * 80 / 100).max(18).min(total.height.saturating_sub(2));
+    let width = (total.width * 70 / 100).max(60).min(total.width.saturating_sub(2));
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((total.height.saturating_sub(height)) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(total);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((total.width.saturating_sub(width)) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(v[1]);
+    let area = h[1];
+
+    f.render_widget(ratatui::widgets::Clear, area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(20, 20, 28))).borders(Borders::NONE),
+        area,
+    );
+
+    let kind_label = match form.parent_kind.as_str() {
+        "review" => " threaded review reply ",
+        "review_wrapper" => " new PR comment (review wrapper) ",
+        _ => " new PR comment ",
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Line::from(Span::styled(
+            kind_label,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Parent header — show who you're replying to and the body so the
+    // context is right above your draft.
+    lines.push(Line::from(vec![
+        Span::styled("  replying to ", Style::default().fg(Color::DarkGray)),
+        Span::styled(form.parent_author.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+    ]));
+    let wrap_w = inner.width.saturating_sub(4) as usize;
+    for ln in form.parent_body.lines().take(8) {
+        for chunk in wrap_line(ln, wrap_w.max(20)) {
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(chunk, Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    if form.parent_body.lines().count() > 8 {
+        lines.push(Line::from(Span::styled(
+            "  │ … (parent truncated)",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    }
+    lines.push(Line::from(""));
+
+    // Body editor with caret.
+    lines.push(Line::from(Span::styled(
+        "  your reply:",
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )));
+    {
+        let body = form.body.as_str();
+        let body_cursor = form.body_cursor.min(body.len());
+        let body_lines: Vec<&str> = if body.is_empty() {
+            vec![""]
+        } else {
+            let mut v: Vec<&str> = body.split('\n').collect();
+            if v.is_empty() { v.push(""); }
+            v
+        };
+        let mut offset = 0usize;
+        for ln in body_lines.iter() {
+            let line_end = offset + ln.len();
+            let mut spans = vec![Span::raw("  ")];
+            if body_cursor >= offset && body_cursor <= line_end {
+                let rel = body_cursor - offset;
+                let (pre, post) = ln.split_at(rel.min(ln.len()));
+                spans.push(Span::raw(pre.to_string()));
+                spans.push(Span::styled("▏", Style::default().fg(Color::Cyan)));
+                spans.push(Span::raw(post.to_string()));
+            } else {
+                spans.push(Span::raw((*ln).to_string()));
+            }
+            lines.push(Line::from(spans));
+            offset = line_end + 1;
+        }
+    }
+    lines.push(Line::from(""));
+
+    if let Some(err) = &form.error {
+        for ln in err.lines() {
+            for chunk in wrap_line(ln, wrap_w.max(20)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {}", chunk),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    if form.busy {
+        lines.push(Line::from(Span::styled(
+            "  posting…",
+            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+        )));
+    } else {
+        lines.push(Line::from(Span::styled(
+            "  Enter newline · F5 / Ctrl-S submit · Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_pr_create(f: &mut Frame, app: &App) {
