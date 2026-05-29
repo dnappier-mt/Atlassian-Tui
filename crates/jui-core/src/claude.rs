@@ -165,6 +165,50 @@ async fn run_claude_with_dirs(
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Ask Claude to tighten a PR body using the actual git diff as ground truth.
+/// `diff` may be empty (e.g. when daemon couldn't compute it) — prompt degrades
+/// gracefully. Returns the rewritten body, plain text/markdown.
+pub async fn improve_pr_body(title: &str, body: &str, diff: &str) -> Result<String> {
+    if which::which("claude").is_err() {
+        return Err(anyhow!("`claude` CLI not on PATH"));
+    }
+    let diff_section = if diff.trim().is_empty() {
+        "(diff unavailable — base description on the body alone)".to_string()
+    } else {
+        format!("```diff\n{diff}\n```")
+    };
+    let prompt = format!(
+        "You are tightening a pull-request description. Rewrite the body below so it \
+accurately summarizes what the diff actually changes, in a form a reviewer can scan \
+fast. Lead with the *why* and the user-visible effect, then the *what* (1–5 bullets \
+of the substantive changes). Drop filler, hedging, repetition, and obvious mechanics \
+(formatting, imports, renames) unless they're load-bearing. Do NOT invent facts not \
+supported by the diff or the original body. If the diff and body disagree, trust the \
+diff. Keep concrete details: file paths, function names, flag names, error strings, \
+ticket keys.\n\
+\n\
+# PR title (context only — do not modify)\n\
+{title}\n\
+\n\
+# Original body\n\
+{body}\n\
+\n\
+# Diff (ground truth)\n\
+{diff_section}\n\
+\n\
+# Output\n\
+Reply with ONLY the rewritten PR body — no preamble, no \"Sure, here's...\", no outer \
+code fences, no commentary. Plain markdown only.",
+        title = title,
+        body = body,
+        diff_section = diff_section,
+    );
+    let result = tokio::time::timeout(Duration::from_secs(180), run_claude(&prompt))
+        .await
+        .map_err(|_| anyhow!("claude timed out after 180s"))??;
+    Ok(result.trim().to_string())
+}
+
 /// Ask Claude to rewrite a Jira description more tightly. Returns the improved body
 /// as plain text (preserves blank lines / bullets if present). The summary is passed
 /// as context only — do not modify it.

@@ -147,6 +147,11 @@ impl JiraCli {
         Ok(())
     }
 
+    pub async fn edit_description(&self, key: &str, body: &str) -> Result<()> {
+        self.run_ok(&["issue", "edit", key, "-b", body, "--no-input"]).await?;
+        Ok(())
+    }
+
     pub async fn edit_priority(&self, key: &str, priority: &str) -> Result<()> {
         self.run_ok(&["issue", "edit", key, "-y", priority, "--no-input"]).await?;
         Ok(())

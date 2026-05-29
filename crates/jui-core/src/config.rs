@@ -39,6 +39,11 @@ pub struct JiraConfig {
     /// `[jira] reviewer_customfield = "customfield_10100"`.
     #[serde(default = "default_reviewer_field")]
     pub reviewer_customfield: String,
+    /// Custom-field id for the "DevQA" field. Empty string = feature off
+    /// (no auto-write to Jira ticket on PR create, no backfill). Discoverable
+    /// via `jira issue meta <key>` or your instance's field admin.
+    #[serde(default)]
+    pub devqa_customfield: String,
 }
 
 impl Default for JiraConfig {
@@ -47,6 +52,7 @@ impl Default for JiraConfig {
             binary: None,
             my_jql: default_my_jql(),
             reviewer_customfield: default_reviewer_field(),
+            devqa_customfield: String::new(),
         }
     }
 }
@@ -115,6 +121,12 @@ pub struct WorkflowConfig {
     /// terminal state. Empty string = no exclusion.
     #[serde(default = "default_all_mine_exclude_status")]
     pub all_mine_exclude_status: String,
+    /// Status to transition a ticket into after a successful PR submission.
+    /// Empty string disables the auto-transition (matches the legacy hardcoded
+    /// "any 'code review' transition" behavior — kept available for sites
+    /// without a custom status).
+    #[serde(default = "default_pr_submit_status")]
+    pub pr_submit_status: String,
 }
 
 impl Default for WorkflowConfig {
@@ -123,6 +135,7 @@ impl Default for WorkflowConfig {
             active_statuses: default_active_statuses(),
             default_create_status: default_create_status(),
             all_mine_exclude_status: default_all_mine_exclude_status(),
+            pr_submit_status: default_pr_submit_status(),
         }
     }
 }
@@ -146,6 +159,10 @@ fn default_create_status() -> String {
 
 fn default_all_mine_exclude_status() -> String {
     "Firmware Closed".to_string()
+}
+
+fn default_pr_submit_status() -> String {
+    "Firmware Code Review".to_string()
 }
 
 /// Per-repo override loaded from `.jui.toml` if present.

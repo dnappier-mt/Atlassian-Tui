@@ -134,6 +134,7 @@ pub struct SettingsForm {
     pub selected: usize,
     pub default_create_status: String,
     pub all_mine_exclude_status: String,
+    pub pr_submit_status: String,
     /// `Some` while the picker overlay is open.
     pub picker: Option<StatusPicker>,
 }
@@ -167,7 +168,7 @@ impl StatusPicker {
 }
 
 impl SettingsForm {
-    pub const ROW_COUNT: usize = 2;
+    pub const ROW_COUNT: usize = 3;
 }
 
 pub struct ActiveStatusForm {
@@ -439,12 +440,14 @@ pub struct StartWorkPromptForm {
     pub priority: String,
     pub need_time: bool,
     pub need_priority: bool,
-    /// 0 → time, 1 → priority. Skipped fields aren't part of cycling.
+    /// 0 → location, 1 → time, 2 → priority. Skipped fields drop out of cycling.
     pub field: u8,
     pub error: Option<String>,
     /// Valid priorities for this Jira instance (live-fetched). Used both as a hint
     /// and to validate the user's input before sending.
     pub valid_priorities: Vec<String>,
+    /// Where to land the checkout: worktree (default) or branch in main repo.
+    pub location: jui_core::scm::WorkLocation,
 }
 
 pub struct EditPriorityForm {
@@ -832,6 +835,10 @@ pub struct App {
     /// `GlobalConfig.workflow.all_mine_exclude_status`; editable from
     /// `Mode::Settings`.
     pub all_mine_exclude_status: String,
+    /// Status the daemon transitions a ticket into after a successful PR
+    /// submission. Mirrors `GlobalConfig.workflow.pr_submit_status`; editable
+    /// from `Mode::Settings`.
+    pub pr_submit_status: String,
     /// When true, the next `refresh()` uses an "all my tickets" JQL that drops
     /// the `statusCategory != Done` filter and replaces it with a single
     /// `status != "<all_mine_exclude_status>"` clause. Off by default.
@@ -961,6 +968,10 @@ impl App {
                 .unwrap_or_default()
                 .workflow
                 .all_mine_exclude_status,
+            pr_submit_status: jui_core::config::GlobalConfig::load()
+                .unwrap_or_default()
+                .workflow
+                .pr_submit_status,
             show_all_mine: false,
             pr_user_states: std::collections::HashMap::new(),
             show_completed_prs: false,
@@ -1607,31 +1618,29 @@ impl App {
             None | Some("") | Some("--") | Some("None") => true,
             _ => false,
         };
-        if need_time || need_priority {
-            // Fetch valid priorities so the prompt shows correct examples for this
-            // instance (some Jiras use Blocker/P1/P2/P3 instead of Highest/High/...).
-            let valid_priorities = if need_priority {
-                let mut s = ipc::connect().await?;
-                match ipc::send_request(&mut s, &Request::ListPriorities).await? {
-                    Response::Priorities { items } => items,
-                    _ => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
-            self.mode = Mode::StartWorkPrompt(StartWorkPromptForm {
-                ticket_key: t.key.clone(),
-                time_estimate: String::new(),
-                priority: String::new(),
-                need_time,
-                need_priority,
-                field: if need_time { 0 } else { 1 },
-                error: None,
-                valid_priorities,
-            });
-            return Ok(());
-        }
-        self.execute_start_work().await
+        // Always open the prompt so the user can pick worktree vs branch-in-repo,
+        // even when time/priority are already filled in.
+        let valid_priorities = if need_priority {
+            let mut s = ipc::connect().await?;
+            match ipc::send_request(&mut s, &Request::ListPriorities).await? {
+                Response::Priorities { items } => items,
+                _ => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        self.mode = Mode::StartWorkPrompt(StartWorkPromptForm {
+            ticket_key: t.key.clone(),
+            time_estimate: String::new(),
+            priority: String::new(),
+            need_time,
+            need_priority,
+            field: 0,
+            error: None,
+            valid_priorities,
+            location: jui_core::scm::WorkLocation::Worktree,
+        });
+        Ok(())
     }
 
     /// Move the current ticket back to Backlog and pop a Comment form so the user can
@@ -1688,6 +1697,7 @@ impl App {
         let key = form.ticket_key.clone();
         let estimate = if form.need_time { trim_to_opt(&form.time_estimate) } else { None };
         let priority = if form.need_priority { trim_to_opt(&form.priority) } else { None };
+        let location = form.location;
 
         // Validate priority against the instance's actual list before sending —
         // saves a round-trip and gives a much better error message.
@@ -1743,14 +1753,28 @@ impl App {
         // Reload ticket so subsequent steps see the new values.
         self.load_detail().await?;
         self.mode = Mode::Detail;
-        self.execute_start_work().await
+        self.execute_start_work(location).await
     }
 
-    async fn execute_start_work(&mut self) -> Result<()> {
+    async fn execute_start_work(&mut self, location: jui_core::scm::WorkLocation) -> Result<()> {
+        // Append-only debug log so we can diagnose silent failures of this flow.
+        let dbg = |msg: &str| {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true).append(true)
+                .open("/tmp/jui-startwork.log")
+            {
+                let _ = writeln!(f, "{} {msg}", chrono::Utc::now().to_rfc3339());
+            }
+        };
+        dbg(&format!("=== execute_start_work location={:?} ===", location));
         let Some(t) = self.detail.clone().or_else(|| self.current_ticket().cloned()) else {
+            dbg("no ticket in detail/current — bailing");
+            self.status = "start-work: no ticket selected".into();
             return Ok(());
         };
         let key = t.key.clone();
+        dbg(&format!("ticket key={key} status={:?}", t.status));
         let mut status_parts: Vec<String> = Vec::new();
 
         // 1. Transition to "In Dev" (best-effort).
@@ -1787,33 +1811,55 @@ impl App {
         // ticket's linked project (cached); `cwd` is only the fallback when
         // the ticket has no linked project on file.
         let cwd = std::env::current_dir()?;
+        dbg(&format!("sending StartWork key={key} cwd={} location={:?}", cwd.display(), location));
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::StartWork { key: key.clone(), cwd },
+            &Request::StartWork { key: key.clone(), cwd, location },
         )
         .await?;
-        let mut worktree_path: Option<std::path::PathBuf> = None;
-        if let Response::StartWork { reply } = &resp {
-            let part = match reply {
-                StartWorkReply::GitWorktree { branch, path, created_branch, attached_existing_worktree } => {
-                    worktree_path = Some(path.clone());
-                    let action = if *attached_existing_worktree { "reused" }
-                        else if *created_branch { "created" }
-                        else { "attached" };
-                    format!("worktree {action} {branch} → {}", path.display())
-                }
-                StartWorkReply::SvnExport { value } => format!("svn export {value}"),
-                StartWorkReply::NoScm => "no SCM".into(),
-            };
-            status_parts.push(part);
-        } else if let Response::Err { message } = resp {
-            self.status = format!("scm err: {message}");
-            return Ok(());
+        dbg(&format!("StartWork resp={:?}", resp));
+        // Path Claude should launch in: worktree dir for worktree mode, repo root for branch-in-repo.
+        let mut launch_path: Option<std::path::PathBuf> = None;
+        let mut used_branch_in_repo = false;
+        match &resp {
+            Response::StartWork { reply } => {
+                let part = match reply {
+                    StartWorkReply::GitWorktree { branch, path, created_branch, attached_existing_worktree } => {
+                        launch_path = Some(path.clone());
+                        let action = if *attached_existing_worktree { "reused" }
+                            else if *created_branch { "created" }
+                            else { "attached" };
+                        format!("worktree {action} {branch} → {}", path.display())
+                    }
+                    StartWorkReply::GitBranchInRepo { branch, path, created_branch, already_on_branch } => {
+                        launch_path = Some(path.clone());
+                        used_branch_in_repo = true;
+                        let action = if *already_on_branch { "already on" }
+                            else if *created_branch { "created" }
+                            else { "checked out" };
+                        format!("repo {action} {branch} → {}", path.display())
+                    }
+                    StartWorkReply::SvnExport { value } => format!("svn export {value}"),
+                    StartWorkReply::NoScm => "no SCM".into(),
+                };
+                status_parts.push(part);
+            }
+            Response::Err { message } => {
+                let prior = if status_parts.is_empty() { String::new() } else { format!("{} · ", status_parts.join(" · ")) };
+                self.status = format!("{prior}start-work failed: {message}");
+                dbg(&format!("daemon err: {message}"));
+                return Ok(());
+            }
+            other => {
+                self.status = format!("start-work: unexpected daemon response {other:?}");
+                dbg(&format!("unexpected daemon resp: {other:?}"));
+                return Ok(());
+            }
         }
 
-        // 2b. Open a tmux pane in the worktree dir, if we got one and we're inside tmux.
-        if let Some(path) = worktree_path {
+        // 2b. Open a tmux pane in the checkout dir, if we got one and we're inside tmux.
+        if let Some(path) = &launch_path {
             if std::env::var("TMUX").is_ok() {
                 let st = std::process::Command::new("tmux")
                     .args(["split-window", "-h", "-c", &path.to_string_lossy()])
@@ -1828,20 +1874,33 @@ impl App {
             }
         }
 
-        // 3. Find a linked project to cd into.
+        // 3. Find a linked project to cd into. For branch-in-repo mode we cd
+        // straight into the repo root (where the branch lives); for worktree mode
+        // we keep the existing behavior of preferring the first linked project.
         let project_paths: Vec<std::path::PathBuf> = self
             .detail_linked_projects
             .iter()
             .filter(|p| p.project.available)
             .map(|p| p.project.path.clone())
             .collect();
-        let Some(top) = project_paths.first().cloned() else {
+        dbg(&format!(
+            "project_paths={:?} used_branch_in_repo={} launch_path={:?}",
+            project_paths, used_branch_in_repo, launch_path
+        ));
+        let top = if used_branch_in_repo {
+            launch_path.clone().or_else(|| project_paths.first().cloned())
+        } else {
+            project_paths.first().cloned()
+        };
+        let Some(top) = top else {
             self.status = format!(
                 "{} · no linked project available — link one (P) and retry",
                 status_parts.join(" · ")
             );
+            dbg("no top path — bailing");
             return Ok(());
         };
+        dbg(&format!("top={}", top.display()));
 
         // 4. Get or create the Claude session id.
         let mut s = ipc::connect().await?;
@@ -2159,9 +2218,9 @@ impl App {
     /// `PrCreateForm.suggestion` for the user to accept/reject. No-op when
     /// not in `PrCreate` or the body is empty.
     pub async fn improve_pr_body(&mut self) -> Result<()> {
-        let (title, body) = {
+        let (ticket_key, title, body) = {
             let Mode::PrCreate(f) = &self.mode else { return Ok(()) };
-            (f.title.clone(), f.body.clone())
+            (f.key.clone(), f.title.clone(), f.body.clone())
         };
         if body.trim().is_empty() {
             self.status = "nothing to improve — body empty".into();
@@ -2173,14 +2232,14 @@ impl App {
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_pr_body_improve = Some(rx);
-        self.status = "asking claude to tighten PR body…".into();
-        // Reuse ImproveDescription on the daemon — same semantics: rewrite a
-        // free-form body, keep facts, drop filler. Title doubles as context
-        // (the daemon's prompt names it "Summary").
+        self.status = "asking claude to tighten PR body (with diff)…".into();
+        // Daemon resolves the ticket's worktree, runs `git diff <base>...HEAD`
+        // and passes it to Claude alongside title+body so the rewrite reflects
+        // the actual change.
         tokio::spawn(async move {
             let result: anyhow::Result<String> = async {
                 let mut s = ipc::connect().await?;
-                let req = Request::ImproveDescription { summary: title, body };
+                let req = Request::ImprovePrBody { ticket_key, title, body };
                 match ipc::send_request(&mut s, &req).await? {
                     Response::Improved { body } => Ok(body),
                     Response::Err { message } => Err(anyhow::anyhow!("{message}")),
@@ -3978,6 +4037,7 @@ change, look for regressions, and report findings to me directly here.
             selected: 0,
             default_create_status: self.default_create_status.clone(),
             all_mine_exclude_status: self.all_mine_exclude_status.clone(),
+            pr_submit_status: self.pr_submit_status.clone(),
             picker: None,
         });
         self.status = "settings — i/enter: pick status · j/k: move · esc: close".into();
@@ -3991,6 +4051,7 @@ change, look for regressions, and report findings to me directly here.
             let cur = match form.selected {
                 0 => form.default_create_status.clone(),
                 1 => form.all_mine_exclude_status.clone(),
+                2 => form.pr_submit_status.clone(),
                 _ => String::new(),
             };
             (form.selected, cur)
@@ -4043,17 +4104,23 @@ change, look for regressions, and report findings to me directly here.
     /// Persist the current settings form back to `GlobalConfig.workflow` and
     /// refresh the cached fields on `App`.
     pub fn save_settings(&mut self) -> Result<()> {
-        let (create, exclude) = if let Mode::Settings(form) = &self.mode {
-            (form.default_create_status.clone(), form.all_mine_exclude_status.clone())
+        let (create, exclude, pr_submit) = if let Mode::Settings(form) = &self.mode {
+            (
+                form.default_create_status.clone(),
+                form.all_mine_exclude_status.clone(),
+                form.pr_submit_status.clone(),
+            )
         } else {
             return Ok(());
         };
         let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
         cfg.workflow.default_create_status = create.clone();
         cfg.workflow.all_mine_exclude_status = exclude.clone();
+        cfg.workflow.pr_submit_status = pr_submit.clone();
         cfg.save()?;
         self.default_create_status = create;
         self.all_mine_exclude_status = exclude;
+        self.pr_submit_status = pr_submit;
         Ok(())
     }
 
@@ -5435,6 +5502,7 @@ async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Resu
                 let label = match row {
                     0 => { form.default_create_status = val.clone(); "default-create" }
                     1 => { form.all_mine_exclude_status = val.clone(); "all-mine-exclude" }
+                    2 => { form.pr_submit_status = val.clone(); "pr-submit" }
                     _ => "",
                 };
                 let l = label.to_string();
@@ -6801,29 +6869,47 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             KeyCode::Char('R') => { app.regenerate_implementation().await?; }
             _ => {}
         },
-        Mode::StartWorkPrompt(form) => match code {
-            KeyCode::Esc => app.mode = Mode::Detail,
-            KeyCode::Tab | KeyCode::BackTab => {
-                // Toggle between time and priority fields if both are needed.
-                if form.need_time && form.need_priority {
-                    form.field = if form.field == 0 { 1 } else { 0 };
+        Mode::StartWorkPrompt(form) => {
+            // Cycle order: 0 (location) → 1 (time, if needed) → 2 (priority, if needed) → 0
+            let visible: Vec<u8> = {
+                let mut v = vec![0u8];
+                if form.need_time { v.push(1); }
+                if form.need_priority { v.push(2); }
+                v
+            };
+            let cycle = |cur: u8, forward: bool| -> u8 {
+                let i = visible.iter().position(|&f| f == cur).unwrap_or(0);
+                let n = visible.len();
+                let next = if forward { (i + 1) % n } else { (i + n - 1) % n };
+                visible[next]
+            };
+            match code {
+                KeyCode::Esc => app.mode = Mode::Detail,
+                KeyCode::Tab => { form.field = cycle(form.field, true); }
+                KeyCode::BackTab => { form.field = cycle(form.field, false); }
+                KeyCode::F(5) => { app.submit_start_work_prompt().await?; }
+                KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                    app.submit_start_work_prompt().await?;
                 }
+                KeyCode::Enter => { app.submit_start_work_prompt().await?; }
+                // Location field — arrows or space toggle worktree ↔ branch-in-repo.
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 0 => {
+                    form.location = match form.location {
+                        jui_core::scm::WorkLocation::Worktree => jui_core::scm::WorkLocation::BranchInRepo,
+                        jui_core::scm::WorkLocation::BranchInRepo => jui_core::scm::WorkLocation::Worktree,
+                    };
+                }
+                KeyCode::Backspace if form.field != 0 => {
+                    let target = if form.field == 1 { &mut form.time_estimate } else { &mut form.priority };
+                    target.pop();
+                }
+                KeyCode::Char(c) if form.field != 0 => {
+                    let target = if form.field == 1 { &mut form.time_estimate } else { &mut form.priority };
+                    target.push(c);
+                }
+                _ => {}
             }
-            KeyCode::F(5) => { app.submit_start_work_prompt().await?; }
-            KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
-                app.submit_start_work_prompt().await?;
-            }
-            KeyCode::Enter => { app.submit_start_work_prompt().await?; }
-            KeyCode::Backspace => {
-                let target = if form.field == 0 { &mut form.time_estimate } else { &mut form.priority };
-                target.pop();
-            }
-            KeyCode::Char(c) => {
-                let target = if form.field == 0 { &mut form.time_estimate } else { &mut form.priority };
-                target.push(c);
-            }
-            _ => {}
-        },
+        }
         Mode::EditPriority(form) => match code {
             KeyCode::Esc => app.mode = Mode::Detail,
             KeyCode::Char('j') | KeyCode::Down => {

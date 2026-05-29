@@ -618,6 +618,27 @@ pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<FetchedComment>> 
     Ok(all)
 }
 
+/// PR body markdown (`gh pr view -R <repo> <num> --json body -q .body`).
+pub async fn pr_body(repo: &str, number: u64) -> Result<String> {
+    let out = Command::new("gh")
+        .args([
+            "pr", "view", &number.to_string(),
+            "-R", repo,
+            "--json", "body",
+            "-q", ".body",
+        ])
+        .output()
+        .await
+        .context("running gh pr view (body)")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh pr view (body) failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 /// PR author's GitHub login (`gh pr view -R <repo> <num> --json author -q .author.login`).
 pub async fn pr_author_login(repo: &str, number: u64) -> Result<String> {
     let out = Command::new("gh")

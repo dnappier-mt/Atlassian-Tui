@@ -119,9 +119,26 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             &conf_pages_label
         }
     };
-    let title = format!(" jui — {}  |  {}", mode, app.status);
-    let p = Paragraph::new(title).style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD));
-    f.render_widget(p, area);
+    let cyan_bold = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let prefix = format!(" jui — {}  |  ", mode);
+    // Heuristic: surface error-shaped status messages in bold red so silent
+    // failures (e.g. dirty-tree start-work) stop hiding in the noise.
+    let s_lc = app.status.to_ascii_lowercase();
+    let is_err = s_lc.contains(" err:")
+        || s_lc.starts_with("err:")
+        || s_lc.contains("failed")
+        || s_lc.contains("error:")
+        || s_lc.contains("unexpected");
+    let status_span = if is_err {
+        Span::styled(
+            app.status.clone(),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(app.status.clone(), cyan_bold)
+    };
+    let line = Line::from(vec![Span::styled(prefix, cyan_bold), status_span]);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 fn draw_list(f: &mut Frame, area: Rect, app: &App) {
@@ -1947,9 +1964,10 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rows: [(&str, &str); 2] = [
+    let rows: [(&str, &str); 3] = [
         ("Default create status", form.default_create_status.as_str()),
         ("All-mine exclude status", form.all_mine_exclude_status.as_str()),
+        ("PR submit status", form.pr_submit_status.as_str()),
     ];
 
     let mut items: Vec<ListItem> = Vec::new();
@@ -2246,14 +2264,44 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
 
     let mut lines = vec![
         Line::from(Span::styled(
-            "before launching claude, please fill in the missing field(s):",
+            "configure the start-work checkout, then submit:",
             Style::default().fg(Color::Cyan),
         )),
         Line::from(""),
     ];
+
+    // Location row (always shown).
+    let loc_selected = form.field == 0;
+    let label_style = if loc_selected {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let wt_active = matches!(form.location, jui_core::scm::WorkLocation::Worktree);
+    let br_active = matches!(form.location, jui_core::scm::WorkLocation::BranchInRepo);
+    let opt_style = |active: bool| {
+        if active {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+    lines.push(Line::from(vec![
+        Span::styled("location  ", label_style),
+        Span::styled(if wt_active { "[●] worktree" } else { "[ ] worktree" }, opt_style(wt_active)),
+        Span::raw("   "),
+        Span::styled(if br_active { "[●] branch in repo" } else { "[ ] branch in repo" }, opt_style(br_active)),
+    ]));
+    if loc_selected {
+        lines.push(Line::from(Span::styled(
+            "  ←/→ or space to toggle. branch-in-repo aborts if working tree is dirty.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     if form.need_time {
-        lines.push(field_line("estimate  ", &form.time_estimate, form.field == 0));
-        if form.field == 0 {
+        lines.push(field_line("estimate  ", &form.time_estimate, form.field == 1));
+        if form.field == 1 {
             lines.push(Line::from(Span::styled(
                 "  examples: 8h, 2d 4h, 30m",
                 Style::default().fg(Color::DarkGray),
@@ -2261,8 +2309,8 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     if form.need_priority {
-        lines.push(field_line("priority  ", &form.priority, form.field == 1));
-        if form.field == 1 {
+        lines.push(field_line("priority  ", &form.priority, form.field == 2));
+        if form.field == 2 {
             let hint = if form.valid_priorities.is_empty() {
                 "  examples: Highest, High, Medium, Low, Lowest".to_string()
             } else {

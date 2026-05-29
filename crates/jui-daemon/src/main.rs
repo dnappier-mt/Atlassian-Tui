@@ -330,7 +330,7 @@ async fn dispatch(
             Ok(Response::Ok)
         }
 
-        Request::StartWork { key, cwd } => {
+        Request::StartWork { key, cwd, location } => {
             let ticket = match state.jira.view(&key).await {
                 Ok(t) => t,
                 Err(_) => state
@@ -356,7 +356,7 @@ async fn dispatch(
                 .next()
                 .unwrap_or(cwd);
             let repo = scm::detect(&scm_anchor);
-            let outcome = scm::start_work(&repo, &key, &slug)?;
+            let outcome = scm::start_work(&repo, &key, &slug, location)?;
             let reply = match outcome {
                 scm::StartWorkOutcome::GitWorktree {
                     branch,
@@ -368,6 +368,17 @@ async fn dispatch(
                     path,
                     created_branch,
                     attached_existing_worktree,
+                },
+                scm::StartWorkOutcome::GitBranchInRepo {
+                    branch,
+                    path,
+                    created_branch,
+                    already_on_branch,
+                } => StartWorkReply::GitBranchInRepo {
+                    branch,
+                    path,
+                    created_branch,
+                    already_on_branch,
                 },
                 scm::StartWorkOutcome::SvnExport { value } => StartWorkReply::SvnExport { value },
                 scm::StartWorkOutcome::NoScm => StartWorkReply::NoScm,
@@ -1016,6 +1027,41 @@ async fn dispatch(
             Ok(Response::Improved { body: improved })
         }
 
+        Request::ImprovePrBody { ticket_key, title, body } => {
+            // Resolve a working dir for the diff: per-ticket worktree if it
+            // exists, otherwise the first linked project root. Empty `diff`
+            // falls through to a diff-less prompt rather than erroring — user
+            // still gets a tighten, just without ground truth.
+            let project_path = {
+                let cache = state.cache.lock().await;
+                cache.linked_paths(&ticket_key)?.into_iter().next()
+            };
+            let ticket = match state.jira.view(&ticket_key).await {
+                Ok(t) => Some(t),
+                Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
+            };
+            let work_dir: Option<std::path::PathBuf> = project_path.map(|p| {
+                ticket
+                    .as_ref()
+                    .and_then(|t| jui_core::scm::worktree_path_for_slug(&p, &t.branch_slug()))
+                    .filter(|w| w.exists())
+                    .unwrap_or(p)
+            });
+            let diff = work_dir
+                .as_deref()
+                .and_then(|d| pr_diff_against_default(d).ok())
+                .unwrap_or_default();
+            info!(
+                title_len = title.len(),
+                body_len = body.len(),
+                diff_len = diff.len(),
+                "claude pr-tighten requested"
+            );
+            let improved = jui_core::claude::improve_pr_body(&title, &body, &diff).await?;
+            info!(out_len = improved.len(), "claude pr-tighten done");
+            Ok(Response::Improved { body: improved })
+        }
+
         Request::EditPriority { key, priority } => {
             // Priority via REST: jira-cli's `-y` flag is rejected by some Jira
             // instances. The REST PUT endpoint reliably accepts {"name": ...}.
@@ -1520,19 +1566,50 @@ async fn create_pull_request(
         warn!(%ticket_key, "add_comment after PR failed: {e:#}");
     }
 
-    // 7. Transition to Code Review.
+    // 7. Transition to the configured PR-submit status (default "Firmware
+    //    Code Review"). Empty string disables; otherwise prefer an exact
+    //    case-insensitive match on `to_status`, then a substring fallback so
+    //    older configs ("code review") still resolve.
+    let cfg = GlobalConfig::load().unwrap_or_default();
     let api = JiraApi::from_jira_cli_config()?;
-    let transitions = api.list_transitions(ticket_key).await.unwrap_or_default();
-    let target = transitions.iter().find(|tr| {
-        tr.to_status.as_deref().map(|s| s.eq_ignore_ascii_case("code review")).unwrap_or(false)
-            || tr.name.to_ascii_lowercase().contains("code review")
-    });
-    if let Some(tr) = target {
-        if let Err(e) = state.jira.transition(ticket_key, &tr.name).await {
-            warn!(%ticket_key, "transition to Code Review failed: {e:#}");
+    let target_status = cfg.workflow.pr_submit_status.trim();
+    if !target_status.is_empty() {
+        let transitions = api.list_transitions(ticket_key).await.unwrap_or_default();
+        let target = transitions
+            .iter()
+            .find(|tr| {
+                tr.to_status
+                    .as_deref()
+                    .map(|s| s.eq_ignore_ascii_case(target_status))
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                let needle = target_status.to_ascii_lowercase();
+                transitions
+                    .iter()
+                    .find(|tr| tr.name.to_ascii_lowercase().contains(&needle))
+            });
+        if let Some(tr) = target {
+            if let Err(e) = state.jira.transition(ticket_key, &tr.name).await {
+                warn!(%ticket_key, %target_status, "transition failed: {e:#}");
+            }
+        } else {
+            warn!(%ticket_key, %target_status, "no matching transition available");
         }
-    } else {
-        warn!(%ticket_key, "no Code Review transition available");
+    }
+
+    // 7b. Write the picked DevQA back to the Jira ticket's custom field so
+    //     the assignment isn't only a comment + PR @-mention. Skipped when
+    //     the customfield id is unconfigured or no DevQA was picked.
+    let devqa_field = cfg.jira.devqa_customfield.trim();
+    if !devqa_field.is_empty() {
+        if let Some(qid) = devqa_account_id {
+            if let Err(e) = api.set_reviewer(ticket_key, qid, devqa_field).await {
+                warn!(%ticket_key, %devqa_field, "set DevQA on Jira failed: {e:#}");
+            } else {
+                info!(%ticket_key, %qid, "DevQA written to Jira customfield");
+            }
+        }
     }
 
     // 8. Async cache refresh.
@@ -1721,6 +1798,13 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     prs.retain(|p| seen.insert(p.url.clone()));
 
+    // Pull the user-configured terminal status (e.g. "Firmware Closed") so
+    // boards that don't use plain "Closed"/"Done" still get filtered.
+    let extra_excluded = GlobalConfig::load()
+        .ok()
+        .map(|c| c.workflow.all_mine_exclude_status.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty());
+
     let mut keys: Vec<String> = Vec::new();
     let mut tickets_to_cache: Vec<jui_core::ticket::Ticket> = Vec::new();
     // (ticket_key, pr) — used after we drop the cache lock to fetch comments.
@@ -1740,7 +1824,7 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
         let closed = matches!(
             status_lc.as_str(),
             "done" | "resolved" | "closed" | "archive" | "archived" | "won't do" | "wont do" | "cancelled" | "canceled"
-        );
+        ) || extra_excluded.as_deref() == Some(status_lc.as_str());
         if closed { continue; }
         // Cache the freshly-viewed ticket if we just fetched it.
         if state.cache.lock().await.get_ticket(&key)?.is_none() {
@@ -1783,6 +1867,59 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
         let _ = cache.upsert_mentions("authored", &authored_keys);
         for (k, pr) in &authored_pr_for_key {
             let _ = cache.upsert_ticket_pr(k, &pr.url, pr.number, &pr.repo);
+        }
+    }
+
+    // Backfill missing DevQA on tickets for authored PRs. Only runs when the
+    // user has configured `jira.devqa_customfield`. For each authored PR:
+    //   1. Read ticket's DevQA field via REST.
+    //   2. If empty, fetch PR body and grep for `DevQA: @<handle>`.
+    //   3. Reverse-look-up the handle against the users_map to get a Jira
+    //      account id, then PUT it onto the ticket field.
+    // Failures here are logged + skipped; this is best-effort housekeeping.
+    let cfg_for_backfill = GlobalConfig::load().unwrap_or_default();
+    let devqa_field = cfg_for_backfill.jira.devqa_customfield.trim().to_string();
+    if !devqa_field.is_empty() {
+        use jui_core::users_map::UsersMap;
+        let users_map = UsersMap::load().unwrap_or_default();
+        let api = match JiraApi::from_jira_cli_config() {
+            Ok(a) => Some(a),
+            Err(e) => {
+                warn!("devqa backfill skipped — jira-cli config unreadable: {e:#}");
+                None
+            }
+        };
+        if let Some(api) = api {
+            for (key, pr) in &authored_pr_for_key {
+                // Skip work if the field is already populated.
+                match api.user_custom_field(key, &devqa_field).await {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(%key, "devqa backfill read failed: {e:#}");
+                        continue;
+                    }
+                }
+                let body = match jui_core::github::pr_body(&pr.repo, pr.number).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(%key, repo = %pr.repo, num = pr.number, "devqa backfill body fetch failed: {e:#}");
+                        continue;
+                    }
+                };
+                let handle = match parse_devqa_handle(&body) {
+                    Some(h) => h,
+                    None => continue,
+                };
+                let Some(account_id) = users_map.lookup_by_handle(&handle) else {
+                    warn!(%key, %handle, "devqa backfill: no jira account mapped for @<handle>; add via PR-create picker");
+                    continue;
+                };
+                match api.set_reviewer(key, account_id, &devqa_field).await {
+                    Ok(_) => info!(%key, %handle, %account_id, "devqa backfilled on Jira ticket"),
+                    Err(e) => warn!(%key, %account_id, "devqa backfill set failed: {e:#}"),
+                }
+            }
         }
     }
 
@@ -2087,3 +2224,115 @@ async fn tmux_status_loop(state: Arc<State>) {
 
 #[allow(dead_code)]
 fn _unused(_p: PathBuf) {}
+
+/// Pull the GitHub handle out of the first `DevQA: @<handle>` line in a PR
+/// body, case-insensitive on the label. Returns `None` if the line is missing
+/// or malformed. The label is exactly what `create_pull_request` writes, so
+/// PRs opened through jui will always match.
+fn parse_devqa_handle(body: &str) -> Option<String> {
+    for raw in body.lines() {
+        let line = raw.trim_start_matches(['>', ' ', '\t']).trim();
+        let lower = line.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("devqa:") {
+            let rest_idx = line.len() - rest.len();
+            let after = line[rest_idx..].trim();
+            let handle = after
+                .trim_start_matches('@')
+                .split(|c: char| c.is_whitespace() || c == ',' || c == ';')
+                .next()
+                .unwrap_or("");
+            if !handle.is_empty() {
+                return Some(handle.to_string());
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod parse_devqa_tests {
+    use super::parse_devqa_handle;
+
+    #[test]
+    fn plain_line() {
+        assert_eq!(parse_devqa_handle("DevQA: @alice"), Some("alice".into()));
+    }
+    #[test]
+    fn lowercase_label() {
+        assert_eq!(parse_devqa_handle("devqa: @bob"), Some("bob".into()));
+    }
+    #[test]
+    fn with_surrounding_text() {
+        let body = "Summary line.\n\nDevQA: @carol\n\nFooter.";
+        assert_eq!(parse_devqa_handle(body), Some("carol".into()));
+    }
+    #[test]
+    fn missing() {
+        assert_eq!(parse_devqa_handle("nothing here"), None);
+    }
+    #[test]
+    fn no_handle_after_colon() {
+        assert_eq!(parse_devqa_handle("DevQA:"), None);
+    }
+}
+
+/// Compute `git diff <default-base>...HEAD` for `repo`, where the default base
+/// is read from `origin/HEAD` (falls back to `origin/develop`, then `origin/main`).
+/// Output is capped so a huge refactor diff doesn't blow Claude's context. Returns
+/// an `Err` only when no usable base could be found; truncation is communicated
+/// in the returned string itself.
+fn pr_diff_against_default(repo: &std::path::Path) -> Result<String> {
+    use std::process::Command;
+    const MAX_DIFF_BYTES: usize = 80_000;
+
+    let default_via_origin_head = Command::new("git")
+        .current_dir(repo)
+        .args(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    let candidates: Vec<String> = {
+        let mut v = Vec::new();
+        if let Some(s) = default_via_origin_head { v.push(s); }
+        v.push("origin/develop".into());
+        v.push("origin/main".into());
+        v.push("origin/master".into());
+        v
+    };
+
+    let base = candidates.into_iter().find(|b| {
+        Command::new("git")
+            .current_dir(repo)
+            .args(["rev-parse", "--verify", "--quiet"])
+            .arg(b)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    });
+    let Some(base) = base else {
+        return Err(anyhow::anyhow!("no usable base branch (origin/HEAD, develop, main, master)"));
+    };
+
+    let range = format!("{base}...HEAD");
+    let out = Command::new("git")
+        .current_dir(repo)
+        .args(["diff", "--no-color", "-M", "-C"])
+        .arg(&range)
+        .output()
+        .context("running git diff")?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "git diff {range} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
+    if s.len() > MAX_DIFF_BYTES {
+        s.truncate(MAX_DIFF_BYTES);
+        s.push_str("\n\n[diff truncated]\n");
+    }
+    Ok(s)
+}

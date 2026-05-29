@@ -42,6 +42,16 @@ impl UsersMap {
         self.github_handles.get(account_id).map(|s| s.as_str())
     }
 
+    /// Reverse lookup: find a Jira `account_id` for a given GitHub handle.
+    /// Case-insensitive on the handle since GitHub itself folds case.
+    pub fn lookup_by_handle(&self, handle: &str) -> Option<&str> {
+        let needle = handle.trim_start_matches('@').to_ascii_lowercase();
+        self.github_handles
+            .iter()
+            .find(|(_, h)| h.to_ascii_lowercase() == needle)
+            .map(|(id, _)| id.as_str())
+    }
+
     pub fn set(&mut self, account_id: &str, handle: &str) {
         // Strip a leading @ in case the user typed it.
         let h = handle.trim_start_matches('@').to_string();

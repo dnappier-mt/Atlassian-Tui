@@ -42,10 +42,32 @@ pub enum StartWorkOutcome {
         created_branch: bool,
         attached_existing_worktree: bool,
     },
+    /// Branch checked out in the main repo (no worktree). `path` is the repo root.
+    /// `created_branch` is true when no existing branch matched the ticket key.
+    /// `already_on_branch` is true when HEAD was already on the target branch.
+    GitBranchInRepo {
+        branch: String,
+        path: PathBuf,
+        created_branch: bool,
+        already_on_branch: bool,
+    },
     /// Caller is in an SVN repo. Shell needs to export the env var.
     SvnExport { value: String },
     /// No SCM detected — caller can record the association anyway.
     NoScm,
+}
+
+/// Where to land the start-work checkout: a separate worktree (default) or the
+/// main repo itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkLocation {
+    Worktree,
+    BranchInRepo,
+}
+
+impl Default for WorkLocation {
+    fn default() -> Self { WorkLocation::Worktree }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,12 +76,96 @@ pub enum StartWorkError {
     Git(String),
 }
 
-pub fn start_work(repo: &ScmRepo, key: &str, slug: &str) -> Result<StartWorkOutcome> {
+pub fn start_work(
+    repo: &ScmRepo,
+    key: &str,
+    slug: &str,
+    location: WorkLocation,
+) -> Result<StartWorkOutcome> {
     match repo.kind {
-        ScmKind::Git => git_start_work(&repo.root, key, slug),
+        ScmKind::Git => match location {
+            WorkLocation::Worktree => git_start_work(&repo.root, key, slug),
+            WorkLocation::BranchInRepo => git_start_work_in_repo(&repo.root, key, slug),
+        },
         ScmKind::Svn => Ok(StartWorkOutcome::SvnExport { value: slug.to_string() }),
         ScmKind::None => Ok(StartWorkOutcome::NoScm),
     }
+}
+
+/// Branch-in-main-repo start-work:
+///   1. Refuse if working tree is dirty (staged or unstaged changes).
+///   2. Search local branches for one whose name contains the ticket key.
+///   3. If found, `git checkout <branch>`; otherwise `git checkout -b <slug>`.
+///   4. Returns the repo root as the launch path.
+fn git_start_work_in_repo(root: &Path, key: &str, slug: &str) -> Result<StartWorkOutcome> {
+    // Reject dirty trees so we don't silently lose work. Ignore untracked files
+    // — build artifacts shouldn't block a branch switch.
+    let status = Command::new("git")
+        .current_dir(root)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .context("running git status")?;
+    if !status.status.success() {
+        let err = String::from_utf8_lossy(&status.stderr).trim().to_string();
+        return Err(StartWorkError::Git(err).into());
+    }
+    if !status.stdout.is_empty() {
+        let dirty = String::from_utf8_lossy(&status.stdout).trim().to_string();
+        return Err(StartWorkError::Git(format!(
+            "working tree has uncommitted changes — stash or commit first:\n{dirty}"
+        ))
+        .into());
+    }
+
+    let existing = find_branch_for_key(root, key)?;
+    let current = current_git_branch(root).ok().flatten();
+    let (branch, created) = match existing {
+        Some(b) => (b, false),
+        None => (slug.to_string(), true),
+    };
+
+    if current.as_deref() == Some(branch.as_str()) {
+        return Ok(StartWorkOutcome::GitBranchInRepo {
+            branch,
+            path: root.to_path_buf(),
+            created_branch: false,
+            already_on_branch: true,
+        });
+    }
+
+    let mut args: Vec<String> = vec!["checkout".into()];
+    if created {
+        args.push("-b".into());
+    }
+    args.push(branch.clone());
+
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(args.iter().map(|s| s.as_str()))
+        .output()
+        .context("running git checkout")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        // Git's "already used by worktree" error is the most common branch-in-repo
+        // failure — surface a clearer message pointing at the worktree.
+        let friendly = if err.contains("already used by worktree") || err.contains("is already checked out") {
+            format!(
+                "branch '{branch}' is already checked out in a worktree — \
+                 use 'worktree' mode to reuse it, or `git worktree remove` the old one first. \
+                 (git said: {err})"
+            )
+        } else {
+            err
+        };
+        return Err(StartWorkError::Git(friendly).into());
+    }
+
+    Ok(StartWorkOutcome::GitBranchInRepo {
+        branch,
+        path: root.to_path_buf(),
+        created_branch: created,
+        already_on_branch: false,
+    })
 }
 
 /// Worktree-based start-work:

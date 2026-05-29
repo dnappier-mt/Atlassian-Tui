@@ -5,6 +5,7 @@ mod ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use jui_core::ipc::{self, Request, Response, StartWorkReply};
+use jui_core::scm::WorkLocation;
 use jui_core::paths;
 use std::path::PathBuf;
 use std::process::Command;
@@ -167,12 +168,19 @@ async fn cmd_start(key: String) -> Result<()> {
     );
     let cwd = std::env::current_dir()?;
     let mut s = ensure_daemon().await?;
-    match ipc::send_request(&mut s, &Request::StartWork { key, cwd }).await? {
+    match ipc::send_request(&mut s, &Request::StartWork { key, cwd, location: WorkLocation::Worktree }).await? {
         Response::StartWork { reply: StartWorkReply::GitWorktree { branch, path, created_branch, attached_existing_worktree } } => {
             let action = if attached_existing_worktree { "reusing existing worktree" }
                 else if created_branch { "created new branch + worktree" }
                 else { "attached worktree to existing branch" };
             println!("{action}\n  branch: {branch}\n  path:   {}", path.display());
+            Ok(())
+        }
+        Response::StartWork { reply: StartWorkReply::GitBranchInRepo { branch, path, created_branch, already_on_branch } } => {
+            let action = if already_on_branch { "already on branch" }
+                else if created_branch { "created new branch in repo" }
+                else { "checked out existing branch in repo" };
+            println!("{action}\n  branch: {branch}\n  repo:   {}", path.display());
             Ok(())
         }
         Response::StartWork { reply: StartWorkReply::SvnExport { value } } => {
@@ -188,10 +196,13 @@ async fn cmd_start(key: String) -> Result<()> {
 async fn cmd_start_machine(key: String) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let mut s = ensure_daemon().await?;
-    let resp = ipc::send_request(&mut s, &Request::StartWork { key, cwd }).await?;
+    let resp = ipc::send_request(&mut s, &Request::StartWork { key, cwd, location: WorkLocation::Worktree }).await?;
     match resp {
         Response::StartWork { reply: StartWorkReply::GitWorktree { path, .. } } => {
             println!("worktree {}", path.display());
+        }
+        Response::StartWork { reply: StartWorkReply::GitBranchInRepo { path, .. } } => {
+            println!("repo {}", path.display());
         }
         Response::StartWork { reply: StartWorkReply::SvnExport { value } } => println!("svn {value}"),
         Response::StartWork { reply: StartWorkReply::NoScm } => println!("none"),

@@ -89,7 +89,13 @@ pub enum Request {
     AssignTicket { key: String, assignee: String },
     SetReviewer { key: String, assignee_id: String },
     Refresh { jql: Option<String> },
-    StartWork { key: String, cwd: PathBuf },
+    StartWork {
+        key: String,
+        cwd: PathBuf,
+        /// Where to land the checkout. Omitted = worktree (back-compat).
+        #[serde(default)]
+        location: crate::scm::WorkLocation,
+    },
     AddComment { key: String, body: String },
     ListComments { key: String },
     DeleteComment { key: String, comment_id: String },
@@ -155,6 +161,11 @@ pub enum Request {
     EditDescription { key: String, body: String },
     /// Ask Claude to rewrite a description more tightly. Pure transform — no Jira write.
     ImproveDescription { summary: String, body: String },
+    /// PR-aware body tightener. Daemon resolves the ticket's worktree, runs
+    /// `git diff <base>...HEAD` against the default remote branch, and passes
+    /// the diff to Claude alongside the title/body so the rewrite reflects
+    /// the actual change. Pure transform — does not touch GitHub.
+    ImprovePrBody { ticket_key: String, title: String, body: String },
     EditPriority { key: String, priority: String },
     ListPriorities,
     SetEstimate { key: String, original: Option<String>, remaining: Option<String> },
@@ -267,6 +278,12 @@ pub enum StartWorkReply {
         path: std::path::PathBuf,
         created_branch: bool,
         attached_existing_worktree: bool,
+    },
+    GitBranchInRepo {
+        branch: String,
+        path: std::path::PathBuf,
+        created_branch: bool,
+        already_on_branch: bool,
     },
     SvnExport { value: String },
     NoScm,

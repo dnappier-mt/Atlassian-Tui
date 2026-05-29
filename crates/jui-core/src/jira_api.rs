@@ -321,6 +321,52 @@ impl JiraApi {
         Ok(())
     }
 
+    /// Read the value of a single user-shaped custom field on `key`. Returns
+    /// `None` when the field is unset (or the field exists on schema but is
+    /// null), `Some(account_id)` when set. Tries both string and object
+    /// shapes so it matches whatever set_reviewer ended up writing.
+    pub async fn user_custom_field(
+        &self,
+        key: &str,
+        field_id: &str,
+    ) -> Result<Option<String>> {
+        let token = std::env::var("JIRA_API_TOKEN")
+            .context("JIRA_API_TOKEN not set; needed to read custom field")?;
+        let url = format!(
+            "{}/rest/api/3/issue/{}?fields={}",
+            self.server, key, field_id
+        );
+        let out = Command::new("curl")
+            .args([
+                "-sS", "--fail-with-body",
+                "-H", "Accept: application/json",
+                "-u", &format!("{}:{}", self.login, token),
+                &url,
+            ])
+            .output()
+            .await
+            .context("invoking curl")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "GET issue (field={field_id}) failed: {}",
+                String::from_utf8_lossy(&out.stdout).trim()
+            ));
+        }
+        let v: Value = serde_json::from_slice(&out.stdout)?;
+        let raw = v.get("fields").and_then(|f| f.get(field_id));
+        let account_id = match raw {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
+            Some(Value::Object(o)) => o.get("accountId").and_then(|x| x.as_str()).map(str::to_string),
+            Some(Value::Array(arr)) => arr
+                .first()
+                .and_then(|v| v.get("accountId").and_then(|x| x.as_str()))
+                .map(str::to_string),
+            _ => None,
+        };
+        Ok(account_id)
+    }
+
     /// Set a "reviewer" custom field on `key` to `account_id`.
     /// Reviewer fields vary per site (single-user, multi-user, server-style with name)
     /// — try the three most common shapes and return on the first success.
