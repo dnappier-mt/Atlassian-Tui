@@ -7200,37 +7200,6 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 app.status = format!("sort: {}", app.sort_mode.label());
             }
             KeyCode::Char('s') => { app.start_work().await?; }
-            KeyCode::Char('a') => {
-                app.push_current_view();
-                app.mode = Mode::Archive;
-            }
-            KeyCode::Char('b') => {
-                let cols = app.kanban_columns();
-                app.kanban_card_per_col = vec![0; cols.len()];
-                app.kanban_col = app.kanban_col.min(cols.len().saturating_sub(1));
-                app.push_current_view();
-                app.mode = Mode::Kanban;
-            }
-            KeyCode::Char('p') => { app.push_current_view(); app.open_projects().await?; }
-            KeyCode::Char('W') => { app.push_current_view(); app.open_active_status_config(); }
-            KeyCode::Char(',') => { app.push_current_view(); app.open_settings(); }
-            KeyCode::Char(':') => { app.push_current_view(); app.open_rules(); }
-            KeyCode::Char('H') => {
-                // Return to Home from List as a *forward* navigation — push
-                // current onto the stack so Q from Home walks back.
-                app.push_current_view();
-                app.mode = Mode::Home(HomeForm {
-                    items: Vec::new(),
-                    selected: 0,
-                    loading: true,
-                    error: None,
-                    menu_selected: 0,
-                    focus: HomeFocus::Menu,
-                });
-                if let Err(e) = app.load_home_activity().await {
-                    app.status = format!("activity err: {e:#}");
-                }
-            }
             KeyCode::Char('M') => {
                 app.show_all_mine = !app.show_all_mine;
                 app.status = if app.show_all_mine {
@@ -7240,8 +7209,6 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 };
                 app.refresh().await?;
             }
-            KeyCode::Char('f') => { app.push_current_view(); app.open_confluence_spaces().await?; }
-            KeyCode::Char('T') => { app.push_current_view(); app.open_tree().await?; }
             KeyCode::Tab => {
                 // Tab expands subtasks in the Active section; no-op in Mentioned.
                 if app.list_focus != ListFocus::Active { return Ok(()); }
