@@ -2093,9 +2093,26 @@ fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
 fn draw_home(f: &mut Frame, area: Rect, app: &App) {
     use crate::app::{HomeFocus, HOME_TARGETS};
     let Mode::Home(form) = &app.mode else { return };
+    // Size the left menu to the widest entry so view options never truncate.
+    // Each row is " {num} " + "({hot}) " + desc, plus a 2-col highlight symbol
+    // ("▶ ") and 2 cols of borders.
+    let menu_content_w = HOME_TARGETS
+        .iter()
+        .map(|(_, num, hot, desc)| {
+            format!(" {num} ").chars().count()
+                + format!("({hot}) ").chars().count()
+                + desc.chars().count()
+        })
+        .max()
+        .unwrap_or(0) as u16;
+    // Reserve room for the feed but always favor showing the full menu text.
+    // Pad the fitted width by 20% for a roomier menu pane.
+    let menu_w = ((menu_content_w + 4) * 6 / 5)
+        .min(area.width.saturating_sub(20))
+        .max(20);
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(46), Constraint::Min(40)])
+        .constraints([Constraint::Length(menu_w), Constraint::Min(20)])
         .split(area);
 
     // Left: shortcut menu.
