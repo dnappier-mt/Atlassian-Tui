@@ -383,7 +383,98 @@ async fn dispatch(
                 scm::StartWorkOutcome::SvnExport { value } => StartWorkReply::SvnExport { value },
                 scm::StartWorkOutcome::NoScm => StartWorkReply::NoScm,
             };
+            // Rules engine: StartWork trigger. The user invoking the daemon
+            // is by definition "me", so `actor_is_me` is true; we don't pay
+            // the round-trip to resolve their display name unless a rule
+            // asks for `{actor}` (deferred until needed).
+            let s2 = state.clone();
+            let k2 = key.clone();
+            let summary = ticket.summary.clone();
+            let status = ticket.status.clone();
+            let project = ticket.key.split('-').next().map(str::to_string);
+            let issue_type = ticket.issue_type.clone();
+            let has_linked = !state.cache.lock().await.linked_paths(&k2).unwrap_or_default().is_empty();
+            tokio::spawn(async move {
+                fire_rules(
+                    &s2,
+                    jui_core::rules::Trigger::StartWork,
+                    jui_core::rules::RuleContext {
+                        ticket_key: Some(k2),
+                        ticket_summary: Some(summary),
+                        ticket_status: Some(status),
+                        ticket_project_key: project,
+                        ticket_issue_type: issue_type,
+                        has_linked_repo: has_linked,
+                        actor_is_me: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            });
             Ok(Response::StartWork { reply })
+        }
+
+        Request::StopWork { key, comment } => {
+            // Mirror the TUI's old stop-work flow but server-side so the rules
+            // engine has a single fire point. Transition to a Backlog
+            // transition (first matching), then append the optional comment.
+            let prior_status = state
+                .cache
+                .lock()
+                .await
+                .get_ticket(&key)?
+                .map(|t| t.status);
+            let api = JiraApi::from_jira_cli_config()?;
+            let transitions = api.list_transitions(&key).await.unwrap_or_default();
+            let target = transitions
+                .iter()
+                .find(|tr| {
+                    tr.to_status
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case("Backlog"))
+                        .unwrap_or(false)
+                })
+                .or_else(|| {
+                    transitions
+                        .iter()
+                        .find(|tr| tr.name.to_ascii_lowercase().contains("backlog"))
+                });
+            let new_status = match &target {
+                Some(tr) => {
+                    state.jira.transition(&key, &tr.name).await?;
+                    tr.to_status.clone().unwrap_or_else(|| tr.name.clone())
+                }
+                None => return Err(anyhow::anyhow!("no Backlog transition for {key}")),
+            };
+            if let Some(c) = comment.as_deref() {
+                if !c.trim().is_empty() {
+                    if let Err(e) = state.jira.add_comment(&key, c).await {
+                        warn!(%key, "stop-work comment failed: {e:#}");
+                    }
+                }
+            }
+            let s2 = state.clone();
+            let k2 = key.clone();
+            let project = key.split('-').next().map(str::to_string);
+            let prior_status_clone = prior_status.clone();
+            tokio::spawn(async move {
+                fire_rules(
+                    &s2,
+                    jui_core::rules::Trigger::StopWork,
+                    jui_core::rules::RuleContext {
+                        ticket_key: Some(k2.clone()),
+                        from_status: prior_status_clone,
+                        to_status: Some(new_status.clone()),
+                        ticket_status: Some(new_status),
+                        ticket_project_key: project,
+                        actor_is_me: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                refresh_ticket_after_mutation(&s2, &k2).await;
+            });
+            Ok(Response::Ok)
         }
 
         Request::AddComment { key, body } => {
@@ -766,10 +857,42 @@ async fn dispatch(
         }
 
         Request::Transition { key, to } => {
+            // Snapshot the pre-transition status so the rules engine can fire
+            // with both `from_status` and `to_status` populated. Cache-only
+            // read — a live Jira fetch would race the transition itself.
+            let prior_status = state
+                .cache
+                .lock()
+                .await
+                .get_ticket(&key)?
+                .map(|t| t.status);
             state.jira.transition(&key, &to).await?;
             let s2 = state.clone();
             let k2 = key.clone();
-            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            let project = key.split('-').next().map(str::to_string);
+            let prior = prior_status.clone();
+            let to_clone = to.clone();
+            tokio::spawn(async move {
+                fire_rules(
+                    &s2,
+                    jui_core::rules::Trigger::TicketStatusChanged {
+                        from: prior.clone(),
+                        to: Some(to_clone.clone()),
+                    },
+                    jui_core::rules::RuleContext {
+                        ticket_key: Some(k2.clone()),
+                        ticket_status: Some(to_clone.clone()),
+                        ticket_project_key: project,
+                        from_status: prior,
+                        to_status: Some(to_clone),
+                        has_linked_repo: !s2.cache.lock().await.linked_paths(&k2).unwrap_or_default().is_empty(),
+                        actor_is_me: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                refresh_ticket_after_mutation(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
 
@@ -783,6 +906,16 @@ async fn dispatch(
             let api = JiraApi::from_jira_cli_config()?;
             let items = api.statuses().await?;
             Ok(Response::Statuses { items })
+        }
+
+        Request::ListRuleLog { limit } => {
+            let items = state.cache.lock().await.list_rule_log(limit)?;
+            Ok(Response::RuleLog { items })
+        }
+
+        Request::RecentActivity { limit } => {
+            let items = state.cache.lock().await.recent_activity(limit)?;
+            Ok(Response::Activity { items })
         }
 
         Request::GetPrDraft { ticket_key } => {
@@ -968,10 +1101,37 @@ async fn dispatch(
                     ),
                 });
             };
+            let prior_status = state.cache.lock().await.get_ticket(&key)?.map(|t| t.status);
+            let new_status = tr.to_status.clone().unwrap_or_else(|| tr.name.clone());
             state.jira.transition(&key, &tr.name).await?;
             tracing::info!(%key, transition = %tr.name, "archived ticket");
             // Drop from local cache; refresh will re-add if it still appears in JQL.
             let _ = state.cache.lock().await.delete_ticket(&key);
+            // Rules engine: archive counts as a status transition.
+            let s2 = state.clone();
+            let k2 = key.clone();
+            let project = key.split('-').next().map(str::to_string);
+            let prior = prior_status.clone();
+            let ns = new_status.clone();
+            tokio::spawn(async move {
+                fire_rules(
+                    &s2,
+                    jui_core::rules::Trigger::TicketStatusChanged {
+                        from: prior.clone(),
+                        to: Some(ns.clone()),
+                    },
+                    jui_core::rules::RuleContext {
+                        ticket_key: Some(k2),
+                        ticket_status: Some(ns.clone()),
+                        ticket_project_key: project,
+                        from_status: prior,
+                        to_status: Some(ns),
+                        actor_is_me: true,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            });
             Ok(Response::Ok)
         }
 
@@ -988,7 +1148,32 @@ async fn dispatch(
             }
             let s2 = state.clone();
             let k2 = key.clone();
-            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            // Best-effort "to_me" detection: compare assignee against the
+            // jira-cli config's `login` (email). True when matches; otherwise
+            // we can't tell and leave the flag false. Account-id comparisons
+            // would need a `myself` call we don't want to pay for here.
+            let my_login = JiraApi::from_jira_cli_config().ok().map(|a| a.login);
+            let to_me = my_login
+                .as_deref()
+                .map(|l| l.eq_ignore_ascii_case(&assignee))
+                .unwrap_or(false);
+            let project = key.split('-').next().map(str::to_string);
+            let assignee_clone = assignee.clone();
+            tokio::spawn(async move {
+                fire_rules(
+                    &s2,
+                    jui_core::rules::Trigger::TicketAssigned { to_me: Some(to_me) },
+                    jui_core::rules::RuleContext {
+                        ticket_key: Some(k2.clone()),
+                        ticket_project_key: project,
+                        actor: Some(assignee_clone),
+                        actor_is_me: false,
+                        ..Default::default()
+                    },
+                )
+                .await;
+                refresh_ticket_after_mutation(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
 
@@ -1612,10 +1797,45 @@ async fn create_pull_request(
         }
     }
 
-    // 8. Async cache refresh.
+    // 8. Async cache refresh + rules-engine PrCreated fire.
     let s2 = state.clone();
     let k2 = ticket_key.to_string();
-    tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+    let pr_url = pr.url.clone();
+    let pr_number = pr.number;
+    let pr_repo = repo.clone();
+    let summary = ticket.summary.clone();
+    let status = ticket.status.clone();
+    let issue_type = ticket.issue_type.clone();
+    let project = ticket_key.split('-').next().map(str::to_string);
+    let reviewer_h = reviewer_gh.clone();
+    let devqa_h = devqa_gh.clone();
+    let reviewer_aid = reviewer_account_id.map(|s| s.to_string());
+    let devqa_aid = devqa_account_id.map(|s| s.to_string());
+    tokio::spawn(async move {
+        fire_rules(
+            &s2,
+            jui_core::rules::Trigger::PrCreated,
+            jui_core::rules::RuleContext {
+                ticket_key: Some(k2.clone()),
+                ticket_summary: Some(summary),
+                ticket_status: Some(status),
+                ticket_project_key: project,
+                ticket_issue_type: issue_type,
+                has_linked_repo: true,
+                pr_url: Some(pr_url),
+                pr_number: Some(pr_number),
+                pr_repo: Some(pr_repo),
+                reviewer_handle: reviewer_h,
+                devqa_handle: devqa_h,
+                reviewer_account_id: reviewer_aid,
+                devqa_account_id: devqa_aid,
+                actor_is_me: true,
+                ..Default::default()
+            },
+        )
+        .await;
+        refresh_ticket_after_mutation(&s2, &k2).await;
+    });
 
     Ok(Response::PullRequestCreated { url: pr.url, number: pr.number })
 }
@@ -2225,6 +2445,209 @@ async fn tmux_status_loop(state: Arc<State>) {
 #[allow(dead_code)]
 fn _unused(_p: PathBuf) {}
 
+/// Rules-engine entry point. Loads the current `[[rules]]` from disk on every
+/// fire (cheap TOML read) so user edits in the TUI take effect without a
+/// daemon restart, selects matching rules, then runs each rule's actions in
+/// sequence. Failures log via `tracing::warn!` and never bubble back to the
+/// caller — the primary mutation already succeeded.
+async fn fire_rules(state: &Arc<State>, fired: jui_core::rules::Trigger, ctx: jui_core::rules::RuleContext) {
+    let cfg = GlobalConfig::load().unwrap_or_default();
+    let matched = jui_core::rules::select(&cfg.rules, &fired, &ctx);
+    if matched.is_empty() {
+        return;
+    }
+    info!(rule_count = matched.len(), trigger = ?fired, "rules engine fired");
+    // Snapshot the matches into owned Rules so we don't hold any borrow on
+    // `cfg` across `.await` points.
+    let to_run: Vec<jui_core::rules::Rule> = matched.into_iter().cloned().collect();
+    for rule in &to_run {
+        for (i, action) in rule.actions.iter().enumerate() {
+            let result = run_rule_action(state, rule, action, &ctx).await;
+            let (status, message) = match &result {
+                Ok(_) => ("ok".to_string(), None),
+                Err(e) => {
+                    warn!(
+                        rule = %rule.name,
+                        rule_id = %rule.id,
+                        action_idx = i,
+                        "rules engine action failed: {e:#}"
+                    );
+                    ("err".to_string(), Some(format!("{e:#}")))
+                }
+            };
+            let entry = jui_core::cache::RuleLogEntry {
+                fired_at: chrono::Utc::now().timestamp_millis(),
+                rule_id: rule.id.clone(),
+                rule_name: rule.name.clone(),
+                trigger_kind: trigger_kind_str(&fired),
+                trigger_filters: trigger_filters_str(&fired),
+                ticket_key: ctx.ticket_key.clone(),
+                action_idx: i as u32,
+                action_kind: action_kind_str(action),
+                action_target: action_target_str(action, &ctx),
+                conditions_summary: if rule.conditions.is_empty() {
+                    None
+                } else {
+                    Some(rule.conditions.iter().map(condition_kind_str).collect::<Vec<_>>().join(", "))
+                },
+                status,
+                message,
+            };
+            let _ = state.cache.lock().await.insert_rule_log(&entry);
+        }
+    }
+}
+
+fn trigger_kind_str(t: &jui_core::rules::Trigger) -> String {
+    use jui_core::rules::Trigger as T;
+    match t {
+        T::PrCreated => "pr_created".into(),
+        T::StartWork => "start_work".into(),
+        T::StopWork => "stop_work".into(),
+        T::TicketStatusChanged { .. } => "ticket_status_changed".into(),
+        T::TicketAssigned { .. } => "ticket_assigned".into(),
+    }
+}
+
+fn trigger_filters_str(t: &jui_core::rules::Trigger) -> Option<String> {
+    use jui_core::rules::Trigger as T;
+    match t {
+        T::TicketStatusChanged { from, to } => Some(format!(
+            "from={}, to={}",
+            from.as_deref().unwrap_or("*"),
+            to.as_deref().unwrap_or("*")
+        )),
+        T::TicketAssigned { to_me } => Some(format!(
+            "to_me={}",
+            to_me.map(|b| b.to_string()).unwrap_or_else(|| "*".into())
+        )),
+        _ => None,
+    }
+}
+
+fn action_kind_str(a: &jui_core::rules::Action) -> String {
+    use jui_core::rules::Action as A;
+    match a {
+        A::JiraTransition { .. } => "jira_transition".into(),
+        A::JiraComment { .. } => "jira_comment".into(),
+        A::GithubPrComment { .. } => "github_pr_comment".into(),
+        A::SetTicketDevQa => "set_ticket_devqa".into(),
+    }
+}
+
+fn action_target_str(a: &jui_core::rules::Action, ctx: &jui_core::rules::RuleContext) -> Option<String> {
+    use jui_core::rules::Action as A;
+    let raw = match a {
+        A::JiraTransition { to } => jui_core::rules::render(to, ctx),
+        A::JiraComment { body } => jui_core::rules::render(body, ctx),
+        A::GithubPrComment { body } => jui_core::rules::render(body, ctx),
+        A::SetTicketDevQa => return ctx.devqa_account_id.clone(),
+    };
+    let joined = raw.replace('\n', " ↵ ");
+    // Char-aware truncate so `↵` (3 bytes) at the boundary doesn't panic.
+    let mut s: String = joined.chars().take(200).collect();
+    if s.chars().count() < joined.chars().count() {
+        s.push('…');
+    }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+fn condition_kind_str(c: &jui_core::rules::Condition) -> String {
+    use jui_core::rules::Condition as C;
+    match c {
+        C::ProjectKeyEquals { value } => format!("project_key={value}"),
+        C::StatusEquals { value } => format!("status={value}"),
+        C::IssueTypeIn { values } => format!("issue_type∈[{}]", values.join(",")),
+        C::HasLinkedRepo => "has_linked_repo".into(),
+        C::ActorIsMe => "actor_is_me".into(),
+    }
+}
+
+async fn run_rule_action(
+    state: &Arc<State>,
+    rule: &jui_core::rules::Rule,
+    action: &jui_core::rules::Action,
+    ctx: &jui_core::rules::RuleContext,
+) -> Result<()> {
+    use jui_core::rules::{render, Action};
+    let Some(ticket_key) = ctx.ticket_key.as_deref() else {
+        return Err(anyhow::anyhow!("rule '{}' has no ticket_key in context", rule.name));
+    };
+    match action {
+        Action::JiraTransition { to } => {
+            let to_rendered = render(to, ctx);
+            let api = JiraApi::from_jira_cli_config()?;
+            let transitions = api.list_transitions(ticket_key).await.unwrap_or_default();
+            let needle = to_rendered.to_ascii_lowercase();
+            let target = transitions
+                .iter()
+                .find(|tr| {
+                    tr.to_status
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case(&to_rendered))
+                        .unwrap_or(false)
+                })
+                .or_else(|| {
+                    transitions
+                        .iter()
+                        .find(|tr| tr.name.to_ascii_lowercase().contains(&needle))
+                });
+            match target {
+                Some(tr) => {
+                    state.jira.transition(ticket_key, &tr.name).await?;
+                    info!(rule = %rule.name, %ticket_key, to = %to_rendered, "rule: transitioned");
+                }
+                None => {
+                    return Err(anyhow::anyhow!(
+                        "no transition matching '{to_rendered}' for {ticket_key}"
+                    ));
+                }
+            }
+        }
+        Action::JiraComment { body } => {
+            let rendered = render(body, ctx);
+            state.jira.add_comment(ticket_key, &rendered).await?;
+            info!(rule = %rule.name, %ticket_key, "rule: jira comment posted");
+        }
+        Action::GithubPrComment { body } => {
+            let meta = {
+                let cache = state.cache.lock().await;
+                cache.get_ticket_pr_meta(ticket_key)?
+            };
+            let Some((repo, number)) = meta else {
+                return Err(anyhow::anyhow!(
+                    "no PR linked to {ticket_key}; cannot post github comment"
+                ));
+            };
+            let rendered = render(body, ctx);
+            jui_core::github::post_pr_comment(&repo, number, &rendered).await?;
+            info!(rule = %rule.name, %ticket_key, %repo, %number, "rule: github comment posted");
+        }
+        Action::SetTicketDevQa => {
+            let cfg = GlobalConfig::load().unwrap_or_default();
+            let field = cfg.jira.devqa_customfield.trim().to_string();
+            if field.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "jira.devqa_customfield is empty — set it in ~/.config/jui/config.toml"
+                ));
+            }
+            let Some(account_id) = ctx.devqa_account_id.as_deref() else {
+                return Err(anyhow::anyhow!(
+                    "no devqa_account_id in context — this action only fires after a PR-create with DevQA picked"
+                ));
+            };
+            let api = JiraApi::from_jira_cli_config()?;
+            api.set_reviewer(ticket_key, account_id, &field).await?;
+            info!(rule = %rule.name, %ticket_key, %account_id, %field, "rule: DevQA set on Jira ticket");
+        }
+    }
+    Ok(())
+}
+
 /// Pull the GitHub handle out of the first `DevQA: @<handle>` line in a PR
 /// body, case-insensitive on the label. Returns `None` if the line is missing
 /// or malformed. The label is exactly what `create_pull_request` writes, so
@@ -2331,7 +2754,13 @@ fn pr_diff_against_default(repo: &std::path::Path) -> Result<String> {
     }
     let mut s = String::from_utf8_lossy(&out.stdout).into_owned();
     if s.len() > MAX_DIFF_BYTES {
-        s.truncate(MAX_DIFF_BYTES);
+        // Snap to the nearest char boundary at-or-below the byte cap so we
+        // never split a UTF-8 codepoint.
+        let mut cut = MAX_DIFF_BYTES;
+        while cut > 0 && !s.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        s.truncate(cut);
         s.push_str("\n\n[diff truncated]\n");
     }
     Ok(s)

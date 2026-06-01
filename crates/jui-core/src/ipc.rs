@@ -96,6 +96,21 @@ pub enum Request {
         #[serde(default)]
         location: crate::scm::WorkLocation,
     },
+    /// Move the ticket back to Backlog (or the first matching backlog
+    /// transition) so the rules engine has a single fire site for the
+    /// `StopWork` trigger. Optional `comment` is appended as a Jira comment
+    /// when the user filled in the post-stop form.
+    StopWork {
+        key: String,
+        #[serde(default)]
+        comment: Option<String>,
+    },
+    /// Recent rule-engine fire history (newest first). 5-day rolling window
+    /// pruned on each insert by the daemon. `limit` caps the result row count.
+    ListRuleLog { limit: u32 },
+    /// Mixed activity feed (jira comments, pr comments, ticket status
+    /// changes) sorted newest first. Drives the Home pane.
+    RecentActivity { limit: u32 },
     AddComment { key: String, body: String },
     ListComments { key: String },
     DeleteComment { key: String, comment_id: String },
@@ -234,6 +249,10 @@ pub enum Response {
     /// Reply for `GetPushRemote`. `name = None` means no override on file
     /// (caller falls back to the picker flow).
     PushRemote { name: Option<String> },
+    /// Reply for `ListRuleLog`.
+    RuleLog { items: Vec<crate::cache::RuleLogEntry> },
+    /// Reply for `RecentActivity`.
+    Activity { items: Vec<crate::cache::ActivityEntry> },
     Comments { items: Vec<Comment> },
     Priorities { items: Vec<String> },
     Implementation { markdown: String, project_paths: Vec<String>, updated_at: String },

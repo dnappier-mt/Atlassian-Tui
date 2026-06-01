@@ -125,6 +125,181 @@ pub enum Mode {
     /// Compose a reply to a GitHub PR comment. Opened with `r` from the
     /// PR Comments pane in Detail view.
     PrCommentReply(PrCommentReplyForm),
+    /// Rules engine list. Each row is one `jui_core::rules::Rule`. Editing
+    /// happens in `Mode::RuleEdit`. Opens with `:` from the List view.
+    Rules(RulesForm),
+    RuleEdit(RuleEditForm),
+    /// Rules-engine fire history (5-day rolling). Opened with `l` from the
+    /// rules list. Newest-first list of action-level log rows.
+    RuleLog(RuleLogForm),
+    /// Top-level landing pane. Shortcuts to every other view + a recent-
+    /// activity feed pulled via `Request::RecentActivity`.
+    Home(HomeForm),
+}
+
+pub struct HomeForm {
+    pub items: Vec<jui_core::cache::ActivityEntry>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+    /// Which shortcut row is highlighted in the menu column. Independent of
+    /// `selected` (which navigates the activity feed). Tab swaps focus.
+    pub menu_selected: usize,
+    pub focus: HomeFocus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HomeFocus {
+    Menu,
+    Activity,
+}
+
+/// Top-level views the home pane can launch. Order is the menu display
+/// order; numeric shortcuts 1..n track the same order.
+#[derive(Debug, Clone, Copy)]
+pub enum HomeTarget {
+    List,
+    Tree,
+    Kanban,
+    Archive,
+    Confluence,
+    Settings,
+    Rules,
+    Projects,
+}
+
+pub const HOME_TARGETS: &[(HomeTarget, &str, &str, &str)] = &[
+    (HomeTarget::List,       "1", "L", "Tickets list — assigned + mentions"),
+    (HomeTarget::Tree,       "2", "T", "Tree view — parent → child hierarchy"),
+    (HomeTarget::Kanban,     "3", "K", "Kanban board — columns by status"),
+    (HomeTarget::Archive,    "4", "A", "Archive — closed / cancelled tickets"),
+    (HomeTarget::Confluence, "5", "C", "Confluence — spaces + pages"),
+    (HomeTarget::Settings,   "6", ",", "Settings — workflow + defaults"),
+    (HomeTarget::Rules,      "7", ":", "Rules engine — automations + log"),
+    (HomeTarget::Projects,   "8", "P", "Projects — manage linked repos"),
+];
+
+pub struct RuleLogForm {
+    pub items: Vec<jui_core::cache::RuleLogEntry>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+/// List view for the rules engine.
+pub struct RulesForm {
+    pub items: Vec<jui_core::rules::Rule>,
+    pub selected: usize,
+    /// Two-press delete guard — index awaiting confirmation.
+    pub pending_remove: Option<usize>,
+}
+
+/// Single-rule editor. `original_id = None` means "new rule, push on save".
+pub struct RuleEditForm {
+    pub original_id: Option<String>,
+    pub rule: jui_core::rules::Rule,
+    /// Which logical row the cursor is on. Layout is dynamic: header rows
+    /// (name, trigger, trigger filter, enabled) are followed by one row per
+    /// condition then one row per action.
+    pub selected_row: usize,
+    /// Set when the user is text-editing the focused row's value.
+    pub edit_buffer: Option<String>,
+    /// What the edit buffer applies to. Mirrors `selected_row` at the time
+    /// edit started; refreshed each commit.
+    pub edit_target: Option<RuleEditTarget>,
+    pub pending_remove_condition: Option<usize>,
+    pub pending_remove_action: Option<usize>,
+    pub error: Option<String>,
+    /// Status picker overlay — open when the user is editing a status-valued
+    /// field (currently `Action::JiraTransition.to`). Loaded asynchronously
+    /// from `Request::ListStatuses`; `loading=true` while in flight.
+    pub picker: Option<RulePicker>,
+    /// Variable autocomplete popup. Opens when the user types `{` inside a
+    /// text-edit buffer; closes on Enter/Tab (insert), Esc (cancel), or
+    /// Backspace past the `{` anchor.
+    pub var_picker: Option<VarPicker>,
+}
+
+/// Autocomplete state for `{placeholder}` variable insertion inside a
+/// rule-edit text buffer. `anchor` is the byte offset of the opening `{`
+/// inside the active `edit_buffer`; the filter text is everything between
+/// `anchor + 1` and the buffer's current end.
+pub struct VarPicker {
+    pub anchor: usize,
+    pub selected: usize,
+}
+
+/// Static list of `(name, description)` for every placeholder the rules
+/// engine knows how to substitute. Keep in sync with
+/// `jui_core::rules::RuleContext::placeholder_value`.
+pub const RULE_VARS: &[(&str, &str)] = &[
+    ("ticket_key", "Jira ticket key (e.g. ENG-1234)"),
+    ("ticket_summary", "Ticket title"),
+    ("ticket_status", "Current ticket status"),
+    ("project_key", "Project prefix from the ticket key (e.g. ENG)"),
+    ("issue_type", "Issue type (Story, Bug, …)"),
+    ("from_status", "Status before a TicketStatusChanged trigger"),
+    ("to_status", "Status after a TicketStatusChanged trigger"),
+    ("pr_url", "Full GitHub URL of the linked PR"),
+    ("pr_number", "PR number"),
+    ("pr_repo", "<owner>/<repo> slug for the linked PR"),
+    ("reviewer_handle", "GitHub handle of the picked reviewer"),
+    ("devqa_handle", "GitHub handle of the picked DevQA"),
+    ("reviewer_account_id", "Jira account-id of the picked reviewer"),
+    ("devqa_account_id", "Jira account-id of the picked DevQA"),
+    ("actor", "Display name of the user who triggered the event"),
+];
+
+/// Names matching the buffer-tail typed after `{`, case-insensitive. Empty
+/// query returns the full list. Returned in stable order so the popup
+/// doesn't visually shuffle while the user types.
+pub fn filter_vars(query: &str) -> Vec<&'static (&'static str, &'static str)> {
+    if query.is_empty() {
+        return RULE_VARS.iter().collect();
+    }
+    let q = query.to_ascii_lowercase();
+    RULE_VARS
+        .iter()
+        .filter(|(name, _)| name.to_ascii_lowercase().contains(&q))
+        .collect()
+}
+
+#[derive(Debug, Clone)]
+pub enum RuleEditTarget {
+    Name,
+    TriggerFilter, // text field for TicketStatusChanged.to
+    ConditionValue(usize),
+    ActionValue(usize),
+}
+
+/// Status-picker overlay for the rule editor. `target` tells us which field
+/// to write the commit back to.
+pub struct RulePicker {
+    pub target: RulePickerTarget,
+    pub query: String,
+    pub all: Vec<String>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum RulePickerTarget {
+    ActionTransitionTo(usize),
+}
+
+impl RulePicker {
+    pub fn filtered(&self) -> Vec<&str> {
+        if self.query.trim().is_empty() {
+            return self.all.iter().map(String::as_str).collect();
+        }
+        let q = self.query.to_ascii_lowercase();
+        self.all
+            .iter()
+            .filter(|s| s.to_ascii_lowercase().contains(&q))
+            .map(String::as_str)
+            .collect()
+    }
 }
 
 /// Editable settings rows. Each row maps to one field on `WorkflowConfig`.
@@ -318,6 +493,7 @@ pub struct TreeNode {
     pub has_my_open_pr: bool,
 }
 
+#[derive(Clone)]
 pub struct TreeForm {
     pub nodes: Vec<TreeNode>,
     pub roots: Vec<usize>,
@@ -743,6 +919,11 @@ pub struct CommentForm {
     pub key: String,
     pub body: String,
     pub reply_to: Option<ReplyContext>,
+    /// When true, submitting this form invokes the daemon's `StopWork`
+    /// request (which transitions the ticket + appends the comment + fires
+    /// the rules engine) instead of the plain `AddComment`. Empty body still
+    /// stops the work; the comment is just optional.
+    pub from_stop_work: bool,
 }
 
 /// Reply form for the GitHub PR Comments pane. Carries the parent comment's
@@ -910,6 +1091,8 @@ pub struct App {
 /// Captured "where to return to" for the back-stack. `Tree` keeps the full
 /// form so expand state and selection survive the round-trip; `Detail` also
 /// remembers focus + selection so popping back lands on the same sub-pane row.
+/// All other variants are markers — reopened via the matching `open_*`
+/// helper, losing local state (selection / scroll). Acceptable v1 trade-off.
 pub enum NavFrame {
     List,
     Archive,
@@ -921,6 +1104,16 @@ pub enum NavFrame {
         subtask_selected: usize,
         comment_selected: usize,
     },
+    Home,
+    Settings,
+    Rules,
+    RuleLog,
+    /// Stored by id; popping reopens that rule in the editor. Empty string
+    /// represents an in-progress "new rule" — we drop those when popping.
+    RuleEdit(String),
+    Projects,
+    Confluence,
+    ActiveStatusConfig,
 }
 
 /// Sentinel offset separating `kanban_extra` indices from `tickets` indices in
@@ -935,7 +1128,14 @@ impl App {
             inactive_idxs: vec![],
             list_selected: 0,
             archive_selected: 0,
-            mode: Mode::List,
+            mode: Mode::Home(HomeForm {
+                items: Vec::new(),
+                selected: 0,
+                loading: true,
+                error: None,
+                menu_selected: 0,
+                focus: HomeFocus::Menu,
+            }),
             status: "loading…".into(),
             detail: None,
             comments: vec![],
@@ -1646,49 +1846,39 @@ impl App {
     /// Move the current ticket back to Backlog and pop a Comment form so the user can
     /// optionally explain why. Esc skips the comment, Ctrl-S submits it.
     pub async fn stop_work(&mut self) -> Result<()> {
+        // Pop the Comment form first; submit (or Esc) is what actually sends
+        // the StopWork request to the daemon, where the transition + comment
+        // + rules-engine fire happen atomically. Esc on the form skips the
+        // comment but still stops the work (handled in the key handler).
         let Some(t) = self.detail.clone().or_else(|| self.current_ticket().cloned()) else {
             return Ok(());
         };
-        let key = t.key.clone();
+        self.mode = Mode::Comment(CommentForm {
+            key: t.key.clone(),
+            body: String::new(),
+            reply_to: None,
+            from_stop_work: true,
+        });
+        self.status = format!("stop {}: add optional note then Ctrl-S / Enter, or Esc to skip", t.key);
+        Ok(())
+    }
 
-        // Find a Backlog transition.
-        let mut s = ipc::connect().await?;
-        let resp = ipc::send_request(&mut s, &Request::ListTransitions { key: key.clone() }).await?;
-        let target = if let Response::Transitions { items } = resp {
-            items
-                .iter()
-                .find(|tr| tr.to_status.as_deref().map(|s| s.eq_ignore_ascii_case("Backlog")).unwrap_or(false))
-                .or_else(|| items.iter().find(|tr| tr.name.to_ascii_lowercase().contains("backlog")))
-                .cloned()
-        } else {
-            None
-        };
-        let Some(tr) = target else {
-            self.status = format!("no Backlog transition available for {key}");
-            return Ok(());
-        };
-
+    /// Fire the daemon's `StopWork` with no comment. Called when the user
+    /// presses Esc on the stop-work comment form.
+    pub async fn submit_stop_work_no_comment(&mut self, key: String) -> Result<()> {
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::Transition { key: key.clone(), to: tr.name.clone() },
+            &Request::StopWork { key: key.clone(), comment: None },
         )
         .await?;
-        if let Response::Err { message } = resp {
-            self.status = format!("transition err: {message}");
-            return Ok(());
+        match resp {
+            Response::Ok => self.status = format!("stopped work on {key}"),
+            Response::Err { message } => self.status = format!("stop-work err: {message}"),
+            _ => self.status = "unexpected response".into(),
         }
-        self.status = format!(
-            "{key} → {}",
-            tr.to_status.clone().unwrap_or_else(|| tr.name.clone())
-        );
-
-        // Pop a Comment form so the user can optionally add a note.
-        self.mode = Mode::Comment(CommentForm {
-            key,
-            body: String::new(),
-            reply_to: None,
-        });
+        self.mode = Mode::Detail;
+        self.load_detail().await?;
         Ok(())
     }
 
@@ -2365,11 +2555,23 @@ impl App {
         } else {
             form.body.clone()
         };
-        let req = Request::AddComment { key: form.key.clone(), body };
+        let req = if form.from_stop_work {
+            // Stop-work flow: send StopWork so daemon does transition +
+            // comment + rules-engine fire as one atomic step. Empty body is
+            // still valid — daemon skips the comment write.
+            let comment = if body.trim().is_empty() { None } else { Some(body) };
+            Request::StopWork { key: form.key.clone(), comment }
+        } else {
+            Request::AddComment { key: form.key.clone(), body }
+        };
         let mut s = ipc::connect().await?;
         match ipc::send_request(&mut s, &req).await? {
             Response::Ok => {
-                self.status = format!("commented on {}", form.key);
+                self.status = if form.from_stop_work {
+                    format!("stopped work on {}", form.key)
+                } else {
+                    format!("commented on {}", form.key)
+                };
                 self.mode = Mode::Detail;
                 self.load_detail().await?;
             }
@@ -4030,6 +4232,253 @@ change, look for regressions, and report findings to me directly here.
         })
     }
 
+    /// Snapshot the current view as a NavFrame and push it onto `nav_stack`
+    /// so a subsequent `pop_back_or_quit()` can restore it. Returns the
+    /// pushed frame (or `None` if the current mode isn't navigable). Modal
+    /// forms (Comment, Create, EditTime, pickers, etc.) are deliberately
+    /// not navigable — they're returned-to by Esc.
+    pub fn push_current_view(&mut self) -> Option<()> {
+        let frame = match &self.mode {
+            Mode::List => Some(NavFrame::List),
+            Mode::Archive => Some(NavFrame::Archive),
+            Mode::Kanban | Mode::KanbanFilter(_) => Some(NavFrame::Kanban),
+            Mode::Tree(f) => Some(NavFrame::Tree(Box::new(f.clone()))),
+            Mode::Home(_) => Some(NavFrame::Home),
+            Mode::Settings(_) => Some(NavFrame::Settings),
+            Mode::Rules(_) => Some(NavFrame::Rules),
+            Mode::RuleLog(_) => Some(NavFrame::RuleLog),
+            Mode::RuleEdit(f) => Some(NavFrame::RuleEdit(
+                f.original_id.clone().unwrap_or_default(),
+            )),
+            Mode::Projects(_) => Some(NavFrame::Projects),
+            Mode::ConfluenceSpaces(_) | Mode::ConfluencePages(_) | Mode::PageView(_) => {
+                Some(NavFrame::Confluence)
+            }
+            Mode::ActiveStatusConfig(_) => Some(NavFrame::ActiveStatusConfig),
+            Mode::Detail => Some(NavFrame::Detail {
+                ticket_key: self
+                    .detail
+                    .as_ref()
+                    .map(|t| t.key.clone())
+                    .unwrap_or_default(),
+                focus: self.detail_focus,
+                subtask_selected: self.subtask_selected,
+                comment_selected: self.comment_selected,
+            }),
+            _ => None,
+        };
+        let frame = frame?;
+        self.nav_stack.push(frame);
+        Some(())
+    }
+
+    /// Q-back: pop the top of the nav stack and reopen that view. If the
+    /// stack is empty, set `should_quit`. Returns `Ok(true)` when a view
+    /// was popped, `Ok(false)` when the app is being asked to exit.
+    pub async fn pop_back_or_quit(&mut self) -> Result<bool> {
+        let Some(frame) = self.nav_stack.pop() else {
+            self.should_quit = true;
+            return Ok(false);
+        };
+        match frame {
+            NavFrame::List => self.mode = Mode::List,
+            NavFrame::Archive => self.mode = Mode::Archive,
+            NavFrame::Kanban => self.mode = Mode::Kanban,
+            NavFrame::Tree(form) => self.mode = Mode::Tree(*form),
+            NavFrame::Detail { ticket_key, focus, subtask_selected, comment_selected } => {
+                if !ticket_key.is_empty() {
+                    self.open_ticket_by_key(ticket_key).await?;
+                }
+                self.detail_focus = focus;
+                self.subtask_selected = subtask_selected;
+                self.comment_selected = comment_selected;
+                self.mode = Mode::Detail;
+            }
+            NavFrame::Home => {
+                // Reopen Home without re-pushing (we're popping).
+                self.mode = Mode::Home(HomeForm {
+                    items: Vec::new(),
+                    selected: 0,
+                    loading: true,
+                    error: None,
+                    menu_selected: 0,
+                    focus: HomeFocus::Menu,
+                });
+                if let Err(e) = self.load_home_activity().await {
+                    self.status = format!("activity err: {e:#}");
+                }
+            }
+            NavFrame::Settings => self.open_settings(),
+            NavFrame::Rules => self.open_rules(),
+            NavFrame::RuleLog => self.open_rule_log().await?,
+            NavFrame::RuleEdit(_) => {
+                // We don't capture full editor state; pop to Rules instead so
+                // the user can pick the rule again. Practical for v1.
+                self.open_rules();
+            }
+            NavFrame::Projects => self.open_projects().await?,
+            NavFrame::Confluence => self.open_confluence_spaces().await?,
+            NavFrame::ActiveStatusConfig => self.open_active_status_config(),
+        }
+        Ok(true)
+    }
+
+    /// Return to the Home pane and reload its activity feed. Used as the
+    /// "back" target from every top-level view (Settings, Rules, Kanban,
+    /// Tree, Archive, Confluence, Projects, ActiveStatusConfig).
+    pub async fn go_home(&mut self) -> Result<()> {
+        self.mode = Mode::Home(HomeForm {
+            items: Vec::new(),
+            selected: 0,
+            loading: true,
+            error: None,
+            menu_selected: 0,
+            focus: HomeFocus::Menu,
+        });
+        if let Err(e) = self.load_home_activity().await {
+            self.status = format!("activity err: {e:#}");
+        }
+        Ok(())
+    }
+
+    /// Refresh the Home pane's activity feed from the daemon. Idempotent;
+    /// safe to call on startup and on user-triggered refresh.
+    pub async fn load_home_activity(&mut self) -> Result<()> {
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(&mut s, &Request::RecentActivity { limit: 50 }).await?;
+        if let Mode::Home(form) = &mut self.mode {
+            form.loading = false;
+            match resp {
+                Response::Activity { items } => {
+                    form.items = items;
+                    form.selected = form.selected.min(form.items.len().saturating_sub(1));
+                }
+                Response::Err { message } => form.error = Some(message),
+                _ => form.error = Some("unexpected response".into()),
+            }
+        }
+        Ok(())
+    }
+
+    /// Switch from Home to a named target view. Each branch mirrors the
+    /// existing keybind that opens that view from List. Pushes Home onto
+    /// the back stack so Q from the destination pops here.
+    pub async fn home_open(&mut self, target: HomeTarget) -> Result<()> {
+        self.push_current_view();
+        match target {
+            HomeTarget::List => {
+                self.mode = Mode::List;
+            }
+            HomeTarget::Tree => {
+                self.open_tree().await?;
+            }
+            HomeTarget::Kanban => {
+                self.mode = Mode::Kanban;
+            }
+            HomeTarget::Archive => {
+                self.mode = Mode::Archive;
+            }
+            HomeTarget::Confluence => {
+                self.open_confluence_spaces().await?;
+            }
+            HomeTarget::Settings => {
+                self.open_settings();
+            }
+            HomeTarget::Rules => {
+                self.open_rules();
+            }
+            HomeTarget::Projects => {
+                self.open_projects().await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the rules-engine fire-history pane. Fetches the most recent
+    /// 500 log entries (well within the 5-day rolling window for any
+    /// reasonable cadence) from the daemon.
+    pub async fn open_rule_log(&mut self) -> Result<()> {
+        self.mode = Mode::RuleLog(RuleLogForm {
+            items: Vec::new(),
+            selected: 0,
+            loading: true,
+            error: None,
+        });
+        self.status = "loading rule log…".into();
+        let mut s = ipc::connect().await?;
+        let resp = ipc::send_request(&mut s, &Request::ListRuleLog { limit: 500 }).await?;
+        if let Mode::RuleLog(form) = &mut self.mode {
+            form.loading = false;
+            match resp {
+                Response::RuleLog { items } => {
+                    form.items = items;
+                    self.status = format!(
+                        "rule log — {} entries (5-day rolling) · j/k scroll · r refresh · esc back",
+                        form.items.len()
+                    );
+                }
+                Response::Err { message } => {
+                    form.error = Some(message.clone());
+                    self.status = format!("rule log err: {message}");
+                }
+                _ => {
+                    form.error = Some("unexpected response".into());
+                    self.status = "unexpected response".into();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Open the rules engine list pane. Rules are loaded fresh from
+    /// `~/.config/jui/config.toml` so external edits show up.
+    pub fn open_rules(&mut self) {
+        let cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
+        self.mode = Mode::Rules(RulesForm {
+            items: cfg.rules,
+            selected: 0,
+            pending_remove: None,
+        });
+        self.status = "rules — a add · d delete · t toggle · enter edit · esc back".into();
+    }
+
+    /// Save the current rules list back to `~/.config/jui/config.toml`.
+    /// Called after every add/delete/toggle so the user doesn't have to
+    /// remember a save key, mirroring the active-statuses editor.
+    pub fn save_rules(&mut self) -> Result<()> {
+        let Mode::Rules(form) = &self.mode else { return Ok(()) };
+        let items = form.items.clone();
+        let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
+        cfg.rules = items;
+        cfg.save()?;
+        Ok(())
+    }
+
+    /// Persist a single rule edit back into the rules list, then return to
+    /// the list view. If `original_id` is `None`, the rule is pushed as new;
+    /// otherwise the existing rule with that id is replaced in place.
+    pub fn save_rule_edit(&mut self) -> Result<()> {
+        let (working, original) = match &self.mode {
+            Mode::RuleEdit(f) => (f.rule.clone(), f.original_id.clone()),
+            _ => return Ok(()),
+        };
+        let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
+        match original {
+            Some(id) => {
+                if let Some(slot) = cfg.rules.iter_mut().find(|r| r.id == id) {
+                    *slot = working;
+                } else {
+                    cfg.rules.push(working);
+                }
+            }
+            None => cfg.rules.push(working),
+        }
+        cfg.save()?;
+        self.open_rules();
+        self.status = "rule saved".into();
+        Ok(())
+    }
+
     /// Open the general Settings page. Values are seeded from the cached
     /// fields on `App`; commits write through `save_settings`.
     pub fn open_settings(&mut self) {
@@ -5396,8 +5845,14 @@ pub async fn run() -> Result<()> {
     if let Err(e) = app.load_myself().await {
         app.status = format!("auth lookup failed: {e:#}");
     }
+    // Background-warm the ticket cache so list-view is ready when the user
+    // navigates into it from Home. Failures are non-fatal — Home renders
+    // even when Jira's unreachable.
     if let Err(e) = app.refresh().await {
         app.status = format!("refresh failed: {e:#}");
+    }
+    if let Err(e) = app.load_home_activity().await {
+        app.status = format!("activity load failed: {e:#}");
     }
 
     let res = main_loop(&mut term, &mut app).await;
@@ -5518,10 +5973,13 @@ async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Resu
     }
     // Navigation mode (picker closed).
     let mut open_picker = false;
+    if matches!(&app.mode, Mode::Settings(_)) && matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.pop_back_or_quit().await?;
+        return Ok(());
+    }
     if let Mode::Settings(form) = &mut app.mode {
         match code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                app.mode = Mode::List;
                 return Ok(());
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -5540,6 +5998,786 @@ async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Resu
     Ok(())
 }
 
+async fn rules_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result<()> {
+    let mut open_edit_idx: Option<usize> = None;
+    let mut open_edit_new = false;
+    let mut do_save = false;
+    let mut open_log = false;
+    // Esc/q from the rules pane pops the nav stack (back to whatever
+    // brought us here — typically Home). Handle early so the async call
+    // doesn't fight the borrow on `app.mode` below.
+    if matches!(&app.mode, Mode::Rules(_)) && matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+        app.pop_back_or_quit().await?;
+        return Ok(());
+    }
+    if let Mode::Rules(form) = &mut app.mode {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                return Ok(());
+            }
+            KeyCode::Char('l') => {
+                open_log = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !form.items.is_empty() {
+                    form.selected = (form.selected + 1).min(form.items.len() - 1);
+                }
+                form.pending_remove = None;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+                form.pending_remove = None;
+            }
+            KeyCode::Char('a') => {
+                open_edit_new = true;
+            }
+            KeyCode::Char('t') => {
+                if let Some(r) = form.items.get_mut(form.selected) {
+                    r.enabled = !r.enabled;
+                    do_save = true;
+                }
+            }
+            KeyCode::Char('d') => {
+                if form.pending_remove == Some(form.selected) {
+                    if form.selected < form.items.len() {
+                        form.items.remove(form.selected);
+                        form.selected = form.selected.min(form.items.len().saturating_sub(1));
+                        do_save = true;
+                    }
+                    form.pending_remove = None;
+                } else {
+                    form.pending_remove = Some(form.selected);
+                    app.status = "press d again to confirm delete".into();
+                }
+            }
+            KeyCode::Enter => {
+                if !form.items.is_empty() {
+                    open_edit_idx = Some(form.selected);
+                }
+            }
+            _ => {}
+        }
+    }
+    if do_save {
+        if let Err(e) = app.save_rules() {
+            app.status = format!("save err: {e:#}");
+        } else {
+            app.status = "rules saved".into();
+        }
+    }
+    if open_edit_new {
+        app.push_current_view();
+        let rule = jui_core::rules::Rule {
+            id: jui_core::rules::new_rule_id(),
+            name: "new rule".into(),
+            enabled: true,
+            trigger: jui_core::rules::Trigger::PrCreated,
+            conditions: vec![],
+            actions: vec![],
+        };
+        app.mode = Mode::RuleEdit(RuleEditForm {
+            original_id: None,
+            rule,
+            selected_row: 0,
+            edit_buffer: None,
+            edit_target: None,
+            pending_remove_condition: None,
+            pending_remove_action: None,
+            error: None,
+            picker: None,
+            var_picker: None,
+        });
+        app.status = "new rule — j/k move · enter edit · a add cond/act · ctrl-s save · esc cancel".into();
+    } else if let Some(idx) = open_edit_idx {
+        let snapshot = if let Mode::Rules(form) = &app.mode {
+            form.items.get(idx).cloned()
+        } else {
+            None
+        };
+        if let Some(rule) = snapshot {
+            app.push_current_view();
+            let id = rule.id.clone();
+            app.mode = Mode::RuleEdit(RuleEditForm {
+                original_id: Some(id),
+                rule,
+                selected_row: 0,
+                edit_buffer: None,
+                edit_target: None,
+                pending_remove_condition: None,
+                pending_remove_action: None,
+                error: None,
+                picker: None,
+                var_picker: None,
+            });
+            app.status = "editing rule — ctrl-s save · esc cancel".into();
+        }
+    }
+    if open_log {
+        app.push_current_view();
+        app.open_rule_log().await?;
+    }
+    Ok(())
+}
+
+async fn home_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result<()> {
+    let mut do_refresh = false;
+    let mut open_target: Option<HomeTarget> = None;
+    let mut open_ticket: Option<String> = None;
+    if let Mode::Home(form) = &mut app.mode {
+        // Number-key shortcuts always work regardless of focus — quicker than
+        // moving the cursor.
+        if let KeyCode::Char(c) = code {
+            for (i, (target, num, _hot, _desc)) in HOME_TARGETS.iter().enumerate() {
+                if c.to_string() == *num {
+                    open_target = Some(*target);
+                    form.menu_selected = i;
+                    break;
+                }
+            }
+        }
+        if open_target.is_none() {
+            match code {
+                KeyCode::Char('q') => {
+                    app.should_quit = true;
+                    return Ok(());
+                }
+                KeyCode::Tab | KeyCode::BackTab => {
+                    form.focus = match form.focus {
+                        HomeFocus::Menu => HomeFocus::Activity,
+                        HomeFocus::Activity => HomeFocus::Menu,
+                    };
+                }
+                KeyCode::Char('r') => do_refresh = true,
+                KeyCode::Char('j') | KeyCode::Down => match form.focus {
+                    HomeFocus::Menu => {
+                        if !HOME_TARGETS.is_empty() {
+                            form.menu_selected =
+                                (form.menu_selected + 1).min(HOME_TARGETS.len() - 1);
+                        }
+                    }
+                    HomeFocus::Activity => {
+                        if !form.items.is_empty() {
+                            form.selected = (form.selected + 1).min(form.items.len() - 1);
+                        }
+                    }
+                },
+                KeyCode::Char('k') | KeyCode::Up => match form.focus {
+                    HomeFocus::Menu => {
+                        form.menu_selected = form.menu_selected.saturating_sub(1);
+                    }
+                    HomeFocus::Activity => {
+                        form.selected = form.selected.saturating_sub(1);
+                    }
+                },
+                KeyCode::Enter => match form.focus {
+                    HomeFocus::Menu => {
+                        if let Some((target, _, _, _)) = HOME_TARGETS.get(form.menu_selected) {
+                            open_target = Some(*target);
+                        }
+                    }
+                    HomeFocus::Activity => {
+                        if let Some(item) = form.items.get(form.selected) {
+                            if let Some(k) = &item.ticket_key {
+                                open_ticket = Some(k.clone());
+                            }
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+    if do_refresh {
+        app.load_home_activity().await?;
+    }
+    if let Some(target) = open_target {
+        app.home_open(target).await?;
+    } else if let Some(key) = open_ticket {
+        // Opening a Detail from the Home activity feed counts as forward
+        // navigation; push Home so Q from Detail pops back here.
+        app.push_current_view();
+        app.detail_origin = DetailOrigin::List;
+        app.open_ticket_by_key(key).await?;
+        app.mode = Mode::Detail;
+    }
+    Ok(())
+}
+
+async fn rule_log_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result<()> {
+    let mut do_refresh = false;
+    if let Mode::RuleLog(form) = &mut app.mode {
+        match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.open_rules();
+                return Ok(());
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !form.items.is_empty() {
+                    form.selected = (form.selected + 1).min(form.items.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') => form.selected = 0,
+            KeyCode::Char('G') => {
+                form.selected = form.items.len().saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                form.selected = (form.selected + 10).min(form.items.len().saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                form.selected = form.selected.saturating_sub(10);
+            }
+            KeyCode::Char('r') => do_refresh = true,
+            _ => {}
+        }
+    }
+    if do_refresh {
+        app.open_rule_log().await?;
+    }
+    Ok(())
+}
+
+/// Dynamic row layout for the rule editor. The order is:
+///   Name, Trigger, [TriggerFilter when applicable], Enabled,
+///   ConditionsHeader, [Cond(0..N)], AddCondition,
+///   ActionsHeader,    [Act(0..M)],  AddAction
+#[derive(Debug, Clone, Copy)]
+pub enum RuleRow {
+    Name,
+    Trigger,
+    TriggerFilter,
+    Enabled,
+    ConditionsHeader,
+    Cond(usize),
+    AddCondition,
+    ActionsHeader,
+    Act(usize),
+    AddAction,
+}
+
+pub fn rule_edit_rows(rule: &jui_core::rules::Rule) -> Vec<RuleRow> {
+    let mut out = vec![RuleRow::Name, RuleRow::Trigger];
+    if trigger_has_filter(&rule.trigger) {
+        out.push(RuleRow::TriggerFilter);
+    }
+    out.push(RuleRow::Enabled);
+    out.push(RuleRow::ConditionsHeader);
+    for i in 0..rule.conditions.len() {
+        out.push(RuleRow::Cond(i));
+    }
+    out.push(RuleRow::AddCondition);
+    out.push(RuleRow::ActionsHeader);
+    for i in 0..rule.actions.len() {
+        out.push(RuleRow::Act(i));
+    }
+    out.push(RuleRow::AddAction);
+    out
+}
+
+fn trigger_has_filter(t: &jui_core::rules::Trigger) -> bool {
+    matches!(
+        t,
+        jui_core::rules::Trigger::TicketStatusChanged { .. }
+            | jui_core::rules::Trigger::TicketAssigned { .. }
+    )
+}
+
+/// Cycle through trigger variants for the cycle-picker key on the Trigger row.
+pub fn cycle_trigger(t: &jui_core::rules::Trigger, forward: bool) -> jui_core::rules::Trigger {
+    use jui_core::rules::Trigger as T;
+    let variants = [
+        T::PrCreated,
+        T::StartWork,
+        T::StopWork,
+        T::TicketStatusChanged { from: None, to: None },
+        T::TicketAssigned { to_me: None },
+    ];
+    let i = match t {
+        T::PrCreated => 0,
+        T::StartWork => 1,
+        T::StopWork => 2,
+        T::TicketStatusChanged { .. } => 3,
+        T::TicketAssigned { .. } => 4,
+    };
+    let n = variants.len();
+    let next = if forward { (i + 1) % n } else { (i + n - 1) % n };
+    variants[next].clone()
+}
+
+fn cycle_condition(c: &jui_core::rules::Condition) -> jui_core::rules::Condition {
+    use jui_core::rules::Condition as C;
+    match c {
+        C::ProjectKeyEquals { .. } => C::StatusEquals { value: String::new() },
+        C::StatusEquals { .. } => C::IssueTypeIn { values: vec![] },
+        C::IssueTypeIn { .. } => C::HasLinkedRepo,
+        C::HasLinkedRepo => C::ActorIsMe,
+        C::ActorIsMe => C::ProjectKeyEquals { value: String::new() },
+    }
+}
+
+fn cycle_action(a: &jui_core::rules::Action) -> jui_core::rules::Action {
+    use jui_core::rules::Action as A;
+    match a {
+        A::JiraTransition { .. } => A::JiraComment { body: String::new() },
+        A::JiraComment { .. } => A::GithubPrComment { body: String::new() },
+        A::GithubPrComment { .. } => A::SetTicketDevQa,
+        A::SetTicketDevQa => A::JiraTransition { to: String::new() },
+    }
+}
+
+async fn rule_edit_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<()> {
+    // Picker overlay first — when open, all keys feed it.
+    if matches!(&app.mode, Mode::RuleEdit(f) if f.picker.is_some()) {
+        return rule_edit_picker_keys(app, code).await;
+    }
+    // Compute the row layout once per keypress.
+    let rows: Vec<RuleRow> = if let Mode::RuleEdit(form) = &app.mode {
+        rule_edit_rows(&form.rule)
+    } else {
+        return Ok(());
+    };
+    let n = rows.len();
+    let mut do_save = false;
+    let mut bail = false;
+    let mut open_picker: Option<RulePickerTarget> = None;
+    if let Mode::RuleEdit(form) = &mut app.mode {
+        // Text-input mode takes precedence: keystrokes feed the buffer until
+        // Enter (commit) or Esc (abort).
+        if let Some(buf) = form.edit_buffer.as_mut() {
+            // Variable-autocomplete sub-state: open when the user typed `{`.
+            // Filter chars typed since the `{` form the live filter; Tab /
+            // Enter while the picker is open insert the selected variable
+            // and keep edit mode open, so the user can keep typing and then
+            // press Enter again to commit the whole field.
+            if let Some(vp) = form.var_picker.as_mut() {
+                let filter: String = buf[vp.anchor + 1..].to_string();
+                let matches_len = filter_vars(&filter).len();
+                match code {
+                    KeyCode::Esc => {
+                        form.var_picker = None;
+                    }
+                    KeyCode::Up => {
+                        vp.selected = vp.selected.saturating_sub(1);
+                    }
+                    KeyCode::Down => {
+                        if matches_len > 0 {
+                            vp.selected = (vp.selected + 1).min(matches_len - 1);
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Enter => {
+                        let matches = filter_vars(&filter);
+                        let picked = matches
+                            .get(vp.selected.min(matches.len().saturating_sub(1)))
+                            .map(|(name, _)| (*name).to_string());
+                        if let Some(name) = picked {
+                            buf.truncate(vp.anchor);
+                            buf.push('{');
+                            buf.push_str(&name);
+                            buf.push('}');
+                        }
+                        form.var_picker = None;
+                    }
+                    KeyCode::Backspace => {
+                        if buf.len() > vp.anchor + 1 {
+                            buf.pop();
+                            vp.selected = 0;
+                        } else {
+                            // Past the `{` — pop it too and close picker.
+                            buf.pop();
+                            form.var_picker = None;
+                        }
+                    }
+                    KeyCode::Char(c) => {
+                        if c == '}' {
+                            // User typed the closing brace themselves —
+                            // commit whatever they have literally and stop.
+                            buf.push(c);
+                            form.var_picker = None;
+                        } else if c == '{' {
+                            // Reopen at a new anchor (e.g. inside an already-
+                            // closed brace pair).
+                            vp.anchor = buf.len();
+                            vp.selected = 0;
+                            buf.push(c);
+                        } else {
+                            buf.push(c);
+                            vp.selected = 0;
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(());
+            }
+            match code {
+                KeyCode::Esc => {
+                    form.edit_buffer = None;
+                    form.edit_target = None;
+                }
+                KeyCode::Enter => {
+                    let value = buf.clone();
+                    let target = form.edit_target.clone();
+                    form.edit_buffer = None;
+                    form.edit_target = None;
+                    apply_edit(&mut form.rule, target, value);
+                }
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char('{') => {
+                    let anchor = buf.len();
+                    buf.push('{');
+                    form.var_picker = Some(VarPicker { anchor, selected: 0 });
+                }
+                KeyCode::Char(c) => {
+                    buf.push(c);
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+        match code {
+            KeyCode::Esc => {
+                bail = true;
+            }
+            KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
+                do_save = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                form.selected_row = (form.selected_row + 1).min(n.saturating_sub(1));
+                form.pending_remove_condition = None;
+                form.pending_remove_action = None;
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                form.selected_row = form.selected_row.saturating_sub(1);
+                form.pending_remove_condition = None;
+                form.pending_remove_action = None;
+            }
+            KeyCode::Char(' ') | KeyCode::Tab | KeyCode::Right => {
+                // Cycle whatever is selected.
+                match rows.get(form.selected_row).copied() {
+                    Some(RuleRow::Trigger) => {
+                        form.rule.trigger = cycle_trigger(&form.rule.trigger, true);
+                    }
+                    Some(RuleRow::Enabled) => {
+                        form.rule.enabled = !form.rule.enabled;
+                    }
+                    Some(RuleRow::Cond(i)) => {
+                        if let Some(c) = form.rule.conditions.get_mut(i) {
+                            *c = cycle_condition(c);
+                        }
+                    }
+                    Some(RuleRow::Act(i)) => {
+                        if let Some(a) = form.rule.actions.get_mut(i) {
+                            *a = cycle_action(a);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::BackTab | KeyCode::Left => {
+                if let Some(RuleRow::Trigger) = rows.get(form.selected_row).copied() {
+                    form.rule.trigger = cycle_trigger(&form.rule.trigger, false);
+                }
+            }
+            KeyCode::Char('e') | KeyCode::Enter => {
+                // Open text-edit buffer for whichever row supports it.
+                match rows.get(form.selected_row).copied() {
+                    Some(RuleRow::Name) => {
+                        form.edit_buffer = Some(form.rule.name.clone());
+                        form.edit_target = Some(RuleEditTarget::Name);
+                    }
+                    Some(RuleRow::TriggerFilter) => {
+                        let cur = match &form.rule.trigger {
+                            jui_core::rules::Trigger::TicketStatusChanged { to, .. } => {
+                                to.clone().unwrap_or_default()
+                            }
+                            jui_core::rules::Trigger::TicketAssigned { to_me } => {
+                                to_me.map(|b| b.to_string()).unwrap_or_default()
+                            }
+                            _ => String::new(),
+                        };
+                        form.edit_buffer = Some(cur);
+                        form.edit_target = Some(RuleEditTarget::TriggerFilter);
+                    }
+                    Some(RuleRow::Cond(i)) => {
+                        let cur = match form.rule.conditions.get(i) {
+                            Some(jui_core::rules::Condition::ProjectKeyEquals { value }) => value.clone(),
+                            Some(jui_core::rules::Condition::StatusEquals { value }) => value.clone(),
+                            Some(jui_core::rules::Condition::IssueTypeIn { values }) => values.join(","),
+                            _ => String::new(),
+                        };
+                        form.edit_buffer = Some(cur);
+                        form.edit_target = Some(RuleEditTarget::ConditionValue(i));
+                    }
+                    Some(RuleRow::Act(i)) => {
+                        // JiraTransition pops a status picker (filter list of
+                        // all statuses); other text actions open the inline
+                        // edit buffer; SetTicketDevQa has nothing to edit.
+                        match form.rule.actions.get(i) {
+                            Some(jui_core::rules::Action::JiraTransition { .. }) => {
+                                open_picker = Some(RulePickerTarget::ActionTransitionTo(i));
+                            }
+                            Some(jui_core::rules::Action::JiraComment { body }) => {
+                                form.edit_buffer = Some(body.clone());
+                                form.edit_target = Some(RuleEditTarget::ActionValue(i));
+                            }
+                            Some(jui_core::rules::Action::GithubPrComment { body }) => {
+                                form.edit_buffer = Some(body.clone());
+                                form.edit_target = Some(RuleEditTarget::ActionValue(i));
+                            }
+                            Some(jui_core::rules::Action::SetTicketDevQa) | None => {
+                                app.status = "this action has no editable value — use tab/space to cycle action kind".into();
+                            }
+                        }
+                    }
+                    Some(RuleRow::AddCondition) => {
+                        form.rule.conditions.push(jui_core::rules::Condition::HasLinkedRepo);
+                    }
+                    Some(RuleRow::AddAction) => {
+                        form.rule.actions.push(jui_core::rules::Action::JiraComment {
+                            body: String::new(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::Char('a') => {
+                // Same as add on AddCondition / AddAction rows, but also
+                // works from header rows for convenience.
+                match rows.get(form.selected_row).copied() {
+                    Some(RuleRow::ConditionsHeader)
+                    | Some(RuleRow::AddCondition)
+                    | Some(RuleRow::Cond(_)) => {
+                        form.rule.conditions.push(jui_core::rules::Condition::HasLinkedRepo);
+                    }
+                    Some(RuleRow::ActionsHeader)
+                    | Some(RuleRow::AddAction)
+                    | Some(RuleRow::Act(_)) => {
+                        form.rule.actions.push(jui_core::rules::Action::JiraComment {
+                            body: String::new(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            KeyCode::Char('d') => {
+                match rows.get(form.selected_row).copied() {
+                    Some(RuleRow::Cond(i)) => {
+                        if form.pending_remove_condition == Some(i) {
+                            if i < form.rule.conditions.len() {
+                                form.rule.conditions.remove(i);
+                            }
+                            form.pending_remove_condition = None;
+                        } else {
+                            form.pending_remove_condition = Some(i);
+                            app.status = "press d again to delete condition".into();
+                        }
+                    }
+                    Some(RuleRow::Act(i)) => {
+                        if form.pending_remove_action == Some(i) {
+                            if i < form.rule.actions.len() {
+                                form.rule.actions.remove(i);
+                            }
+                            form.pending_remove_action = None;
+                        } else {
+                            form.pending_remove_action = Some(i);
+                            app.status = "press d again to delete action".into();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    if bail {
+        app.open_rules();
+        return Ok(());
+    }
+    if do_save {
+        if let Err(e) = app.save_rule_edit() {
+            if let Mode::RuleEdit(f) = &mut app.mode {
+                f.error = Some(format!("save err: {e:#}"));
+            }
+        }
+    }
+    if let Some(target) = open_picker {
+        app.open_rule_picker(target).await?;
+    }
+    Ok(())
+}
+
+/// Open the status picker for a rule-edit field. Currently only fired for
+/// `JiraTransition.to`. Async because we hit the daemon for the full Jira
+/// status list — same `ListStatuses` request the Settings picker uses.
+impl App {
+    pub async fn open_rule_picker(&mut self, target: RulePickerTarget) -> Result<()> {
+        // Pre-select the current value if any (for ActionTransitionTo).
+        let current = match (&self.mode, target) {
+            (Mode::RuleEdit(f), RulePickerTarget::ActionTransitionTo(i)) => {
+                match f.rule.actions.get(i) {
+                    Some(jui_core::rules::Action::JiraTransition { to }) => to.clone(),
+                    _ => String::new(),
+                }
+            }
+            _ => String::new(),
+        };
+        if let Mode::RuleEdit(f) = &mut self.mode {
+            f.picker = Some(RulePicker {
+                target,
+                query: String::new(),
+                all: Vec::new(),
+                selected: 0,
+                loading: true,
+                error: None,
+            });
+        }
+        self.status = "fetching statuses…".into();
+        let resp = {
+            let mut s = ipc::connect().await?;
+            ipc::send_request(&mut s, &Request::ListStatuses).await?
+        };
+        if let Mode::RuleEdit(f) = &mut self.mode {
+            let Some(p) = f.picker.as_mut() else { return Ok(()) };
+            p.loading = false;
+            match resp {
+                Response::Statuses { items } => {
+                    if let Some(pos) = items
+                        .iter()
+                        .position(|s| s.eq_ignore_ascii_case(&current))
+                    {
+                        p.selected = pos;
+                    }
+                    p.all = items;
+                    self.status = "type: filter · j/k: move · enter: pick · esc: cancel".into();
+                }
+                Response::Err { message } => {
+                    p.error = Some(message.clone());
+                    self.status = format!("status fetch failed: {message}");
+                }
+                _ => {
+                    p.error = Some("unexpected response".into());
+                    self.status = "unexpected response".into();
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn rule_edit_picker_keys(app: &mut App, code: KeyCode) -> Result<()> {
+    let mut commit: Option<(RulePickerTarget, String)> = None;
+    if let Mode::RuleEdit(form) = &mut app.mode {
+        let Some(p) = form.picker.as_mut() else { return Ok(()) };
+        match code {
+            KeyCode::Esc => {
+                form.picker = None;
+                app.status = "pick cancelled".into();
+                return Ok(());
+            }
+            KeyCode::Down => {
+                let n = p.filtered().len();
+                if n > 0 {
+                    p.selected = (p.selected + 1).min(n - 1);
+                }
+                return Ok(());
+            }
+            KeyCode::Up => {
+                p.selected = p.selected.saturating_sub(1);
+                return Ok(());
+            }
+            KeyCode::Backspace => {
+                p.query.pop();
+                p.selected = 0;
+                return Ok(());
+            }
+            KeyCode::Enter => {
+                let val = p.filtered().get(p.selected).map(|s| s.to_string());
+                let Some(val) = val else {
+                    app.status = "no matching status".into();
+                    return Ok(());
+                };
+                commit = Some((p.target, val));
+            }
+            KeyCode::Char(c) => {
+                p.query.push(c);
+                p.selected = 0;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        }
+    }
+    if let Some((target, val)) = commit {
+        if let Mode::RuleEdit(form) = &mut app.mode {
+            form.picker = None;
+            match target {
+                RulePickerTarget::ActionTransitionTo(i) => {
+                    if let Some(jui_core::rules::Action::JiraTransition { to }) =
+                        form.rule.actions.get_mut(i)
+                    {
+                        *to = val.clone();
+                    }
+                }
+            }
+            app.status = format!("transition target = \"{val}\"");
+        }
+    }
+    Ok(())
+}
+
+fn apply_edit(rule: &mut jui_core::rules::Rule, target: Option<RuleEditTarget>, value: String) {
+    use jui_core::rules::{Action, Condition, Trigger};
+    let Some(t) = target else { return };
+    match t {
+        RuleEditTarget::Name => {
+            rule.name = value;
+        }
+        RuleEditTarget::TriggerFilter => match &mut rule.trigger {
+            Trigger::TicketStatusChanged { to, .. } => {
+                *to = if value.trim().is_empty() { None } else { Some(value.trim().to_string()) };
+            }
+            Trigger::TicketAssigned { to_me } => {
+                let v = value.trim().to_ascii_lowercase();
+                *to_me = match v.as_str() {
+                    "true" | "yes" | "y" | "1" => Some(true),
+                    "false" | "no" | "n" | "0" => Some(false),
+                    "" => None,
+                    _ => *to_me,
+                };
+            }
+            _ => {}
+        },
+        RuleEditTarget::ConditionValue(i) => {
+            if let Some(c) = rule.conditions.get_mut(i) {
+                match c {
+                    Condition::ProjectKeyEquals { value: v } => *v = value,
+                    Condition::StatusEquals { value: v } => *v = value,
+                    Condition::IssueTypeIn { values } => {
+                        *values = value
+                            .split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    _ => {}
+                }
+            }
+        }
+        RuleEditTarget::ActionValue(i) => {
+            if let Some(a) = rule.actions.get_mut(i) {
+                match a {
+                    Action::JiraTransition { to } => *to = value,
+                    Action::JiraComment { body } => *body = value,
+                    Action::GithubPrComment { body } => *body = value,
+                    Action::SetTicketDevQa => {}
+                }
+            }
+        }
+    }
+}
+
 async fn detail_comments_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result<()> {
     match code {
         KeyCode::Char('j') | KeyCode::Down => {
@@ -5556,6 +6794,7 @@ async fn detail_comments_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers)
                     key: t.key.clone(),
                     body: String::new(),
                     reply_to: None,
+                    from_stop_work: false,
                 });
             }
         }
@@ -5569,6 +6808,7 @@ async fn detail_comments_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers)
                         parent_date: c.created.clone(),
                         parent_body: c.body.clone(),
                     }),
+                    from_stop_work: false,
                 });
             }
         }
@@ -5832,19 +7072,84 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             | Mode::ActiveStatusConfig(_)
             | Mode::Settings(_)
             | Mode::PrCommentReply(_)
+            | Mode::RuleEdit(_)
+            | Mode::RuleLog(_)
     );
     if !in_text_input && matches!(code, KeyCode::Char('?')) {
         app.show_help = true;
         return Ok(());
     }
-    // Settings has its own dispatch so we can call async picker fetches
-    // without holding a borrow on `app.mode` through the outer match.
+    // Unified Q: every navigable view's `q` walks back through the nav
+    // stack; when empty, the app exits. Esc keeps its per-mode semantics
+    // (cancels modals, returns to parent of sub-modes, etc.) — only `q`
+    // routes through the stack. Modal forms with text input never see `q`
+    // as a back command (they're in the in_text_input set above).
+    let q_press = matches!(code, KeyCode::Char('q'));
+    let in_navigable = matches!(
+        &app.mode,
+        Mode::Home(_)
+            | Mode::List
+            | Mode::Archive
+            | Mode::Kanban
+            | Mode::Tree(_)
+            | Mode::Projects(_)
+            | Mode::ConfluenceSpaces(_)
+            | Mode::Settings(_)
+            | Mode::Rules(_)
+            | Mode::RuleLog(_)
+            | Mode::RuleEdit(_)
+            | Mode::ActiveStatusConfig(_)
+    );
+    if q_press && in_navigable {
+        // ActiveStatusConfig's add-mode shouldn't quit-back — it's typing.
+        let block = matches!(
+            &app.mode,
+            Mode::ActiveStatusConfig(f) if f.adding.is_some()
+        );
+        if !block {
+            app.pop_back_or_quit().await?;
+            return Ok(());
+        }
+    }
+    // Esc on a top-level view (other than List) also pops the stack so
+    // users who default to Esc don't get stuck. Settings/Rules/RuleEdit/
+    // RuleLog handle Esc inside their own dispatch above, so this only
+    // covers Archive/Kanban/Tree/Projects/Confluence + Home itself.
+    if matches!(code, KeyCode::Esc)
+        && matches!(
+            &app.mode,
+            Mode::Home(_)
+                | Mode::Archive
+                | Mode::Kanban
+                | Mode::Tree(_)
+                | Mode::Projects(_)
+                | Mode::ConfluenceSpaces(_)
+        )
+    {
+        app.pop_back_or_quit().await?;
+        return Ok(());
+    }
+    // Sub-dispatchers for modes that hold async-heavy state (pickers, IPC
+    // round-trips); routed AFTER the unified Q/Esc handler so `q` lands on
+    // pop_back_or_quit instead of each pane's bespoke quit logic.
     if matches!(&app.mode, Mode::Settings(_)) {
         return settings_keys(app, code, mods).await;
     }
+    if matches!(&app.mode, Mode::Rules(_)) {
+        return rules_keys(app, code, mods).await;
+    }
+    if matches!(&app.mode, Mode::RuleEdit(_)) {
+        return rule_edit_keys(app, code, mods).await;
+    }
+    if matches!(&app.mode, Mode::RuleLog(_)) {
+        return rule_log_keys(app, code, mods).await;
+    }
+    if matches!(&app.mode, Mode::Home(_)) {
+        return home_keys(app, code, mods).await;
+    }
     match &mut app.mode {
         Mode::List => match code {
-            KeyCode::Char('q') => app.should_quit = true,
+            // `q` handled by the unified Q dispatch above.
             KeyCode::BackTab => {
                 // Shift-Tab cycles focus between the Active list and the
                 // Mentioned list at the bottom.
@@ -5895,16 +7200,37 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 app.status = format!("sort: {}", app.sort_mode.label());
             }
             KeyCode::Char('s') => { app.start_work().await?; }
-            KeyCode::Char('a') => { app.mode = Mode::Archive; }
+            KeyCode::Char('a') => {
+                app.push_current_view();
+                app.mode = Mode::Archive;
+            }
             KeyCode::Char('b') => {
                 let cols = app.kanban_columns();
                 app.kanban_card_per_col = vec![0; cols.len()];
                 app.kanban_col = app.kanban_col.min(cols.len().saturating_sub(1));
+                app.push_current_view();
                 app.mode = Mode::Kanban;
             }
-            KeyCode::Char('p') => { app.open_projects().await?; }
-            KeyCode::Char('W') => { app.open_active_status_config(); }
-            KeyCode::Char(',') => { app.open_settings(); }
+            KeyCode::Char('p') => { app.push_current_view(); app.open_projects().await?; }
+            KeyCode::Char('W') => { app.push_current_view(); app.open_active_status_config(); }
+            KeyCode::Char(',') => { app.push_current_view(); app.open_settings(); }
+            KeyCode::Char(':') => { app.push_current_view(); app.open_rules(); }
+            KeyCode::Char('H') => {
+                // Return to Home from List as a *forward* navigation — push
+                // current onto the stack so Q from Home walks back.
+                app.push_current_view();
+                app.mode = Mode::Home(HomeForm {
+                    items: Vec::new(),
+                    selected: 0,
+                    loading: true,
+                    error: None,
+                    menu_selected: 0,
+                    focus: HomeFocus::Menu,
+                });
+                if let Err(e) = app.load_home_activity().await {
+                    app.status = format!("activity err: {e:#}");
+                }
+            }
             KeyCode::Char('M') => {
                 app.show_all_mine = !app.show_all_mine;
                 app.status = if app.show_all_mine {
@@ -5914,8 +7240,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 };
                 app.refresh().await?;
             }
-            KeyCode::Char('f') => { app.open_confluence_spaces().await?; }
-            KeyCode::Char('T') => { app.open_tree().await?; }
+            KeyCode::Char('f') => { app.push_current_view(); app.open_confluence_spaces().await?; }
+            KeyCode::Char('T') => { app.push_current_view(); app.open_tree().await?; }
             KeyCode::Tab => {
                 // Tab expands subtasks in the Active section; no-op in Mentioned.
                 if app.list_focus != ListFocus::Active { return Ok(()); }
@@ -5954,6 +7280,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             KeyCode::Enter => {
                 if app.current_ticket().is_some() {
+                    app.push_current_view();
                     app.detail_origin = DetailOrigin::List;
                     app.detail_focus = DetailFocus::Info;
                     app.load_detail().await?;
@@ -6289,6 +7616,24 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         NavFrame::List => app.mode = Mode::List,
                         NavFrame::Archive => app.mode = Mode::Archive,
                         NavFrame::Kanban => app.mode = Mode::Kanban,
+                        NavFrame::Home => {
+                            app.mode = Mode::Home(HomeForm {
+                                items: Vec::new(),
+                                selected: 0,
+                                loading: true,
+                                error: None,
+                                menu_selected: 0,
+                                focus: HomeFocus::Menu,
+                            });
+                            let _ = app.load_home_activity().await;
+                        }
+                        NavFrame::Settings => app.open_settings(),
+                        NavFrame::Rules => app.open_rules(),
+                        NavFrame::RuleLog => app.open_rule_log().await?,
+                        NavFrame::RuleEdit(_) => app.open_rules(),
+                        NavFrame::Projects => app.open_projects().await?,
+                        NavFrame::Confluence => app.open_confluence_spaces().await?,
+                        NavFrame::ActiveStatusConfig => app.open_active_status_config(),
                     }
                 } else {
                     app.mode = match app.detail_origin {
@@ -6609,6 +7954,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         key: t.key.clone(),
                         body: String::new(),
                         reply_to: None,
+                        from_stop_work: false,
                     });
                 }
             }
@@ -6777,7 +8123,16 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
         }
         Mode::Comment(form) => match code {
-            KeyCode::Esc => app.mode = Mode::Detail,
+            KeyCode::Esc => {
+                // On stop-work, Esc still stops the work — it just skips the
+                // optional comment. Normal comment Esc bails to Detail.
+                if form.from_stop_work {
+                    let key = form.key.clone();
+                    app.submit_stop_work_no_comment(key).await?;
+                } else {
+                    app.mode = Mode::Detail;
+                }
+            }
             KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => app.submit_comment().await?,
             KeyCode::Enter => form.body.push('\n'),
             KeyCode::Backspace => { form.body.pop(); }
@@ -7710,6 +9065,14 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
         }
         Mode::ActiveStatusConfig(form) => {
+            // Top-level back: Esc/q while NOT in add-mode pops the nav stack
+            // (typically back to Settings, which is where the user came from).
+            // Handled before the borrow on `form` so the async call doesn't
+            // overlap. Add-mode's own Esc cancels the input (handled below).
+            if form.adding.is_none() && matches!(code, KeyCode::Esc | KeyCode::Char('q')) {
+                app.pop_back_or_quit().await?;
+                return Ok(());
+            }
             // Two-press 'd' guard: any other key clears the pending row.
             if !matches!(code, KeyCode::Char('d')) {
                 form.pending_remove = None;
@@ -7861,6 +9224,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 _ => {}
             }
         }
+        // Rules + RuleEdit + RuleLog + Home are routed via their own dispatch
+        // (see handle_key top); these arms only exist for match exhaustiveness.
+        Mode::Rules(_) | Mode::RuleEdit(_) | Mode::RuleLog(_) | Mode::Home(_) => {}
     }
     Ok(())
 }

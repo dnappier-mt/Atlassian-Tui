@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod jira;
 pub mod jira_api;
 pub mod paths;
+pub mod rules;
 pub mod scm;
 pub mod ticket;
 pub mod users_map;

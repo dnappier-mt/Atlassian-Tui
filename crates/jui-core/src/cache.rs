@@ -219,6 +219,47 @@ impl Cache {
             );
             "#,
         )?;
+        // Ticket status changes captured from poll diffs. Drives the Home
+        // pane's activity feed alongside comments / pr_comments. Pruned to a
+        // 30-day rolling window on insert (long enough for "recently" but
+        // capped so it can't grow without bound on long-running daemons).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS ticket_status_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ticket_key  TEXT NOT NULL,
+                from_status TEXT,
+                to_status   TEXT NOT NULL,
+                changed_at  INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS ticket_status_history_changed_at
+                ON ticket_status_history(changed_at DESC);
+            "#,
+        )?;
+        // Rules-engine execution log. One row per action executed (rather
+        // than per rule fired) so per-action errors don't get smeared. Pruned
+        // to a rolling 5-day window on every insert; index on `fired_at` so
+        // the TUI's newest-first read is cheap.
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS rule_log (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                fired_at           INTEGER NOT NULL,
+                rule_id            TEXT NOT NULL,
+                rule_name          TEXT NOT NULL,
+                trigger_kind       TEXT NOT NULL,
+                trigger_filters    TEXT,
+                ticket_key         TEXT,
+                action_idx         INTEGER NOT NULL,
+                action_kind        TEXT NOT NULL,
+                action_target      TEXT,
+                conditions_summary TEXT,
+                status             TEXT NOT NULL,
+                message            TEXT
+            );
+            CREATE INDEX IF NOT EXISTS rule_log_fired_at ON rule_log(fired_at DESC);
+            "#,
+        )?;
         // Idempotent additive migrations — `ALTER TABLE ADD COLUMN` errors if column
         // already exists, which we ignore.
         for col in [
@@ -238,8 +279,26 @@ impl Cache {
     }
 
     pub fn upsert_tickets(&mut self, tickets: &[Ticket]) -> Result<()> {
+        // Snapshot previous statuses so we can spot transitions and record
+        // them in `ticket_status_history`. Cheap — one round-trip across the
+        // keys we're about to write.
+        let prior: std::collections::HashMap<String, String> = {
+            let mut map = std::collections::HashMap::new();
+            let mut stmt = self
+                .conn
+                .prepare("SELECT key, status FROM tickets WHERE key = ?1")?;
+            for t in tickets {
+                let row: rusqlite::Result<(String, String)> =
+                    stmt.query_row([&t.key], |r| Ok((r.get(0)?, r.get(1)?)));
+                if let Ok((k, s)) = row {
+                    map.insert(k, s);
+                }
+            }
+            map
+        };
         let tx = self.conn.transaction()?;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now_iso = chrono::Utc::now().to_rfc3339();
+        let now_ms = chrono::Utc::now().timestamp_millis();
         {
             let mut stmt = tx.prepare(
                 r#"INSERT INTO tickets
@@ -272,14 +331,37 @@ impl Cache {
                 let labels = serde_json::to_string(&t.labels)?;
                 stmt.execute(params![
                     t.key, t.summary, t.status, t.assignee, t.reporter,
-                    t.priority, t.issue_type, t.updated, t.description, labels, now,
+                    t.priority, t.issue_type, t.updated, t.description, labels, now_iso,
                     t.original_estimate_seconds, t.remaining_estimate_seconds, t.time_spent_seconds,
                     t.created,
                     t.parent_key, t.parent_summary, t.parent_issue_type,
                     t.grandparent_key, t.grandparent_summary,
                 ])?;
             }
+            // Record status-change rows for any ticket whose previous status
+            // differed from the incoming one. Suppress no-op rows for first
+            // sightings (no prior row exists).
+            let mut hist = tx.prepare(
+                r#"INSERT INTO ticket_status_history
+                    (ticket_key, from_status, to_status, changed_at)
+                    VALUES (?1, ?2, ?3, ?4)"#,
+            )?;
+            for t in tickets {
+                if let Some(prev) = prior.get(&t.key) {
+                    if !prev.eq_ignore_ascii_case(&t.status) {
+                        hist.execute(params![t.key, prev, t.status, now_ms])?;
+                    }
+                }
+            }
         }
+        // Prune the history table to 30 days (separately from the txn so a
+        // huge prune doesn't block readers).
+        const THIRTY_DAYS_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+        let cutoff = now_ms - THIRTY_DAYS_MS;
+        tx.execute(
+            "DELETE FROM ticket_status_history WHERE changed_at < ?1",
+            params![cutoff],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1215,6 +1297,208 @@ impl Cache {
         )?;
         Ok(())
     }
+
+    /// Append one row to `rule_log` and immediately prune rows older than 5
+    /// days. The prune is cheap thanks to the `rule_log_fired_at` index;
+    /// running it on every insert keeps the table from growing unbounded
+    /// without a separate background sweep.
+    pub fn insert_rule_log(&self, entry: &RuleLogEntry) -> Result<()> {
+        const FIVE_DAYS_MS: i64 = 5 * 24 * 60 * 60 * 1000;
+        let cutoff = chrono::Utc::now().timestamp_millis() - FIVE_DAYS_MS;
+        self.conn.execute(
+            r#"INSERT INTO rule_log
+                (fired_at, rule_id, rule_name, trigger_kind, trigger_filters,
+                 ticket_key, action_idx, action_kind, action_target,
+                 conditions_summary, status, message)
+               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)"#,
+            params![
+                entry.fired_at,
+                entry.rule_id,
+                entry.rule_name,
+                entry.trigger_kind,
+                entry.trigger_filters,
+                entry.ticket_key,
+                entry.action_idx as i64,
+                entry.action_kind,
+                entry.action_target,
+                entry.conditions_summary,
+                entry.status,
+                entry.message,
+            ],
+        )?;
+        let _ = self
+            .conn
+            .execute("DELETE FROM rule_log WHERE fired_at < ?1", params![cutoff]);
+        Ok(())
+    }
+
+    /// Newest-first slice of the rolling window, capped at `limit`.
+    pub fn list_rule_log(&self, limit: u32) -> Result<Vec<RuleLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT fired_at, rule_id, rule_name, trigger_kind, trigger_filters,
+                       ticket_key, action_idx, action_kind, action_target,
+                       conditions_summary, status, message
+               FROM rule_log
+               ORDER BY fired_at DESC, id DESC
+               LIMIT ?1"#,
+        )?;
+        let rows = stmt
+            .query_map([limit as i64], |r| {
+                Ok(RuleLogEntry {
+                    fired_at: r.get(0)?,
+                    rule_id: r.get(1)?,
+                    rule_name: r.get(2)?,
+                    trigger_kind: r.get(3)?,
+                    trigger_filters: r.get(4)?,
+                    ticket_key: r.get(5)?,
+                    action_idx: r.get::<_, i64>(6)? as u32,
+                    action_kind: r.get(7)?,
+                    action_target: r.get(8)?,
+                    conditions_summary: r.get(9)?,
+                    status: r.get(10)?,
+                    message: r.get(11)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+}
+
+/// Mixed activity feed entry shown on the Home pane. Sources are merged
+/// client-side; the daemon already aggregates from cache tables.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ActivityEntry {
+    pub kind: String,
+    /// ISO 8601 / RFC3339 string; comparable as text for ordering.
+    pub when: String,
+    pub ticket_key: Option<String>,
+    /// One-line summary that the UI can render directly.
+    pub summary: String,
+    /// Optional fuller body for click-through (e.g. comment text).
+    pub detail: Option<String>,
+}
+
+impl Cache {
+    /// Newest-first merge across:
+    ///   - jira comments
+    ///   - pr comments
+    ///   - ticket_status_history
+    /// Returns up to `limit * 3` rows from each source then sort-merges by
+    /// `when` descending; trims to `limit`.
+    pub fn recent_activity(&self, limit: u32) -> Result<Vec<ActivityEntry>> {
+        let per_src = (limit * 3).max(60) as i64;
+        let mut out: Vec<ActivityEntry> = Vec::new();
+
+        // Jira comments (use `created` directly).
+        let mut stmt = self.conn.prepare(
+            r#"SELECT ticket_key, author, created, body
+               FROM comments
+               ORDER BY created DESC
+               LIMIT ?1"#,
+        )?;
+        for row in stmt.query_map([per_src], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })? {
+            let (key, author, when, body) = row?;
+            out.push(ActivityEntry {
+                kind: "jira_comment".into(),
+                when,
+                ticket_key: Some(key),
+                summary: format!("{author} commented"),
+                detail: Some(body),
+            });
+        }
+
+        // PR comments.
+        let mut stmt = self.conn.prepare(
+            r#"SELECT ticket_key, author, created, body, repo, pr_number
+               FROM pr_comments
+               ORDER BY created DESC
+               LIMIT ?1"#,
+        )?;
+        for row in stmt.query_map([per_src], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })? {
+            let (key, author, when, body, repo, num) = row?;
+            out.push(ActivityEntry {
+                kind: "pr_comment".into(),
+                when,
+                ticket_key: Some(key),
+                summary: format!("{author} on {repo}#{num}"),
+                detail: Some(body),
+            });
+        }
+
+        // Ticket status changes.
+        let mut stmt = self.conn.prepare(
+            r#"SELECT ticket_key, from_status, to_status, changed_at
+               FROM ticket_status_history
+               ORDER BY changed_at DESC
+               LIMIT ?1"#,
+        )?;
+        for row in stmt.query_map([per_src], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })? {
+            let (key, from, to, ms) = row?;
+            let when = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default();
+            let summary = match from {
+                Some(f) => format!("status: {f} → {to}"),
+                None => format!("status: {to}"),
+            };
+            out.push(ActivityEntry {
+                kind: "status_change".into(),
+                when,
+                ticket_key: Some(key),
+                summary,
+                detail: None,
+            });
+        }
+
+        // Merge: descending by `when` (string compare works for RFC3339 /
+        // ISO 8601 in UTC).
+        out.sort_by(|a, b| b.when.cmp(&a.when));
+        out.truncate(limit as usize);
+        Ok(out)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RuleLogEntry {
+    /// Unix epoch milliseconds for ordering + display.
+    pub fired_at: i64,
+    pub rule_id: String,
+    pub rule_name: String,
+    pub trigger_kind: String,
+    pub trigger_filters: Option<String>,
+    pub ticket_key: Option<String>,
+    pub action_idx: u32,
+    pub action_kind: String,
+    /// Rendered target value (post-template) — e.g. transition status, or
+    /// truncated comment body — so the log row is meaningful on its own.
+    pub action_target: Option<String>,
+    pub conditions_summary: Option<String>,
+    /// "ok" or "err".
+    pub status: String,
+    pub message: Option<String>,
 }
 
 fn row_to_ticket(r: &rusqlite::Row) -> rusqlite::Result<Ticket> {

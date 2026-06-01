@@ -16,6 +16,11 @@ pub struct GlobalConfig {
     pub projects: Vec<ProjectEntry>,
     #[serde(default)]
     pub workflow: WorkflowConfig,
+    /// User-editable automation rules. See `crates/jui-core/src/rules.rs`.
+    /// v1: rules layer on top of the hardcoded automations (additive); a
+    /// later v2 will seed defaults here and remove the hardcoded paths.
+    #[serde(default)]
+    pub rules: Vec<crate::rules::Rule>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -56,6 +56,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         }
         Mode::ActiveStatusConfig(_) => draw_active_status_config(f, chunks[1], app),
         Mode::Settings(_) => draw_settings(f, chunks[1], app),
+        Mode::Rules(_) => draw_rules(f, chunks[1], app),
+        Mode::RuleEdit(_) => draw_rule_edit(f, chunks[1], app),
+        Mode::RuleLog(_) => draw_rule_log(f, chunks[1], app),
+        Mode::Home(_) => draw_home(f, chunks[1], app),
         Mode::PrCommentReply(_) => {
             // Render Detail underneath so the PR-comments context stays
             // visible behind the modal.
@@ -103,6 +107,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Mode::PrCreate(_) => "pr",
         Mode::ActiveStatusConfig(_) => "workflow",
         Mode::Settings(_) => "settings",
+        Mode::Rules(_) => "rules",
+        Mode::RuleEdit(_) => "rule-edit",
+        Mode::RuleLog(_) => "rule-log",
+        Mode::Home(_) => "home",
         Mode::PrCommentReply(_) => "pr reply",
         Mode::ConfluencePages(form) => {
             conf_pages_label = if form.breadcrumb.is_empty() {
@@ -2022,6 +2030,629 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::Rules(form) = &app.mode else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" rules — a add · d delete · t toggle · enter edit · esc back ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if form.items.is_empty() {
+        let p = Paragraph::new(Span::styled(
+            "no rules yet. press `a` to add one.",
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(p, inner);
+        return;
+    }
+
+    let items: Vec<ListItem> = form
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let enabled = if r.enabled {
+                Span::styled("[on] ", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("[off]", Style::default().fg(Color::DarkGray))
+            };
+            let pending = form.pending_remove == Some(i);
+            let name_style = if pending {
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().add_modifier(Modifier::BOLD)
+            };
+            let trigger = trigger_summary(&r.trigger);
+            let summary = format!(
+                "  {}  on {}  · {} cond · {} act",
+                r.name,
+                trigger,
+                r.conditions.len(),
+                r.actions.len()
+            );
+            ListItem::new(Line::from(vec![
+                enabled,
+                Span::styled(summary, name_style),
+            ]))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(form.selected.min(form.items.len().saturating_sub(1))));
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
+fn draw_home(f: &mut Frame, area: Rect, app: &App) {
+    use crate::app::{HomeFocus, HOME_TARGETS};
+    let Mode::Home(form) = &app.mode else { return };
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(46), Constraint::Min(40)])
+        .split(area);
+
+    // Left: shortcut menu.
+    let menu_focused = form.focus == HomeFocus::Menu;
+    let menu_block = Block::default()
+        .borders(Borders::ALL)
+        .title(if menu_focused { " ▸ jui " } else { " jui " });
+    let menu_inner = menu_block.inner(chunks[0]);
+    f.render_widget(menu_block, chunks[0]);
+
+    let items: Vec<ListItem> = HOME_TARGETS
+        .iter()
+        .map(|(_, num, hot, desc)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!(" {num} "),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("({hot}) "),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::raw(*desc),
+            ]))
+        })
+        .collect();
+    let mut menu_state = ListState::default();
+    menu_state.select(Some(form.menu_selected.min(HOME_TARGETS.len() - 1)));
+    let menu_list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(menu_list, menu_inner, &mut menu_state);
+
+    // Right: activity feed.
+    let feed_focused = form.focus == HomeFocus::Activity;
+    let feed_block = Block::default()
+        .borders(Borders::ALL)
+        .title(if feed_focused {
+            format!(" ▸ recent activity ({}) ", form.items.len())
+        } else {
+            format!(" recent activity ({}) ", form.items.len())
+        });
+    let feed_inner = feed_block.inner(chunks[1]);
+    f.render_widget(feed_block, chunks[1]);
+
+    if form.loading {
+        f.render_widget(
+            Paragraph::new(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
+            feed_inner,
+        );
+        return;
+    }
+    if let Some(err) = &form.error {
+        f.render_widget(
+            Paragraph::new(format!("err: {err}")).style(Style::default().fg(Color::Red)),
+            feed_inner,
+        );
+        return;
+    }
+    if form.items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "no recent activity yet — comments and status changes will land here.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            feed_inner,
+        );
+        return;
+    }
+    let feed_items: Vec<ListItem> = form
+        .items
+        .iter()
+        .map(|e| {
+            let kind_span = match e.kind.as_str() {
+                "jira_comment" => Span::styled(" jira ", Style::default().fg(Color::Cyan)),
+                "pr_comment" => Span::styled(" pr   ", Style::default().fg(Color::Magenta)),
+                "status_change" => Span::styled(" stat ", Style::default().fg(Color::Yellow)),
+                _ => Span::styled(format!(" {:5}", e.kind), Style::default().fg(Color::Gray)),
+            };
+            let when = format_home_ts(&e.when);
+            let mut spans: Vec<Span> = vec![
+                Span::styled(format!("{when} "), Style::default().fg(Color::DarkGray)),
+                kind_span,
+                Span::raw(" "),
+            ];
+            if let Some(k) = &e.ticket_key {
+                spans.push(Span::styled(
+                    format!("{k} "),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            spans.push(Span::raw(e.summary.clone()));
+            if let Some(d) = &e.detail {
+                let snippet = one_line(d);
+                if !snippet.is_empty() {
+                    spans.push(Span::styled(
+                        format!("  — {snippet}"),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut feed_state = ListState::default();
+    feed_state.select(Some(form.selected.min(form.items.len() - 1)));
+    let feed_list = List::new(feed_items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(feed_list, feed_inner, &mut feed_state);
+}
+
+/// Best-effort RFC3339 → short timestamp. Same-day entries show HH:MM; older
+/// ones include MM-DD. Falls back to the raw string on parse failure.
+fn format_home_ts(raw: &str) -> String {
+    if let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(raw) {
+        let local = parsed.with_timezone(&chrono::Local);
+        let now = chrono::Local::now();
+        if local.date_naive() == now.date_naive() {
+            return local.format("%H:%M").to_string();
+        }
+        return local.format("%m-%d %H:%M").to_string();
+    }
+    raw.chars().take(16).collect()
+}
+
+fn draw_rule_log(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::RuleLog(form) = &app.mode else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" rule log (5-day rolling) — j/k scroll · r refresh · esc back ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if form.loading {
+        f.render_widget(Paragraph::new("loading…"), inner);
+        return;
+    }
+    if let Some(err) = &form.error {
+        f.render_widget(
+            Paragraph::new(format!("err: {err}")).style(Style::default().fg(Color::Red)),
+            inner,
+        );
+        return;
+    }
+    if form.items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "no entries yet — rule fires will land here as they happen.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            inner,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = form
+        .items
+        .iter()
+        .map(|e| {
+            let ts = format_rule_log_ts(e.fired_at);
+            let status_span = if e.status == "ok" {
+                Span::styled("✓", Style::default().fg(Color::Green))
+            } else {
+                Span::styled("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            };
+            let mut spans: Vec<Span> = vec![
+                Span::styled(format!("{ts}  "), Style::default().fg(Color::DarkGray)),
+                status_span,
+                Span::raw(" "),
+                Span::styled(
+                    format!("{}  ", e.rule_name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("[{}] ", e.trigger_kind),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ];
+            if let Some(k) = &e.ticket_key {
+                spans.push(Span::styled(
+                    format!("{k} "),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            spans.push(Span::styled(
+                format!("→ {}", e.action_kind),
+                Style::default().fg(Color::Gray),
+            ));
+            if let Some(t) = &e.action_target {
+                spans.push(Span::raw(": "));
+                spans.push(Span::raw(t.clone()));
+            }
+            if let Some(c) = &e.conditions_summary {
+                spans.push(Span::styled(
+                    format!("  · cond: {c}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            if e.status == "err" {
+                if let Some(m) = &e.message {
+                    spans.push(Span::styled(
+                        format!("  · err: {}", one_line(m)),
+                        Style::default().fg(Color::Red),
+                    ));
+                }
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+
+    let mut state = ListState::default();
+    state.select(Some(form.selected.min(form.items.len().saturating_sub(1))));
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
+/// Format a unix-ms timestamp for the log column. Same-day entries show
+/// only `HH:MM:SS`; older entries include the date so the 5-day window is
+/// readable at a glance.
+fn format_rule_log_ts(ms: i64) -> String {
+    let dt = chrono::DateTime::<chrono::Local>::from(
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).unwrap_or_default(),
+    );
+    let now = chrono::Local::now();
+    if dt.date_naive() == now.date_naive() {
+        dt.format("%H:%M:%S").to_string()
+    } else {
+        dt.format("%m-%d %H:%M:%S").to_string()
+    }
+}
+
+fn trigger_summary(t: &jui_core::rules::Trigger) -> String {
+    use jui_core::rules::Trigger as T;
+    match t {
+        T::PrCreated => "pr_created".into(),
+        T::StartWork => "start_work".into(),
+        T::StopWork => "stop_work".into(),
+        T::TicketStatusChanged { from, to } => match (from, to) {
+            (None, None) => "ticket_status_changed".into(),
+            (Some(f), None) => format!("ticket_status_changed (from {f})"),
+            (None, Some(t)) => format!("ticket_status_changed → {t}"),
+            (Some(f), Some(t)) => format!("ticket_status_changed {f} → {t}"),
+        },
+        T::TicketAssigned { to_me } => match to_me {
+            Some(true) => "ticket_assigned (to me)".into(),
+            Some(false) => "ticket_assigned (not me)".into(),
+            None => "ticket_assigned".into(),
+        },
+    }
+}
+
+fn condition_summary(c: &jui_core::rules::Condition) -> String {
+    use jui_core::rules::Condition as C;
+    match c {
+        C::ProjectKeyEquals { value } => format!("project_key = {value}"),
+        C::StatusEquals { value } => format!("status = {value}"),
+        C::IssueTypeIn { values } => format!("issue_type in [{}]", values.join(", ")),
+        C::HasLinkedRepo => "has_linked_repo".into(),
+        C::ActorIsMe => "actor_is_me".into(),
+    }
+}
+
+fn action_summary(a: &jui_core::rules::Action) -> String {
+    use jui_core::rules::Action as A;
+    match a {
+        A::JiraTransition { to } => format!("jira transition → {to}"),
+        A::JiraComment { body } => format!("jira comment: {}", one_line(body)),
+        A::GithubPrComment { body } => format!("github pr comment: {}", one_line(body)),
+        A::SetTicketDevQa => "set ticket DevQA from PR pick".into(),
+    }
+}
+
+fn one_line(s: &str) -> String {
+    let s = s.replace('\n', "↵");
+    // Char-aware truncate: `String::truncate` panics if the byte index lands
+    // mid-codepoint (e.g. inside `↵` or any non-ASCII rune).
+    let mut out: String = s.chars().take(60).collect();
+    if out.chars().count() < s.chars().count() {
+        out.push('…');
+    }
+    out
+}
+
+fn draw_rule_edit(f: &mut Frame, area: Rect, app: &App) {
+    use crate::app::{rule_edit_rows, RuleEditTarget, RuleRow};
+    let Mode::RuleEdit(form) = &app.mode else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" edit rule — {} ", form.rule.name));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let rows = rule_edit_rows(&form.rule);
+    let trigger_filter_text = match &form.rule.trigger {
+        jui_core::rules::Trigger::TicketStatusChanged { to, .. } => {
+            to.clone().unwrap_or_else(|| "(any to_status)".into())
+        }
+        jui_core::rules::Trigger::TicketAssigned { to_me } => match to_me {
+            Some(true) => "true".into(),
+            Some(false) => "false".into(),
+            None => "(any)".into(),
+        },
+        _ => String::new(),
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, row) in rows.iter().enumerate() {
+        let selected = i == form.selected_row;
+        let in_edit = selected && form.edit_buffer.is_some();
+        let bullet = if selected { "▶ " } else { "  " };
+        let row_style = if selected {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let (label, value): (String, String) = match *row {
+            RuleRow::Name => ("name        ".into(), form.rule.name.clone()),
+            RuleRow::Trigger => ("trigger     ".into(), trigger_summary(&form.rule.trigger)),
+            RuleRow::TriggerFilter => ("filter      ".into(), trigger_filter_text.clone()),
+            RuleRow::Enabled => (
+                "enabled     ".into(),
+                if form.rule.enabled { "yes".into() } else { "no".into() },
+            ),
+            RuleRow::ConditionsHeader => (String::new(), "─── conditions ───".into()),
+            RuleRow::Cond(idx) => match form.rule.conditions.get(idx) {
+                Some(c) => {
+                    let pending = form.pending_remove_condition == Some(idx);
+                    let prefix = if pending { "(d again) " } else { "" };
+                    (format!("cond[{idx}]    "), format!("{prefix}{}", condition_summary(c)))
+                }
+                None => (format!("cond[{idx}]    "), "(missing)".into()),
+            },
+            RuleRow::AddCondition => ("            ".into(), "+ add condition (a / enter)".into()),
+            RuleRow::ActionsHeader => (String::new(), "─── actions ───".into()),
+            RuleRow::Act(idx) => match form.rule.actions.get(idx) {
+                Some(a) => {
+                    let pending = form.pending_remove_action == Some(idx);
+                    let prefix = if pending { "(d again) " } else { "" };
+                    (format!("act[{idx}]     "), format!("{prefix}{}", action_summary(a)))
+                }
+                None => (format!("act[{idx}]     "), "(missing)".into()),
+            },
+            RuleRow::AddAction => ("            ".into(), "+ add action (a / enter)".into()),
+        };
+        let value_render = if in_edit {
+            let buf = form.edit_buffer.as_deref().unwrap_or("");
+            format!("{buf}▏")
+        } else {
+            value
+        };
+        if matches!(row, RuleRow::ConditionsHeader | RuleRow::ActionsHeader) {
+            lines.push(Line::from(Span::styled(
+                value_render,
+                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(vec![
+                Span::styled(bullet, row_style),
+                Span::styled(label, Style::default().fg(Color::Gray)),
+                Span::styled(value_render, row_style),
+            ]));
+        }
+    }
+    if let Some(err) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("error: {err}"),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(""));
+    // Variable reference — surfaced in every editor session so users don't
+    // have to remember (or grep the source) for placeholder names.
+    let vars = "{ticket_key} {ticket_summary} {ticket_status} {project_key} {issue_type} \
+                {from_status} {to_status} {pr_url} {pr_number} {pr_repo} \
+                {reviewer_handle} {devqa_handle} {reviewer_account_id} {devqa_account_id} {actor}";
+    lines.push(Line::from(Span::styled(
+        "available variables:",
+        Style::default().fg(Color::Cyan),
+    )));
+    lines.push(Line::from(Span::styled(
+        vars,
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(""));
+    let hint = if form.edit_buffer.is_some() {
+        "typing… enter: commit · esc: cancel"
+    } else {
+        "j/k move · enter/e edit · tab/space cycle · a add · d delete (twice) · ctrl-s save · esc back"
+    };
+    lines.push(Line::from(Span::styled(
+        hint,
+        Style::default().fg(Color::DarkGray),
+    )));
+    // Avoid the unused-variant warning on RuleEditTarget — Rust thinks the
+    // variant types are dead because we never destructure them in `ui.rs`.
+    let _ = std::mem::size_of::<RuleEditTarget>();
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+
+    if form.picker.is_some() {
+        draw_rule_edit_picker(f, area, app);
+    }
+    if form.var_picker.is_some() {
+        draw_var_picker(f, area, app);
+    }
+}
+
+fn draw_var_picker(f: &mut Frame, parent: Rect, app: &App) {
+    use crate::app::filter_vars;
+    let Mode::RuleEdit(form) = &app.mode else { return };
+    let Some(vp) = form.var_picker.as_ref() else { return };
+    let Some(buf) = form.edit_buffer.as_ref() else { return };
+    let filter = &buf[vp.anchor + 1..];
+    let matches = filter_vars(filter);
+
+    // Modest-sized popup anchored near top of the edit pane. Keeps it out of
+    // the way of the field rows; user is reading from the buffer cursor area
+    // anyway. Width is wide enough for "name — description".
+    let w = parent.width.saturating_sub(4).min(70).max(40);
+    let h = ((matches.len() as u16) + 3).clamp(5, 14);
+    let x = parent.x + 2;
+    let y = parent.y + 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(ratatui::widgets::Clear, area);
+    let title = if filter.is_empty() {
+        " variables ".to_string()
+    } else {
+        format!(" variables — filter: {{{filter} ")
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let items: Vec<ListItem> = matches
+        .iter()
+        .map(|(name, desc)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{{{name}}}"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::styled(*desc, Style::default().fg(Color::Gray)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    if !matches.is_empty() {
+        state.select(Some(vp.selected.min(matches.len() - 1)));
+    }
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, chunks[0], &mut state);
+
+    let hint = "tab/enter: insert · ↑/↓ move · esc: close (keep `{`) · backspace past `{`: close + delete";
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+        chunks[1],
+    );
+}
+
+fn draw_rule_edit_picker(f: &mut Frame, parent: Rect, app: &App) {
+    use crate::app::RulePickerTarget;
+    let Mode::RuleEdit(form) = &app.mode else { return };
+    let Some(p) = form.picker.as_ref() else { return };
+
+    // Centered modal — same dimensions as the Settings picker for visual
+    // consistency.
+    let w = parent.width.saturating_sub(4).min(70).max(30);
+    let h = parent.height.saturating_sub(4).min(20).max(8);
+    let x = parent.x + (parent.width.saturating_sub(w)) / 2;
+    let y = parent.y + (parent.height.saturating_sub(h)) / 2;
+    let area = Rect { x, y, width: w, height: h };
+
+    f.render_widget(ratatui::widgets::Clear, area);
+
+    let title = match p.target {
+        RulePickerTarget::ActionTransitionTo(_) => " pick transition target status ",
+    };
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1)])
+        .split(inner);
+
+    let filter_line = Line::from(vec![
+        Span::styled(" filter: ", Style::default().fg(Color::Cyan)),
+        Span::styled(p.query.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled("▏", Style::default().fg(Color::Cyan)),
+    ]);
+    let state_line = if p.loading {
+        Line::from(Span::styled(" loading…", Style::default().fg(Color::DarkGray)))
+    } else if let Some(err) = &p.error {
+        Line::from(Span::styled(
+            format!(" err: {err}"),
+            Style::default().fg(Color::Red),
+        ))
+    } else {
+        let n = p.filtered().len();
+        Line::from(Span::styled(
+            format!(" {n} match{}", if n == 1 { "" } else { "es" }),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+    f.render_widget(Paragraph::new(vec![filter_line, state_line]), chunks[0]);
+
+    let matches: Vec<&str> = p.filtered();
+    let items: Vec<ListItem> = matches
+        .iter()
+        .map(|s| ListItem::new(Span::raw((*s).to_string())))
+        .collect();
+    let mut list_state = ListState::default();
+    if !matches.is_empty() {
+        list_state.select(Some(p.selected.min(matches.len() - 1)));
+    }
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, chunks[1], &mut list_state);
+}
+
 fn draw_settings_picker(f: &mut Frame, parent: Rect, app: &App) {
     let Mode::Settings(form) = &app.mode else { return };
     let Some(p) = form.picker.as_ref() else { return };
@@ -2773,6 +3404,40 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                 ]
             }
         }
+        Mode::Rules(_) => vec![
+            ("j/k", "move"),
+            ("a", "add"),
+            ("d", "delete (twice)"),
+            ("t", "toggle on/off"),
+            ("enter", "edit"),
+            ("l", "log"),
+            ("esc", "back"),
+        ],
+        Mode::RuleEdit(_) => vec![
+            ("j/k", "move"),
+            ("enter/e", "edit"),
+            ("tab/space", "cycle"),
+            ("{", "var picker"),
+            ("a", "add cond/act"),
+            ("d", "delete (twice)"),
+            ("^S", "save"),
+            ("esc", "cancel"),
+        ],
+        Mode::RuleLog(_) => vec![
+            ("j/k", "move"),
+            ("g/G", "top/bottom"),
+            ("PgUp/PgDn", "page"),
+            ("r", "refresh"),
+            ("esc", "back"),
+        ],
+        Mode::Home(_) => vec![
+            ("1-8", "open view"),
+            ("tab", "menu / feed"),
+            ("j/k", "move"),
+            ("enter", "open"),
+            ("r", "refresh feed"),
+            ("q", "quit"),
+        ],
     }
 }
 
