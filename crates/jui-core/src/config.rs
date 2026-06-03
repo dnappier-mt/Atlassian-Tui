@@ -132,7 +132,20 @@ pub struct WorkflowConfig {
     /// without a custom status).
     #[serde(default = "default_pr_submit_status")]
     pub pr_submit_status: String,
+    /// Default `--permission-mode` passed to Claude Code when starting work on
+    /// a ticket. One of the values in [`CLAUDE_PERMISSION_MODES`]; an empty
+    /// string omits the flag entirely (Claude's built-in default). Editable
+    /// from `Mode::Settings`, and overridable per-launch via the plan-mode
+    /// toggle in the start-work pane.
+    #[serde(default = "default_claude_permission_mode")]
+    pub claude_permission_mode: String,
 }
+
+/// Valid values for Claude Code's `--permission-mode` argument, in the order
+/// shown by the Settings picker. Keep in sync with Claude Code's accepted
+/// modes.
+pub const CLAUDE_PERMISSION_MODES: &[&str] =
+    &["default", "acceptEdits", "plan", "bypassPermissions"];
 
 impl Default for WorkflowConfig {
     fn default() -> Self {
@@ -141,8 +154,13 @@ impl Default for WorkflowConfig {
             default_create_status: default_create_status(),
             all_mine_exclude_status: default_all_mine_exclude_status(),
             pr_submit_status: default_pr_submit_status(),
+            claude_permission_mode: default_claude_permission_mode(),
         }
     }
+}
+
+fn default_claude_permission_mode() -> String {
+    "default".to_string()
 }
 
 fn default_active_statuses() -> Vec<String> {

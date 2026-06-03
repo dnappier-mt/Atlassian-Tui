@@ -1972,10 +1972,11 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rows: [(&str, &str); 3] = [
+    let rows: [(&str, &str); 4] = [
         ("Default create status", form.default_create_status.as_str()),
         ("All-mine exclude status", form.all_mine_exclude_status.as_str()),
         ("PR submit status", form.pr_submit_status.as_str()),
+        ("Claude permission mode", form.claude_permission_mode.as_str()),
     ];
 
     let mut items: Vec<ListItem> = Vec::new();
@@ -2008,6 +2009,7 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let help_line = match form.selected {
         0 => "applied as a post-create transition after a new ticket is created",
         1 => "JQL clause: assignee = currentUser() AND status != \"<this>\" when the M-toggle is on",
+        3 => "default --permission-mode for Claude on start-work (overridable per-launch in the start-work pane)",
         _ => "",
     };
     f.render_widget(
@@ -2687,6 +2689,7 @@ fn draw_settings_picker(f: &mut Frame, parent: Rect, app: &App) {
     let title = match p.row {
         0 => " pick default create status ",
         1 => " pick all-mine exclude status ",
+        3 => " pick Claude permission mode ",
         _ => " pick status ",
     };
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -2970,6 +2973,71 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
             )));
         }
     }
+    // Plan-mode toggle row (always shown, field index 3).
+    let plan_selected = form.field == 3;
+    let plan_label_style = if plan_selected {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("plan mode ", plan_label_style),
+        Span::styled(
+            if form.plan_mode { "[●] on" } else { "[ ] on" },
+            opt_style(form.plan_mode),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            if form.plan_mode { "[ ] off" } else { "[●] off" },
+            opt_style(!form.plan_mode),
+        ),
+    ]));
+    if plan_selected {
+        let detail = if form.plan_mode {
+            "  ←/→ or space to toggle. launches Claude with --permission-mode plan.".to_string()
+        } else {
+            format!(
+                "  ←/→ or space to toggle. off → uses configured default ({}).",
+                if form.default_permission_mode.trim().is_empty() {
+                    "Claude default"
+                } else {
+                    form.default_permission_mode.trim()
+                }
+            )
+        };
+        lines.push(Line::from(Span::styled(
+            detail,
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    // Extra-shell toggle row (always shown, field index 4).
+    let shell_selected = form.field == 4;
+    let shell_label_style = if shell_selected {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("shell pane", shell_label_style),
+        Span::raw(" "),
+        Span::styled(
+            if form.open_shell_pane { "[●] yes" } else { "[ ] yes" },
+            opt_style(form.open_shell_pane),
+        ),
+        Span::raw("   "),
+        Span::styled(
+            if form.open_shell_pane { "[ ] no" } else { "[●] no" },
+            opt_style(!form.open_shell_pane),
+        ),
+    ]));
+    if shell_selected {
+        lines.push(Line::from(Span::styled(
+            "  ←/→ or space to toggle. opens an extra shell pane in the worktree next to Claude.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     if let Some(err) = &form.error {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(

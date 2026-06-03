@@ -310,6 +310,10 @@ pub struct SettingsForm {
     pub default_create_status: String,
     pub all_mine_exclude_status: String,
     pub pr_submit_status: String,
+    /// Default `--permission-mode` for Claude Code on start-work. Row 3 picks
+    /// from the fixed [`jui_core::config::CLAUDE_PERMISSION_MODES`] list rather
+    /// than the live Jira statuses used by rows 0–2.
+    pub claude_permission_mode: String,
     /// `Some` while the picker overlay is open.
     pub picker: Option<StatusPicker>,
 }
@@ -343,7 +347,7 @@ impl StatusPicker {
 }
 
 impl SettingsForm {
-    pub const ROW_COUNT: usize = 3;
+    pub const ROW_COUNT: usize = 4;
 }
 
 pub struct ActiveStatusForm {
@@ -624,6 +628,19 @@ pub struct StartWorkPromptForm {
     pub valid_priorities: Vec<String>,
     /// Where to land the checkout: worktree (default) or branch in main repo.
     pub location: jui_core::scm::WorkLocation,
+    /// Configured default `--permission-mode` (snapshot of
+    /// `App::claude_permission_mode` at the time the prompt opened). Used as
+    /// the effective mode when `plan_mode` is off.
+    pub default_permission_mode: String,
+    /// Per-launch plan-mode toggle. When on, Claude Code is launched with
+    /// `--permission-mode plan` regardless of the configured default; when
+    /// off, the configured default applies. Initialized to true when the
+    /// default itself is "plan".
+    pub plan_mode: bool,
+    /// Whether to also open a bare shell tmux pane in the checkout dir, in
+    /// addition to the Claude pane. Off by default: the Claude pane already
+    /// lands in the worktree, so this is an opt-in extra working shell.
+    pub open_shell_pane: bool,
 }
 
 pub struct EditPriorityForm {
@@ -1020,6 +1037,10 @@ pub struct App {
     /// submission. Mirrors `GlobalConfig.workflow.pr_submit_status`; editable
     /// from `Mode::Settings`.
     pub pr_submit_status: String,
+    /// Default `--permission-mode` passed to Claude Code on "start work".
+    /// Mirrors `GlobalConfig.workflow.claude_permission_mode`; editable from
+    /// `Mode::Settings` and overridable per-launch in the start-work pane.
+    pub claude_permission_mode: String,
     /// When true, the next `refresh()` uses an "all my tickets" JQL that drops
     /// the `statusCategory != Done` filter and replaces it with a single
     /// `status != "<all_mine_exclude_status>"` clause. Off by default.
@@ -1172,6 +1193,10 @@ impl App {
                 .unwrap_or_default()
                 .workflow
                 .pr_submit_status,
+            claude_permission_mode: jui_core::config::GlobalConfig::load()
+                .unwrap_or_default()
+                .workflow
+                .claude_permission_mode,
             show_all_mine: false,
             pr_user_states: std::collections::HashMap::new(),
             show_completed_prs: false,
@@ -1839,6 +1864,9 @@ impl App {
             error: None,
             valid_priorities,
             location: jui_core::scm::WorkLocation::Worktree,
+            default_permission_mode: self.claude_permission_mode.clone(),
+            plan_mode: self.claude_permission_mode.eq_ignore_ascii_case("plan"),
+            open_shell_pane: false,
         });
         Ok(())
     }
@@ -1888,6 +1916,13 @@ impl App {
         let estimate = if form.need_time { trim_to_opt(&form.time_estimate) } else { None };
         let priority = if form.need_priority { trim_to_opt(&form.priority) } else { None };
         let location = form.location;
+        let open_shell_pane = form.open_shell_pane;
+        // Effective permission mode: plan-toggle wins, else the configured default.
+        let permission_mode = if form.plan_mode {
+            "plan".to_string()
+        } else {
+            form.default_permission_mode.clone()
+        };
 
         // Validate priority against the instance's actual list before sending —
         // saves a round-trip and gives a much better error message.
@@ -1943,10 +1978,15 @@ impl App {
         // Reload ticket so subsequent steps see the new values.
         self.load_detail().await?;
         self.mode = Mode::Detail;
-        self.execute_start_work(location).await
+        self.execute_start_work(location, permission_mode, open_shell_pane).await
     }
 
-    async fn execute_start_work(&mut self, location: jui_core::scm::WorkLocation) -> Result<()> {
+    async fn execute_start_work(
+        &mut self,
+        location: jui_core::scm::WorkLocation,
+        permission_mode: String,
+        open_shell_pane: bool,
+    ) -> Result<()> {
         // Append-only debug log so we can diagnose silent failures of this flow.
         let dbg = |msg: &str| {
             use std::io::Write;
@@ -2048,19 +2088,24 @@ impl App {
             }
         }
 
-        // 2b. Open a tmux pane in the checkout dir, if we got one and we're inside tmux.
-        if let Some(path) = &launch_path {
-            if std::env::var("TMUX").is_ok() {
-                let st = std::process::Command::new("tmux")
-                    .args(["split-window", "-h", "-c", &path.to_string_lossy()])
-                    .status();
-                match st {
-                    Ok(s) if s.success() => status_parts.push("pane opened".into()),
-                    Ok(_) => status_parts.push("tmux split failed".into()),
-                    Err(e) => status_parts.push(format!("tmux err: {e}")),
+        // 2b. Optionally open an extra bare shell pane in the checkout dir. The
+        // Claude pane (step 8) already lands here, so this is only worth it when
+        // the user opted in via the start-work prompt and wants a working shell
+        // alongside Claude. Skipped by default to avoid a redundant empty pane.
+        if open_shell_pane {
+            if let Some(path) = &launch_path {
+                if std::env::var("TMUX").is_ok() {
+                    let st = std::process::Command::new("tmux")
+                        .args(["split-window", "-h", "-c", &path.to_string_lossy()])
+                        .status();
+                    match st {
+                        Ok(s) if s.success() => status_parts.push("shell pane opened".into()),
+                        Ok(_) => status_parts.push("tmux split failed".into()),
+                        Err(e) => status_parts.push(format!("tmux err: {e}")),
+                    }
+                } else {
+                    status_parts.push("not in tmux — cd manually".into());
                 }
-            } else {
-                status_parts.push("not in tmux — cd manually".into());
             }
         }
 
@@ -2077,11 +2122,12 @@ impl App {
             "project_paths={:?} used_branch_in_repo={} launch_path={:?}",
             project_paths, used_branch_in_repo, launch_path
         ));
-        let top = if used_branch_in_repo {
-            launch_path.clone().or_else(|| project_paths.first().cloned())
-        } else {
-            project_paths.first().cloned()
-        };
+        // Launch Claude in the checkout dir the daemon resolved: the worktree for
+        // worktree mode, the repo root for branch-in-repo. Falling back to the first
+        // linked project only when there's no SCM path (NoScm / SvnExport). The old
+        // code cd'd into project_paths.first() for worktree mode, which dropped
+        // Claude into the main repo on its existing branch instead of the worktree.
+        let top = launch_path.clone().or_else(|| project_paths.first().cloned());
         let Some(top) = top else {
             self.status = format!(
                 "{} · no linked project available — link one (P) and retry",
@@ -2133,13 +2179,21 @@ impl App {
             _ => String::new(),
         };
 
+        // Claude `--permission-mode` flag (empty mode = omit, use Claude's default).
+        let perm_arg = if permission_mode.trim().is_empty() {
+            String::new()
+        } else {
+            format!(" --permission-mode {}", shell_escape(permission_mode.trim()))
+        };
+
         // 6. Tmux check + width.
         if std::env::var("TMUX").is_err() {
             self.status = format!(
-                "{} · not in tmux — run: cd {} && claude {} ({})",
+                "{} · not in tmux — run: cd {} && claude {}{} ({})",
                 status_parts.join(" · "),
                 top.display(),
                 session_arg.join(" "),
+                perm_arg,
                 if is_resume { "resume" } else { "new" }
             );
             return Ok(());
@@ -2150,16 +2204,22 @@ impl App {
         // skip piping the file. On new sessions, pipe the context as the first message.
         let session_arg_str = session_arg.join(" ");
         let cmd = if is_resume {
-            format!("cd {} && claude {}", shell_escape(&top.display().to_string()), session_arg_str)
+            format!(
+                "cd {} && claude {}{}",
+                shell_escape(&top.display().to_string()),
+                session_arg_str,
+                perm_arg,
+            )
         } else {
             let context = build_claude_context(&t, &project_paths, &impl_md);
             let ctx_path = std::env::temp_dir().join(format!("jui-ctx-{}.md", key));
             std::fs::write(&ctx_path, context)?;
             format!(
-                "cd {} && cat {} | claude {}",
+                "cd {} && cat {} | claude {}{}",
                 shell_escape(&top.display().to_string()),
                 shell_escape(&ctx_path.display().to_string()),
                 session_arg_str,
+                perm_arg,
             )
         };
 
@@ -4487,6 +4547,7 @@ change, look for regressions, and report findings to me directly here.
             default_create_status: self.default_create_status.clone(),
             all_mine_exclude_status: self.all_mine_exclude_status.clone(),
             pr_submit_status: self.pr_submit_status.clone(),
+            claude_permission_mode: self.claude_permission_mode.clone(),
             picker: None,
         });
         self.status = "settings — i/enter: pick status · j/k: move · esc: close".into();
@@ -4501,12 +4562,37 @@ change, look for regressions, and report findings to me directly here.
                 0 => form.default_create_status.clone(),
                 1 => form.all_mine_exclude_status.clone(),
                 2 => form.pr_submit_status.clone(),
+                3 => form.claude_permission_mode.clone(),
                 _ => String::new(),
             };
             (form.selected, cur)
         } else {
             return Ok(());
         };
+        // Row 3 (Claude permission mode) picks from a fixed list — no daemon
+        // round-trip, the options are baked into the binary.
+        if row == 3 {
+            if let Mode::Settings(form) = &mut self.mode {
+                let all: Vec<String> = jui_core::config::CLAUDE_PERMISSION_MODES
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                let selected = all
+                    .iter()
+                    .position(|m| m.eq_ignore_ascii_case(&current))
+                    .unwrap_or(0);
+                form.picker = Some(StatusPicker {
+                    row,
+                    query: String::new(),
+                    all,
+                    selected,
+                    loading: false,
+                    error: None,
+                });
+            }
+            self.status = "type: filter · j/k: move · enter: pick · esc: cancel".into();
+            return Ok(());
+        }
         if let Mode::Settings(form) = &mut self.mode {
             form.picker = Some(StatusPicker {
                 row,
@@ -4553,11 +4639,12 @@ change, look for regressions, and report findings to me directly here.
     /// Persist the current settings form back to `GlobalConfig.workflow` and
     /// refresh the cached fields on `App`.
     pub fn save_settings(&mut self) -> Result<()> {
-        let (create, exclude, pr_submit) = if let Mode::Settings(form) = &self.mode {
+        let (create, exclude, pr_submit, perm_mode) = if let Mode::Settings(form) = &self.mode {
             (
                 form.default_create_status.clone(),
                 form.all_mine_exclude_status.clone(),
                 form.pr_submit_status.clone(),
+                form.claude_permission_mode.clone(),
             )
         } else {
             return Ok(());
@@ -4566,10 +4653,12 @@ change, look for regressions, and report findings to me directly here.
         cfg.workflow.default_create_status = create.clone();
         cfg.workflow.all_mine_exclude_status = exclude.clone();
         cfg.workflow.pr_submit_status = pr_submit.clone();
+        cfg.workflow.claude_permission_mode = perm_mode.clone();
         cfg.save()?;
         self.default_create_status = create;
         self.all_mine_exclude_status = exclude;
         self.pr_submit_status = pr_submit;
+        self.claude_permission_mode = perm_mode;
         Ok(())
     }
 
@@ -5958,6 +6047,7 @@ async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Resu
                     0 => { form.default_create_status = val.clone(); "default-create" }
                     1 => { form.all_mine_exclude_status = val.clone(); "all-mine-exclude" }
                     2 => { form.pr_submit_status = val.clone(); "pr-submit" }
+                    3 => { form.claude_permission_mode = val.clone(); "claude-permission-mode" }
                     _ => "",
                 };
                 let l = label.to_string();
@@ -8192,11 +8282,14 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             _ => {}
         },
         Mode::StartWorkPrompt(form) => {
-            // Cycle order: 0 (location) → 1 (time, if needed) → 2 (priority, if needed) → 0
+            // Cycle order: 0 (location) → 1 (time, if needed) → 2 (priority, if
+            // needed) → 3 (plan-mode toggle) → 4 (extra-shell toggle) → 0
             let visible: Vec<u8> = {
                 let mut v = vec![0u8];
                 if form.need_time { v.push(1); }
                 if form.need_priority { v.push(2); }
+                v.push(3);
+                v.push(4);
                 v
             };
             let cycle = |cur: u8, forward: bool| -> u8 {
@@ -8221,11 +8314,19 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         jui_core::scm::WorkLocation::BranchInRepo => jui_core::scm::WorkLocation::Worktree,
                     };
                 }
-                KeyCode::Backspace if form.field != 0 => {
+                // Plan-mode field — arrows or space toggle plan on/off.
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 3 => {
+                    form.plan_mode = !form.plan_mode;
+                }
+                // Extra-shell field — arrows or space toggle the worktree shell pane.
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 4 => {
+                    form.open_shell_pane = !form.open_shell_pane;
+                }
+                KeyCode::Backspace if form.field == 1 || form.field == 2 => {
                     let target = if form.field == 1 { &mut form.time_estimate } else { &mut form.priority };
                     target.pop();
                 }
-                KeyCode::Char(c) if form.field != 0 => {
+                KeyCode::Char(c) if form.field == 1 || form.field == 2 => {
                     let target = if form.field == 1 { &mut form.time_estimate } else { &mut form.priority };
                     target.push(c);
                 }
