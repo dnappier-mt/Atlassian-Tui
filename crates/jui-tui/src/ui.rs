@@ -30,6 +30,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::EditTime(_) => draw_edit_time(f, chunks[1], app),
         Mode::EditPriority(_) => draw_edit_priority(f, chunks[1], app),
         Mode::StartWorkPrompt(_) => draw_start_work_prompt(f, chunks[1], app),
+        Mode::DevQaPrompt(_) => draw_devqa_prompt(f, chunks[1], app),
+        Mode::DevQaResolveConfirm(_) => draw_devqa_resolve_confirm(f, chunks[1], app),
+        Mode::DevQaCleanupConfirm(_) => draw_devqa_cleanup_confirm(f, chunks[1], app),
         Mode::Implementation(_) => draw_implementation(f, chunks[1], app),
         Mode::Projects(_) => draw_projects(f, chunks[1], app),
         Mode::ProjectsAdd(_) => draw_projects_add(f, chunks[1], app),
@@ -89,6 +92,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Mode::EditTime(_) => "time",
         Mode::EditPriority(_) => "priority",
         Mode::StartWorkPrompt(_) => "start work",
+        Mode::DevQaPrompt(_) => "begin dev qa",
+        Mode::DevQaResolveConfirm(_) => "resolve dev qa",
+        Mode::DevQaCleanupConfirm(_) => "remove dev qa worktree",
         Mode::Implementation(_) => "implementation",
         Mode::Projects(_) => "projects",
         Mode::ProjectsAdd(_) => "projects/add",
@@ -316,7 +322,7 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
         .map(|(role, t)| {
             let (badge, badge_style) = role_badge(*role);
             let (glyph, glyph_style) = issue_type_glyph(t.issue_type.as_deref());
-            let pr_label = pr_state_label(*role, app.pr_state(&t.key));
+            let pr_label = devqa_or_pr_label(*role, &t.status, Some(app.pr_state(&t.key)));
             let mut spans: Vec<Span> = Vec::with_capacity(10);
             spans.push(Span::raw(" "));
             // Lead with the user's review state — most prominent column.
@@ -350,12 +356,24 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-/// Returns `pr_state_label` only when both arguments resolve sensibly. Used
-/// from tree rendering where `pr_state` is `Option`.
-fn role_to_pr_label(
+/// Badge for the list/tree review-state column. A "STARTED" DevQA badge takes
+/// precedence when the ticket's Jira status is a "Dev QA In Progress" state
+/// (reviewer/github rows only — those are the ones not assigned to you); else it
+/// falls back to the user's local PR review state (AWAIT/REVIEW/DONE). `None`
+/// when neither applies. Padded to the same 7 cols as `pr_state_label`.
+fn devqa_or_pr_label(
     role: MentionRole,
+    status: &str,
     pr_state: Option<PrUserState>,
 ) -> Option<(&'static str, Style)> {
+    if matches!(role, MentionRole::Github | MentionRole::Reviewer)
+        && status.to_ascii_lowercase().contains("dev qa in progress")
+    {
+        return Some((
+            "STARTED",
+            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+        ));
+    }
     pr_state_label(role, pr_state?)
 }
 
@@ -3054,6 +3072,150 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(p, inner);
 }
 
+fn draw_devqa_prompt(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::DevQaPrompt(form) = &app.mode else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" begin dev qa — {} ", form.ticket_key));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let opt_style = |active: bool| {
+        if active {
+            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    };
+    let wt = form.use_worktree;
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "test this PR — choose where to check out its branch:",
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(Span::styled(
+            format!("  {}", form.pr_url),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "checkout  ",
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(if wt { "[●] git worktree" } else { "[ ] git worktree" }, opt_style(wt)),
+            Span::raw("   "),
+            Span::styled(if !wt { "[●] branch in repo" } else { "[ ] branch in repo" }, opt_style(!wt)),
+        ]),
+        Line::from(Span::styled(
+            if wt {
+                "  ←/→ or space to toggle. isolates the PR branch in a separate worktree."
+                    .to_string()
+            } else {
+                "  ←/→ or space to toggle. checks the PR branch out in your clone (aborts if dirty)."
+                    .to_string()
+            },
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Claude launches to TEST the change, not to solve the ticket.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    if let Some(err) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("error: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "←/→ or space: toggle   enter / F5 / ctrl+s: launch   esc: cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
+fn draw_devqa_resolve_confirm(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::DevQaResolveConfirm(form) = &app.mode else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" resolve dev qa — {} ", form.ticket_key));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Resolve DevQA — this posts to GitHub:",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  • comment "),
+            Span::styled("DevQA: Passed", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" on the PR"),
+        ]),
+        Line::from("  • 🚀 reaction on the PR's top comment"),
+        Line::from("  • then advance the ticket past Dev QA (if a transition exists)"),
+        Line::from("  • remove the DevQA worktree (if one was created)"),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", form.pr_url),
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    if let Some(err) = &form.error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("error: {err}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "enter / y: post & advance    esc / n: cancel",
+        Style::default().fg(Color::DarkGray),
+    )));
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
+fn draw_devqa_cleanup_confirm(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::DevQaCleanupConfirm(form) = &app.mode else { return };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" remove dev qa worktree — {} ", form.ticket_key));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "The DevQA worktree has uncommitted changes.",
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  {}", form.detail),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from("Removing it will discard those changes. DevQA is already"),
+        Line::from("resolved — this only affects the local worktree."),
+        Line::from(""),
+        Line::from(Span::styled(
+            "enter / y: discard & remove    esc / n: keep the worktree",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
+    f.render_widget(p, inner);
+}
+
 fn draw_edit_priority(f: &mut Frame, area: Rect, app: &App) {
     let Mode::EditPriority(form) = &app.mode else { return };
     let block = Block::default()
@@ -3177,6 +3339,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
         ],
         Mode::Kanban => vec![
             ("h/l", "column"),
+            ("⇧←/→", "reorder"),
             ("j/k", "card"),
             ("enter", "open"),
             ("e", "expand col"),
@@ -3260,11 +3423,16 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                 }
                 v.push(("@", "assign"));
                 v.push(("R", "reviewer"));
-                if !crate::app::ticket_has_pr(app) {
+                let has_pr = crate::app::ticket_has_pr(app);
+                let devqa_started = crate::app::ticket_devqa_in_progress(app);
+                if !has_pr {
                     v.push(("P", "open PR"));
+                } else if devqa_started {
+                    // DevQA already started → P resolves it (pass + 🚀).
+                    v.push(("P", "pass DevQA"));
                 }
-                v.push(("Q", "begin DevQA"));
-                if crate::app::ticket_has_pr(app) {
+                v.push(("Q", if devqa_started { "re-open DevQA" } else { "begin DevQA" }));
+                if has_pr {
                     v.push(("K", "PR state"));
                 }
                 v.push(("C", "claude"));
@@ -3376,6 +3544,19 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("enter", "submit"),
             ("F5/ctrl+s", "submit"),
             ("esc", "cancel"),
+        ],
+        Mode::DevQaPrompt(_) => vec![
+            ("←/→/space", "toggle"),
+            ("enter", "launch"),
+            ("esc", "cancel"),
+        ],
+        Mode::DevQaResolveConfirm(_) => vec![
+            ("enter/y", "post pass + 🚀"),
+            ("esc/n", "cancel"),
+        ],
+        Mode::DevQaCleanupConfirm(_) => vec![
+            ("enter/y", "discard + remove"),
+            ("esc/n", "keep worktree"),
         ],
         Mode::Implementation(_) => vec![
             ("j/k", "scroll"),
@@ -4496,7 +4677,9 @@ fn long_desc(key: &str, short: &str) -> Option<&'static str> {
         ("@", "assign") => Some("change ticket assignee"),
         ("R", "reviewer") => Some("set ticket reviewer"),
         ("P", "open PR") => Some("open GitHub pull request"),
+        ("P", "pass DevQA") => Some("post 'DevQA: Passed' + 🚀, advance ticket"),
         ("Q", "begin DevQA") => Some("start DevQA on PR"),
+        ("Q", "re-open DevQA") => Some("re-open the Claude DevQA session"),
         ("C", "claude") => Some("launch Claude in tmux"),
         ("D", "archive") => Some("archive this ticket"),
         ("K", "PR state") => Some("cycle PR review state"),
@@ -5069,10 +5252,7 @@ fn tree_node_line_with_pr_state(
         let (badge, style) = role_badge(role);
         spans.push(Span::styled(badge.to_string(), style));
         spans.push(Span::raw(" "));
-        if let (Some(state), Some((label, label_style))) =
-            (pr_state, role_to_pr_label(role, pr_state))
-        {
-            let _ = state; // silence unused when state.is_none()
+        if let Some((label, label_style)) = devqa_or_pr_label(role, &node.status, pr_state) {
             spans.push(Span::styled(label.to_string(), label_style));
         } else if node.has_my_open_pr {
             // No incoming-review label to show here, so reuse the slot for

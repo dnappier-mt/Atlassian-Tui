@@ -64,15 +64,39 @@ pub enum Request {
     /// Mark the review thread containing the given comment as resolved.
     /// Only meaningful for `kind = "review"` comments; other kinds error.
     ResolvePrComment { ticket_key: String, comment_id: String },
+    /// Resolve DevQA on the ticket's PR: post a "DevQA: Passed" issue comment
+    /// and add a 🚀 reaction to the PR's top-level body. The Jira transition is
+    /// handled TUI-side. Errors when no PR is on file for the ticket.
+    ResolveDevQaPr { ticket_key: String },
+    /// Look for an existing DevQA worktree on disk for the ticket by scanning
+    /// the configured clones' `<repo>-worktrees/<ticket_key>-devqa` paths. Does
+    /// not need a cached PR. Replies `DevQaWorktree` when found, else `Err`.
+    FindDevQaWorktree { ticket_key: String },
+    /// Remove the DevQA git worktree for the ticket (if one was created) and
+    /// delete its throwaway `devqa-pr-<n>` branch. No-op when the ticket used
+    /// branch-in-repo instead of a worktree. When `force` is false and the
+    /// worktree has uncommitted changes, it is left in place and the reply has
+    /// `dirty = true` so the caller can confirm before discarding work.
+    CleanupDevQaWorktree {
+        ticket_key: String,
+        #[serde(default)]
+        force: bool,
+    },
     /// Set up a DevQA worktree for the given PR: locate the user's local clone
-    /// of `repo`, fetch `pull/<pr_number>/head` into a local branch, and
-    /// `git worktree add` it at `<repo>/../<repo>-worktrees/<ticket_key>-devqa`.
-    /// Returns the path and the local branch name so the TUI can open a tmux
-    /// pane + Claude with PR context.
+    /// of `repo`, fetch `pull/<pr_number>/head` into a local branch, and either
+    /// `git worktree add` it at `<repo>/../<repo>-worktrees/<ticket_key>-devqa`
+    /// (`worktree = true`) or check it out directly in the existing clone
+    /// (`worktree = false`, aborts if the clone's working tree is dirty).
+    /// Returns the checkout path and the local branch name so the TUI can open a
+    /// tmux pane + Claude with PR context.
     SetupDevQaWorktree {
         ticket_key: String,
         repo: String,        // "<owner>/<name>"
         pr_number: u64,
+        /// When true, isolate the PR branch in a git worktree. When false, check
+        /// the branch out in the existing clone (branch-in-repo).
+        #[serde(default)]
+        worktree: bool,
     },
     /// Set the user-managed PR review state for the given ticket. Valid values:
     /// "awaiting", "reviewing", "completed". Persisted via SQLite so the state
@@ -228,6 +252,11 @@ pub enum Response {
     },
     /// Reply for `SetupDevQaWorktree`.
     DevQaWorktree { path: std::path::PathBuf, branch: String },
+    /// Reply for `CleanupDevQaWorktree`. `removed` is false when there was no
+    /// worktree to remove, or when it was left in place because it was dirty and
+    /// `force` was not set. `dirty` flags uncommitted changes in the worktree.
+    /// `message` is a short human-readable summary.
+    DevQaCleanup { removed: bool, dirty: bool, message: String },
     /// Reply for `GetPrUserStates`.
     PrUserStates { items: std::collections::HashMap<String, String> },
     Ticket { ticket: Ticket },

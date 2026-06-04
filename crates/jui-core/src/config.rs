@@ -139,6 +139,12 @@ pub struct WorkflowConfig {
     /// toggle in the start-work pane.
     #[serde(default = "default_claude_permission_mode")]
     pub claude_permission_mode: String,
+    /// Preferred left-to-right order of Kanban columns, by status name. Columns
+    /// whose status appears here are shown first, in this order; any remaining
+    /// statuses fall back to the built-in rank ordering. Reordered live with
+    /// Shift+←/→ on the Kanban board. Empty = pure built-in ordering.
+    #[serde(default)]
+    pub kanban_column_order: Vec<String>,
 }
 
 /// Valid values for Claude Code's `--permission-mode` argument, in the order
@@ -155,6 +161,7 @@ impl Default for WorkflowConfig {
             all_mine_exclude_status: default_all_mine_exclude_status(),
             pr_submit_status: default_pr_submit_status(),
             claude_permission_mode: default_claude_permission_mode(),
+            kanban_column_order: Vec::new(),
         }
     }
 }

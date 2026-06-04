@@ -32,6 +32,50 @@ fn trim_to_opt(s: &str) -> Option<String> {
     if s.is_empty() { None } else { Some(s.to_string()) }
 }
 
+/// Parse `(repo, pr_number)` from a GitHub PR web URL like
+/// `https://github.com/owner/repo/pull/123`. Returns None when it doesn't look
+/// like one. Used to recover PR identity from the standalone `detail_pr_link`
+/// when the PR has no cached comments (so `pr_comments` is empty).
+fn parse_pr_url(url: &str) -> Option<(String, u64)> {
+    let (left, right) = url.split_once("/pull/")?;
+    let repo = left.rsplit_once("github.com/").map(|(_, r)| r)?.trim_matches('/');
+    if !repo.contains('/') {
+        return None;
+    }
+    let digits: String = right.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let number = digits.parse::<u64>().ok()?;
+    Some((repo.to_string(), number))
+}
+
+/// Shell commands to run in a freshly-created worktree before launching Claude,
+/// extracted from a `WORKTREE_SETUP.md` in the worktree's parent dir (the
+/// `<repo>-worktrees/` root). We concatenate the contents of every ```bash /
+/// ```sh fenced block, in order. Returns None when there's no such file or no
+/// fenced shell blocks — repos without the convention are simply unaffected.
+fn worktree_setup_script(worktree: &std::path::Path) -> Option<String> {
+    let md_path = worktree.parent()?.join("WORKTREE_SETUP.md");
+    let md = std::fs::read_to_string(&md_path).ok()?;
+    let mut script = String::new();
+    let mut in_block = false;
+    for line in md.lines() {
+        let trimmed = line.trim_start();
+        if !in_block {
+            if trimmed.starts_with("```bash") || trimmed.starts_with("```sh") {
+                in_block = true;
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") {
+            in_block = false;
+            continue;
+        }
+        script.push_str(line);
+        script.push('\n');
+    }
+    let script = script.trim();
+    (!script.is_empty()).then(|| script.to_string())
+}
+
 fn build_claude_context(t: &Ticket, projects: &[std::path::PathBuf], suggestion: &str) -> String {
     let projects_block = if projects.is_empty() {
         "—".to_string()
@@ -97,6 +141,9 @@ pub enum Mode {
     EditTime(EditTimeForm),
     EditPriority(EditPriorityForm),
     StartWorkPrompt(StartWorkPromptForm),
+    DevQaPrompt(DevQaPromptForm),
+    DevQaResolveConfirm(DevQaResolveForm),
+    DevQaCleanupConfirm(DevQaCleanupForm),
     Implementation(ImplementationForm),
     Projects(ProjectsForm),
     ProjectsAdd(ProjectsAddForm),
@@ -643,6 +690,35 @@ pub struct StartWorkPromptForm {
     pub open_shell_pane: bool,
 }
 
+/// Confirmation before resolving DevQA (pressing `P` on a ticket already in
+/// "Dev QA In Progress"). Posts "DevQA: Passed" + a 🚀 reaction to the PR, then
+/// transitions the ticket forward — all outward-facing, hence the confirm step.
+pub struct DevQaResolveForm {
+    pub ticket_key: String,
+    pub pr_url: String,
+    pub error: Option<String>,
+}
+
+/// Shown after a resolve when the DevQA worktree has uncommitted changes —
+/// confirms the user really wants to discard them and remove the worktree.
+pub struct DevQaCleanupForm {
+    pub ticket_key: String,
+    /// Short summary of what's dirty (e.g. "worktree has 3 uncommitted change(s)").
+    pub detail: String,
+}
+
+/// Shown right after pressing `Q` (begin DevQA) has transitioned the ticket,
+/// to choose where the PR branch gets checked out before Claude launches.
+pub struct DevQaPromptForm {
+    pub ticket_key: String,
+    /// PR url, shown as a hint so the user knows what they're about to test.
+    pub pr_url: String,
+    /// true → isolate the PR branch in a git worktree (default); false → check
+    /// it out in the existing clone (branch-in-repo).
+    pub use_worktree: bool,
+    pub error: Option<String>,
+}
+
 pub struct EditPriorityForm {
     pub key: String,
     pub options: Vec<String>,
@@ -1041,6 +1117,10 @@ pub struct App {
     /// Mirrors `GlobalConfig.workflow.claude_permission_mode`; editable from
     /// `Mode::Settings` and overridable per-launch in the start-work pane.
     pub claude_permission_mode: String,
+    /// Preferred left-to-right Kanban column order by status name. Mirrors
+    /// `GlobalConfig.workflow.kanban_column_order`; reordered live with Shift+←/→
+    /// on the Kanban board and persisted on each change.
+    pub kanban_column_order: Vec<String>,
     /// When true, the next `refresh()` uses an "all my tickets" JQL that drops
     /// the `statusCategory != Done` filter and replaces it with a single
     /// `status != "<all_mine_exclude_status>"` clause. Off by default.
@@ -1197,6 +1277,10 @@ impl App {
                 .unwrap_or_default()
                 .workflow
                 .claude_permission_mode,
+            kanban_column_order: jui_core::config::GlobalConfig::load()
+                .unwrap_or_default()
+                .workflow
+                .kanban_column_order,
             show_all_mine: false,
             pr_user_states: std::collections::HashMap::new(),
             show_completed_prs: false,
@@ -1665,12 +1749,89 @@ impl App {
             buckets.entry(status).or_default().push(KANBAN_EXTRA_OFFSET + i);
         }
         let mut cols: Vec<(String, Vec<usize>)> = buckets.into_iter().collect();
-        cols.sort_by(|a, b| {
-            rank(&a.0)
+        // Statuses listed in the saved column order come first, in that order;
+        // anything else falls back to the built-in rank (then alphabetical).
+        let order_pos = |s: &str| {
+            self.kanban_column_order
+                .iter()
+                .position(|x| x.eq_ignore_ascii_case(s))
+        };
+        cols.sort_by(|a, b| match (order_pos(&a.0), order_pos(&b.0)) {
+            (Some(i), Some(j)) => i.cmp(&j),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => rank(&a.0)
                 .cmp(&rank(&b.0))
-                .then_with(|| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase()))
+                .then_with(|| a.0.to_ascii_lowercase().cmp(&b.0.to_ascii_lowercase())),
         });
         cols
+    }
+
+    /// Move the selected Kanban column one slot left/right, persisting the new
+    /// order to config. Reorders by swapping the two columns' statuses in
+    /// `kanban_column_order` (syncing any not-yet-listed visible statuses first),
+    /// which flips their relative position regardless of hidden columns between.
+    pub fn move_kanban_column(&mut self, right: bool) {
+        let cols = self.kanban_columns();
+        if cols.is_empty() {
+            return;
+        }
+        let sel = self.kanban_col.min(cols.len() - 1);
+        let target = if right {
+            if sel + 1 >= cols.len() {
+                return;
+            }
+            sel + 1
+        } else {
+            if sel == 0 {
+                return;
+            }
+            sel - 1
+        };
+        let sel_status = cols[sel].0.clone();
+        let tgt_status = cols[target].0.clone();
+        // Make sure every currently-visible status is in the canonical order so
+        // swap-by-position is well defined and the others keep their slots.
+        for (status, _) in &cols {
+            if !self
+                .kanban_column_order
+                .iter()
+                .any(|x| x.eq_ignore_ascii_case(status))
+            {
+                self.kanban_column_order.push(status.clone());
+            }
+        }
+        let i = self
+            .kanban_column_order
+            .iter()
+            .position(|x| x.eq_ignore_ascii_case(&sel_status));
+        let j = self
+            .kanban_column_order
+            .iter()
+            .position(|x| x.eq_ignore_ascii_case(&tgt_status));
+        if let (Some(i), Some(j)) = (i, j) {
+            self.kanban_column_order.swap(i, j);
+            // Keep the cursor on the moved column and carry its card selection.
+            if self.kanban_card_per_col.len() > sel.max(target) {
+                self.kanban_card_per_col.swap(sel, target);
+            }
+            self.kanban_col = target;
+            self.kanban_expanded_col = None;
+            match self.save_kanban_column_order() {
+                Ok(()) => {
+                    self.status = format!("moved \"{sel_status}\" {}", if right { "→" } else { "←" })
+                }
+                Err(e) => self.status = format!("kanban order save err: {e:#}"),
+            }
+        }
+    }
+
+    /// Persist the current Kanban column order to `config.toml`.
+    pub fn save_kanban_column_order(&mut self) -> Result<()> {
+        let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
+        cfg.workflow.kanban_column_order = self.kanban_column_order.clone();
+        cfg.save()?;
+        Ok(())
     }
 
     pub async fn refresh(&mut self) -> Result<()> {
@@ -2773,16 +2934,36 @@ impl App {
         Ok(())
     }
 
-    /// Set up a DevQA worktree for the ticket's PR (daemon side) and open a
-    /// tmux pane in it running `claude` with PR context. No-op (and returns
-    /// `Ok`) when the ticket has no PR cached.
-    pub async fn begin_devqa_worktree(&mut self, key: &str) -> Result<()> {
-        let Some(c) = self.pr_comments.first().cloned() else { return Ok(()); };
-        let repo = c.repo.clone();
-        let pr_url = c.pr_url.clone();
-        let pr_number = c.pr_number;
+    /// PR url tied to the currently-open ticket — from a cached comment, or the
+    /// standalone PR link (set even when the PR has no comments). None when the
+    /// ticket has no associated PR.
+    fn current_pr_url(&self) -> Option<String> {
+        self.pr_comments
+            .first()
+            .map(|c| c.pr_url.clone())
+            .or_else(|| self.detail_pr_link.clone())
+    }
 
-        // 1. Daemon: locate clone, fetch PR head, create worktree.
+    /// Set up a DevQA checkout for the ticket's PR (daemon side) and open a
+    /// tmux pane in it running `claude` with PR context. With `use_worktree` the
+    /// PR branch is isolated in a git worktree; otherwise it's checked out in the
+    /// existing clone. No-op (and returns `Ok`) when the ticket has no PR cached.
+    pub async fn begin_devqa_worktree(&mut self, key: &str, use_worktree: bool) -> Result<()> {
+        // PR identity: prefer a cached comment (carries repo + number), else
+        // recover it from the standalone PR link, which is set even when the PR
+        // has zero comments. Without either there's no PR to DevQA.
+        let (repo, pr_url, pr_number) = if let Some(c) = self.pr_comments.first().cloned() {
+            (c.repo, c.pr_url, c.pr_number)
+        } else if let Some((repo, num)) =
+            self.detail_pr_link.as_deref().and_then(parse_pr_url)
+        {
+            (repo, self.detail_pr_link.clone().unwrap_or_default(), num)
+        } else {
+            self.status = format!("DevQA: no PR associated with {key}");
+            return Ok(());
+        };
+
+        // 1. Daemon: locate clone, fetch PR head, create worktree or check out.
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
@@ -2790,6 +2971,7 @@ impl App {
                 ticket_key: key.to_string(),
                 repo: repo.clone(),
                 pr_number,
+                worktree: use_worktree,
             },
         )
         .await?;
@@ -2802,7 +2984,7 @@ impl App {
         // 2. Tmux check.
         if std::env::var("TMUX").is_err() {
             self.status = format!(
-                "DevQA worktree at {} (branch {branch}) — open tmux to launch claude",
+                "DevQA checkout at {} (branch {branch}) — open tmux to launch claude",
                 path.display()
             );
             return Ok(());
@@ -2838,9 +3020,23 @@ impl App {
             (format!("--session-id {}", shell_escape(&new_id)), false, new_id)
         };
 
+        // 3b. Worktree setup fixes. For a worktree checkout, run any commands
+        // from `<repo>-worktrees/WORKTREE_SETUP.md` (submodule init, shared
+        // downloads/sstate symlinks, …) in the worktree before Claude starts.
+        // Best-effort and idempotent, so re-running on resume is harmless.
+        let setup_prefix = if use_worktree {
+            match worktree_setup_script(&path) {
+                Some(s) => format!("echo '── applying worktree setup ──'\n{s}\n"),
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+        let pdisp = shell_escape(&path.display().to_string());
+
         // 4. Build PR context file (ticket info + PR url + cached PR comments).
         let cmd = if is_resume {
-            format!("cd {} && claude {}", shell_escape(&path.display().to_string()), session_arg)
+            format!("cd {pdisp} || exit 1\n{setup_prefix}claude {session_arg}")
         } else {
             let mut ctx = String::new();
             if let Some(t) = &self.detail {
@@ -2868,8 +3064,12 @@ impl App {
                 }
             }
             ctx.push_str(
-"\nYou are doing a DevQA pass on this pull request. Run / smoke-test the
-change, look for regressions, and report findings to me directly here.
+"\nYou are doing a DevQA pass on this pull request. The PR branch is already
+checked out in this directory — your job is to **test and verify the existing
+change**, not to implement the ticket or write a solution. Run / smoke-test the
+change as it stands, look for regressions, and report findings to me directly
+here. Do **not** modify code to 'fix' or 'finish' the ticket; only change files
+if I explicitly ask you to (e.g. to reproduce or probe a bug).
 
 ## Rules for posting on the PR
 
@@ -2894,8 +3094,7 @@ change, look for regressions, and report findings to me directly here.
             let ctx_path = std::env::temp_dir().join(format!("jui-devqa-{key}.md"));
             std::fs::write(&ctx_path, ctx)?;
             format!(
-                "cd {} && cat {} | claude {}",
-                shell_escape(&path.display().to_string()),
+                "cd {pdisp} || exit 1\n{setup_prefix}cat {} | claude {}",
                 shell_escape(&ctx_path.display().to_string()),
                 session_arg,
             )
@@ -2930,6 +3129,229 @@ change, look for regressions, and report findings to me directly here.
 
         let mode = if is_resume { "resumed" } else { "new" };
         self.status = format!("DevQA · claude {mode} @ {} · {pr_url}", path.display());
+        Ok(())
+    }
+
+    /// Re-open Claude in an already-existing DevQA worktree on disk, without
+    /// needing the PR cached. Resumes the saved session if there is one, else
+    /// starts a fresh one. Used when the ticket is already past "begin DevQA"
+    /// and a worktree is present but the PR/session links are gone.
+    async fn reopen_devqa_worktree(&mut self, key: &str, path: std::path::PathBuf) -> Result<()> {
+        if std::env::var("TMUX").is_err() {
+            self.status = format!(
+                "DevQA worktree at {} — open tmux to launch claude",
+                path.display()
+            );
+            return Ok(());
+        }
+        // Session id — resume the saved one if present, else mint + save a new one.
+        let mut s = ipc::connect().await?;
+        let existing = match ipc::send_request(
+            &mut s,
+            &Request::GetClaudeSession { ticket_key: key.to_string() },
+        )
+        .await?
+        {
+            Response::ClaudeSession { session_id } => session_id,
+            _ => None,
+        };
+        let (session_arg, is_resume) = if let Some(id) = existing {
+            (format!("--resume {}", shell_escape(&id)), true)
+        } else {
+            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+                .map(|s| s.trim().to_string())
+                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
+            let mut s = ipc::connect().await?;
+            let _ = ipc::send_request(
+                &mut s,
+                &Request::SaveClaudeSession { ticket_key: key.to_string(), session_id: new_id.clone() },
+            )
+            .await?;
+            (format!("--session-id {}", shell_escape(&new_id)), false)
+        };
+        let setup_prefix = match worktree_setup_script(&path) {
+            Some(s) => format!("echo '── applying worktree setup ──'\n{s}\n"),
+            None => String::new(),
+        };
+        let pdisp = shell_escape(&path.display().to_string());
+        let cmd = if is_resume {
+            format!("cd {pdisp} || exit 1\n{setup_prefix}claude {session_arg}")
+        } else {
+            let ctx = format!(
+"# DevQA: {key}
+
+You are doing a DevQA pass: the PR branch is checked out in this worktree. Your
+job is to **test and verify the existing change**, not to implement the ticket
+or write a solution. Run / smoke-test it, look for regressions, and report
+findings here. Do **not** post pass/fail to GitHub or modify code unless I
+explicitly ask.
+");
+            let ctx_path = std::env::temp_dir().join(format!("jui-devqa-{key}.md"));
+            std::fs::write(&ctx_path, ctx)?;
+            format!(
+                "cd {pdisp} || exit 1\n{setup_prefix}cat {} | claude {session_arg}",
+                shell_escape(&ctx_path.display().to_string()),
+            )
+        };
+        let width = tmux_window_width().unwrap_or(0);
+        let out = if width >= 400 {
+            std::process::Command::new("tmux")
+                .args(["split-window", "-h", "-P", "-F", "#{pane_id}", "-c"])
+                .arg(&path)
+                .arg(format!("sh -lc {}", shell_escape(&cmd)))
+                .output()?
+        } else {
+            std::process::Command::new("tmux")
+                .args(["new-window", "-P", "-F", "#{pane_id}", "-c"])
+                .arg(&path)
+                .arg(format!("sh -lc {}", shell_escape(&cmd)))
+                .output()?
+        };
+        if !out.status.success() {
+            return Err(anyhow::anyhow!(
+                "tmux pane failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let send_cmd = format!(
+            "(sleep 4; tmux send-keys -t {pane} '/remote-control' Enter) >/dev/null 2>&1 &"
+        );
+        let _ = std::process::Command::new("sh").arg("-c").arg(&send_cmd).spawn();
+        let mode = if is_resume { "resumed" } else { "new" };
+        self.status = format!("DevQA · claude {mode} @ {} (existing worktree)", path.display());
+        Ok(())
+    }
+
+    /// Submit the DevQA prompt: tear it down and run the checkout + Claude launch
+    /// with the chosen worktree/branch-in-repo mode. On error, keep the prompt
+    /// open and show the message so the user can adjust (e.g. clean a dirty tree).
+    pub async fn submit_devqa_prompt(&mut self) -> Result<()> {
+        let Mode::DevQaPrompt(form) = &self.mode else { return Ok(()) };
+        let key = form.ticket_key.clone();
+        let use_worktree = form.use_worktree;
+        self.mode = Mode::Detail;
+        if let Err(e) = self.begin_devqa_worktree(&key, use_worktree).await {
+            self.mode = Mode::DevQaPrompt(DevQaPromptForm {
+                ticket_key: key,
+                pr_url: self.pr_comments.first().map(|c| c.pr_url.clone()).unwrap_or_default(),
+                use_worktree,
+                error: Some(format!("{e:#}")),
+            });
+        }
+        Ok(())
+    }
+
+    /// Confirmed DevQA resolve: post "DevQA: Passed" + 🚀 to the PR (daemon),
+    /// then best-effort transition the ticket to a "Dev QA Complete"/"Passed"
+    /// status. On the GitHub step failing, keep the confirm open with the error.
+    pub async fn submit_devqa_resolve(&mut self) -> Result<()> {
+        let Mode::DevQaResolveConfirm(form) = &self.mode else { return Ok(()) };
+        let key = form.ticket_key.clone();
+        let pr_url = form.pr_url.clone();
+
+        // 1. GitHub side (comment + reaction) via the daemon.
+        let mut s = ipc::connect().await?;
+        match ipc::send_request(&mut s, &Request::ResolveDevQaPr { ticket_key: key.clone() }).await? {
+            Response::Ok => {}
+            Response::Err { message } => {
+                self.mode = Mode::DevQaResolveConfirm(DevQaResolveForm {
+                    ticket_key: key,
+                    pr_url,
+                    error: Some(message),
+                });
+                return Ok(());
+            }
+            other => {
+                self.mode = Mode::DevQaResolveConfirm(DevQaResolveForm {
+                    ticket_key: key,
+                    pr_url,
+                    error: Some(format!("unexpected response: {other:?}")),
+                });
+                return Ok(());
+            }
+        }
+        self.mode = Mode::Detail;
+        let mut parts = vec!["DevQA: Passed posted · 🚀".to_string()];
+
+        // 2. Jira: best-effort transition forward. Match the destination status
+        //    on common "DevQA complete/passed" spellings; the transition itself
+        //    may just be named "Next", so prefer matching the target status.
+        let mut s = ipc::connect().await?;
+        if let Response::Transitions { items } =
+            ipc::send_request(&mut s, &Request::ListTransitions { key: key.clone() }).await?
+        {
+            let needles = ["dev qa complete", "dev qa passed", "qa complete", "qa passed", "qa done"];
+            let target = items.iter().find(|tr| {
+                let dest = tr.to_status.as_deref().unwrap_or("").to_ascii_lowercase();
+                let name = tr.name.to_ascii_lowercase();
+                needles.iter().any(|n| dest.contains(n) || name.contains(n))
+            });
+            if let Some(tr) = target {
+                let mut s = ipc::connect().await?;
+                let _ = ipc::send_request(
+                    &mut s,
+                    &Request::Transition { key: key.clone(), to: tr.name.clone() },
+                ).await;
+                parts.push(format!("→ {}", tr.to_status.clone().unwrap_or_else(|| tr.name.clone())));
+            } else {
+                parts.push("no DevQA-complete transition available".into());
+            }
+        }
+        let _ = self.set_pr_state(&key, PrUserState::Completed).await;
+
+        // 3. Remove the DevQA worktree if one was created (no-op for
+        //    branch-in-repo). If it has uncommitted changes, don't discard them
+        //    silently — pop a confirm prompt instead. Never block resolve.
+        let mut s = ipc::connect().await?;
+        match ipc::send_request(
+            &mut s,
+            &Request::CleanupDevQaWorktree { ticket_key: key.clone(), force: false },
+        )
+        .await
+        {
+            Ok(Response::DevQaCleanup { removed, dirty, message }) => {
+                if dirty && !removed {
+                    // Surface the resolve outcome now, then ask before discarding.
+                    self.status = format!("{key} · {}", parts.join(" · "));
+                    self.load_detail().await?;
+                    self.mode = Mode::DevQaCleanupConfirm(DevQaCleanupForm {
+                        ticket_key: key,
+                        detail: message,
+                    });
+                    return Ok(());
+                }
+                if removed {
+                    parts.push(message);
+                }
+            }
+            Ok(Response::Err { message }) => parts.push(format!("worktree cleanup: {message}")),
+            _ => {}
+        }
+
+        self.status = format!("{key} · {}", parts.join(" · "));
+        self.load_detail().await?;
+        Ok(())
+    }
+
+    /// Confirmed worktree cleanup from `DevQaCleanupConfirm` — force-remove the
+    /// dirty DevQA worktree. (Esc on the prompt keeps it; see the key handler.)
+    pub async fn confirm_devqa_cleanup(&mut self) -> Result<()> {
+        let Mode::DevQaCleanupConfirm(form) = &self.mode else { return Ok(()) };
+        let key = form.ticket_key.clone();
+        self.mode = Mode::Detail;
+        let mut s = ipc::connect().await?;
+        match ipc::send_request(
+            &mut s,
+            &Request::CleanupDevQaWorktree { ticket_key: key.clone(), force: true },
+        )
+        .await
+        {
+            Ok(Response::DevQaCleanup { message, .. }) => self.status = format!("{key} · {message}"),
+            Ok(Response::Err { message }) => self.status = format!("{key} · worktree cleanup: {message}"),
+            _ => {}
+        }
+        self.load_detail().await?;
         Ok(())
     }
 
@@ -5247,13 +5669,24 @@ async fn refresh_assignee_picker(app: &mut App, query: &str) -> Result<()> {
 ///   2. Any Jira comment body contains a `github.com/.../pull/<n>` URL — we
 ///      post this ourselves whenever the user opens a PR via `P`.
 pub fn ticket_has_pr(app: &App) -> bool {
-    if !app.pr_comments.is_empty() {
+    if !app.pr_comments.is_empty() || app.detail_pr_link.is_some() {
         return true;
     }
     app.comments.iter().any(|c| {
         let b = &c.body;
         b.contains("github.com/") && b.contains("/pull/")
     })
+}
+
+/// True when the currently-open ticket's Jira status indicates DevQA has been
+/// started (i.e. it's in some "Dev QA In Progress" state). Site workflows prefix
+/// the status with a team name (e.g. "Firmware Dev QA In Progress"), so we match
+/// on a substring rather than the exact label.
+pub fn ticket_devqa_in_progress(app: &App) -> bool {
+    app.detail
+        .as_ref()
+        .map(|t| t.status.to_ascii_lowercase().contains("dev qa in progress"))
+        .unwrap_or(false)
 }
 
 /// True when `t.status` matches one of the user-configured active workflow
@@ -7155,6 +7588,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             | Mode::ProjectsAdd(_)
             | Mode::KanbanFilter(_)
             | Mode::StartWorkPrompt(_)
+            | Mode::DevQaPrompt(_)
+            | Mode::DevQaResolveConfirm(_)
+            | Mode::DevQaCleanupConfirm(_)
             | Mode::ConfluenceSpaces(_)
             | Mode::ConfluencePages(_)
             | Mode::AssignPicker(_)
@@ -7384,6 +7820,15 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.mode = Mode::List;
                 }
                 KeyCode::Char('r') => { app.refresh().await?; }
+                // Shift+←/→ (or Shift+H/L) reorder the selected column and persist.
+                KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => {
+                    app.move_kanban_column(false);
+                }
+                KeyCode::Right if mods.contains(KeyModifiers::SHIFT) => {
+                    app.move_kanban_column(true);
+                }
+                KeyCode::Char('H') => { app.move_kanban_column(false); }
+                KeyCode::Char('L') => { app.move_kanban_column(true); }
                 KeyCode::Char('h') | KeyCode::Left => {
                     app.kanban_col = app.kanban_col.saturating_sub(1);
                     app.kanban_expanded_col = None;
@@ -7785,6 +8230,22 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     return Ok(());
                 }
                 KeyCode::Char('P') => {
+                    // Two contexts, mutually exclusive:
+                    //   • DevQA started + has PR → resolve DevQA (pass).
+                    //   • no PR yet            → open a PR.
+                    if ticket_devqa_in_progress(app) && ticket_has_pr(app) {
+                        let key = match &app.detail { Some(t) => t.key.clone(), None => return Ok(()) };
+                        if let Some(pr_url) = app.current_pr_url() {
+                            app.mode = Mode::DevQaResolveConfirm(DevQaResolveForm {
+                                ticket_key: key,
+                                pr_url,
+                                error: None,
+                            });
+                        } else {
+                            app.status = "no PR url to resolve DevQA".into();
+                        }
+                        return Ok(());
+                    }
                     if ticket_has_pr(app) {
                         app.status = "ticket already has a PR".into();
                         return Ok(());
@@ -7843,10 +8304,40 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         None
                     };
                     let Some(tr) = target else {
-                        app.status = format!(
-                            "no 'Dev QA In Progress' transition for {key} \
-                             (current status may not allow it)"
-                        );
+                        // No Dev QA transition available — the ticket was very
+                        // likely already moved past "begin DevQA". Don't dead-end:
+                        //   • if a worktree already exists on disk, re-open Claude
+                        //     in it (resume the saved session, or start a fresh
+                        //     one) — works even when the PR/session links are gone;
+                        //   • else if we still know the PR, prompt to create one;
+                        //   • else explain what's missing.
+                        let mut s = ipc::connect().await?;
+                        let existing_wt = match ipc::send_request(
+                            &mut s,
+                            &Request::FindDevQaWorktree { ticket_key: key.clone() },
+                        )
+                        .await?
+                        {
+                            Response::DevQaWorktree { path, .. } => Some(path),
+                            _ => None,
+                        };
+                        if let Some(path) = existing_wt {
+                            if let Err(e) = app.reopen_devqa_worktree(&key, path).await {
+                                app.status = format!("re-open DevQA err: {e:#}");
+                            }
+                        } else if let Some(pr_url) = app.current_pr_url() {
+                            app.mode = Mode::DevQaPrompt(DevQaPromptForm {
+                                ticket_key: key.clone(),
+                                pr_url,
+                                use_worktree: true,
+                                error: None,
+                            });
+                        } else {
+                            app.status = format!(
+                                "no 'Dev QA In Progress' transition and no worktree, \
+                                 session, or PR for {key}"
+                            );
+                        }
                         return Ok(());
                     };
                     let to_label = tr.to_status.clone().unwrap_or_else(|| tr.name.clone());
@@ -7864,11 +8355,19 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     // Mark the PR as actively under review.
                     let _ = app.set_pr_state(&key, PrUserState::Reviewing).await;
                     app.load_detail().await?;
-                    // Set up the DevQA worktree + open Claude in tmux. Skip
-                    // silently when there's no associated PR (e.g. ticket
-                    // landed in our list via @-mention without a PR).
-                    if let Err(e) = app.begin_devqa_worktree(&key).await {
-                        app.status = format!("{key} → {to_label} · worktree err: {e:#}");
+                    // If there's a PR, prompt for how to land its branch (worktree
+                    // vs. branch-in-repo) before launching Claude. When there's no
+                    // associated PR (e.g. a ticket that landed via @-mention), the
+                    // transition still stands; say so instead of doing nothing.
+                    if let Some(pr_url) = app.current_pr_url() {
+                        app.mode = Mode::DevQaPrompt(DevQaPromptForm {
+                            ticket_key: key.clone(),
+                            pr_url,
+                            use_worktree: true,
+                            error: None,
+                        });
+                    } else {
+                        app.status = format!("{key} → {to_label} · no PR to DevQA");
                     }
                     return Ok(());
                 }
@@ -8333,6 +8832,33 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 _ => {}
             }
         }
+        Mode::DevQaPrompt(form) => match code {
+            // Esc cancels the launch; the ticket stays transitioned to Dev QA.
+            KeyCode::Esc => app.mode = Mode::Detail,
+            // Single toggle field — arrows/space/tab flip worktree ↔ branch-in-repo.
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Tab | KeyCode::BackTab => {
+                form.use_worktree = !form.use_worktree;
+            }
+            KeyCode::Enter | KeyCode::F(5) => { app.submit_devqa_prompt().await?; }
+            KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                app.submit_devqa_prompt().await?;
+            }
+            _ => {}
+        },
+        Mode::DevQaResolveConfirm(_) => match code {
+            KeyCode::Esc | KeyCode::Char('n') => app.mode = Mode::Detail,
+            KeyCode::Enter | KeyCode::Char('y') => { app.submit_devqa_resolve().await?; }
+            _ => {}
+        },
+        Mode::DevQaCleanupConfirm(_) => match code {
+            // Esc / n keeps the worktree (with its uncommitted changes) in place.
+            KeyCode::Esc | KeyCode::Char('n') => {
+                app.mode = Mode::Detail;
+                app.status = "DevQA worktree kept (uncommitted changes)".into();
+            }
+            KeyCode::Enter | KeyCode::Char('y') => { app.confirm_devqa_cleanup().await?; }
+            _ => {}
+        },
         Mode::EditPriority(form) => match code {
             KeyCode::Esc => app.mode = Mode::Detail,
             KeyCode::Char('j') | KeyCode::Down => {
@@ -9297,4 +9823,31 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         Mode::Rules(_) | Mode::RuleEdit(_) | Mode::RuleLog(_) | Mode::Home(_) => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod parse_pr_url_tests {
+    use super::parse_pr_url;
+
+    #[test]
+    fn standard_url() {
+        assert_eq!(
+            parse_pr_url("https://github.com/acme/widgets/pull/123"),
+            Some(("acme/widgets".to_string(), 123))
+        );
+    }
+
+    #[test]
+    fn trailing_fragment() {
+        assert_eq!(
+            parse_pr_url("https://github.com/acme/widgets/pull/42#discussion_r1"),
+            Some(("acme/widgets".to_string(), 42))
+        );
+    }
+
+    #[test]
+    fn not_a_pr_url() {
+        assert_eq!(parse_pr_url("https://github.com/acme/widgets"), None);
+        assert_eq!(parse_pr_url("https://example.com/foo/pull/1"), None);
+    }
 }

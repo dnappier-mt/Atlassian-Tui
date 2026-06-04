@@ -654,9 +654,61 @@ async fn dispatch(
             tokio::spawn(async move { refresh_pr_comments_for_ticket(&s2, &k2).await; });
             Ok(Response::Ok)
         }
+        Request::FindDevQaWorktree { ticket_key } => {
+            match find_existing_devqa_worktree(&state, &ticket_key) {
+                Some((path, branch)) => Ok(Response::DevQaWorktree { path, branch }),
+                None => Ok(Response::Err { message: format!("no DevQA worktree for {ticket_key}") }),
+            }
+        }
+        Request::CleanupDevQaWorktree { ticket_key, force } => {
+            // Resolve repo + number so we can name the worktree + branch.
+            let (repo, number) = {
+                let cache = state.cache.lock().await;
+                if let Some((r, n)) = cache.get_ticket_pr_meta(&ticket_key)? {
+                    (r, n)
+                } else if let Some(c) = cache.get_pr_comments(&ticket_key)?.into_iter().next() {
+                    (c.repo, c.pr_number)
+                } else {
+                    return Ok(Response::Err {
+                        message: format!("no PR on file for {ticket_key}"),
+                    });
+                }
+            };
+            match cleanup_devqa_worktree(&state, &ticket_key, &repo, number, force) {
+                Ok((removed, dirty, message)) => Ok(Response::DevQaCleanup { removed, dirty, message }),
+                Err(e) => Ok(Response::Err { message: format!("{e:#}") }),
+            }
+        }
+        Request::ResolveDevQaPr { ticket_key } => {
+            // Same repo/number resolution as ReplyToPrComment.
+            let (repo, number) = {
+                let cache = state.cache.lock().await;
+                if let Some((r, n)) = cache.get_ticket_pr_meta(&ticket_key)? {
+                    (r, n)
+                } else if let Some(c) = cache.get_pr_comments(&ticket_key)?.into_iter().next() {
+                    (c.repo, c.pr_number)
+                } else {
+                    return Ok(Response::Err {
+                        message: format!("no PR on file for {ticket_key}"),
+                    });
+                }
+            };
+            if let Err(e) = jui_core::github::post_pr_comment(&repo, number, "DevQA: Passed").await {
+                return Ok(Response::Err { message: format!("post DevQA comment: {e:#}") });
+            }
+            if let Err(e) = jui_core::github::add_pr_reaction(&repo, number, "rocket").await {
+                // The comment already landed; report the partial failure so the
+                // user can add the reaction manually rather than retry the comment.
+                return Ok(Response::Err { message: format!("rocket reaction (comment posted): {e:#}") });
+            }
+            let s2 = state.clone();
+            let k2 = ticket_key.clone();
+            tokio::spawn(async move { refresh_pr_comments_for_ticket(&s2, &k2).await; });
+            Ok(Response::Ok)
+        }
 
-        Request::SetupDevQaWorktree { ticket_key, repo, pr_number } => {
-            setup_devqa_worktree(&state, &ticket_key, &repo, pr_number).await
+        Request::SetupDevQaWorktree { ticket_key, repo, pr_number, worktree } => {
+            setup_devqa_worktree(&state, &ticket_key, &repo, pr_number, worktree).await
         }
 
         Request::SetPrUserState { ticket_key, state: pr_state } => {
@@ -1925,6 +1977,7 @@ async fn setup_devqa_worktree(
     ticket_key: &str,
     repo: &str,
     pr_number: u64,
+    use_worktree: bool,
 ) -> Result<Response> {
     let candidates: Vec<std::path::PathBuf> = state
         .config
@@ -1980,30 +2033,167 @@ async fn setup_devqa_worktree(
         ));
     }
 
-    // 2. Create the worktree (or reuse if it already exists).
-    if !worktree_path.exists() {
-        let out = std::process::Command::new("git")
-            .args([
-                "-C", clone.to_str().unwrap(),
-                "worktree", "add",
-                worktree_path.to_str().unwrap(),
-                &local_branch,
-            ])
+    // 2. Land the PR branch somewhere to test from. Either isolate it in a
+    //    worktree (default) or check it out in the existing clone.
+    let checkout_path = if use_worktree {
+        // Create the worktree (or reuse if it already exists).
+        if !worktree_path.exists() {
+            let out = std::process::Command::new("git")
+                .args([
+                    "-C", clone.to_str().unwrap(),
+                    "worktree", "add",
+                    worktree_path.to_str().unwrap(),
+                    &local_branch,
+                ])
+                .output()
+                .context("git worktree add")?;
+            if !out.status.success() {
+                return Err(anyhow::anyhow!(
+                    "git worktree add failed: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                ));
+            }
+        }
+        worktree_path
+    } else {
+        // Branch-in-repo: refuse to clobber uncommitted work, then check out
+        // the PR branch directly in the clone.
+        let status = std::process::Command::new("git")
+            .args(["-C", clone.to_str().unwrap(), "status", "--porcelain"])
             .output()
-            .context("git worktree add")?;
+            .context("git status --porcelain")?;
+        if !status.stdout.is_empty() {
+            return Err(anyhow::anyhow!(
+                "{} has uncommitted changes — commit/stash them or use a worktree",
+                clone.display()
+            ));
+        }
+        let out = std::process::Command::new("git")
+            .args(["-C", clone.to_str().unwrap(), "checkout", &local_branch])
+            .output()
+            .context("git checkout devqa branch")?;
         if !out.status.success() {
             return Err(anyhow::anyhow!(
-                "git worktree add failed: {}",
+                "git checkout {local_branch} failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-    }
+        clone.clone()
+    };
 
-    info!(%ticket_key, %repo, pr_number, path = %worktree_path.display(), "DevQA worktree ready");
+    info!(%ticket_key, %repo, pr_number, use_worktree, path = %checkout_path.display(), "DevQA checkout ready");
     Ok(Response::DevQaWorktree {
-        path: worktree_path,
+        path: checkout_path,
         branch: local_branch,
     })
+}
+
+/// Find an existing DevQA worktree for `ticket_key` by checking each configured
+/// clone's deterministic `<repo>-worktrees/<ticket_key>-devqa` path. Returns the
+/// worktree path + its current branch. Independent of any cached PR, so it works
+/// even after the daemon has forgotten the ticket↔PR link.
+fn find_existing_devqa_worktree(state: &Arc<State>, ticket_key: &str) -> Option<(std::path::PathBuf, String)> {
+    for p in &state.config.projects {
+        let clone = &p.path;
+        let repo_name = clone.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if repo_name.is_empty() {
+            continue;
+        }
+        let parent = clone.parent().unwrap_or(clone);
+        let wt = parent
+            .join(format!("{repo_name}-worktrees"))
+            .join(format!("{ticket_key}-devqa"));
+        if wt.exists() {
+            let branch = std::process::Command::new("git")
+                .args(["-C", wt.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            return Some((wt, branch));
+        }
+    }
+    None
+}
+
+/// Remove the DevQA worktree for `ticket_key` (if it exists) and delete the
+/// throwaway `devqa-pr-<n>` branch. Returns `(removed, dirty, message)`.
+///
+/// A no-op (`removed = false`) when there's no worktree — e.g. the ticket used
+/// branch-in-repo. When the worktree has uncommitted changes to tracked files
+/// and `force` is false, it is left in place (`removed = false, dirty = true`)
+/// so the caller can confirm before discarding work. `force` skips that gate.
+fn cleanup_devqa_worktree(
+    state: &Arc<State>,
+    ticket_key: &str,
+    repo: &str,
+    pr_number: u64,
+    force: bool,
+) -> Result<(bool, bool, String)> {
+    let candidates: Vec<std::path::PathBuf> = state
+        .config
+        .projects
+        .iter()
+        .map(|p| p.path.clone())
+        .collect();
+    let clone = jui_core::scm::find_clone_for_gh_repo(repo, &candidates)
+        .ok_or_else(|| anyhow::anyhow!("no local clone matches {repo}"))?;
+    let repo_name = clone.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let parent = clone.parent().unwrap_or(&clone);
+    let worktree_path = parent
+        .join(format!("{}-worktrees", repo_name))
+        .join(format!("{ticket_key}-devqa"));
+
+    if !worktree_path.exists() {
+        return Ok((false, false, "no DevQA worktree to remove".to_string()));
+    }
+
+    // Dirty check: modified/staged tracked files. We ignore untracked files and
+    // submodule working-tree churn so the build symlinks + submodule artifacts
+    // created by WORKTREE_SETUP.md don't read as "uncommitted work".
+    let status = std::process::Command::new("git")
+        .args([
+            "-C", worktree_path.to_str().unwrap(),
+            "status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all",
+        ])
+        .output()
+        .context("git status (dirty check)")?;
+    let dirty = !status.stdout.is_empty();
+    if dirty && !force {
+        let n = String::from_utf8_lossy(&status.stdout).lines().count();
+        return Ok((
+            false,
+            true,
+            format!("worktree has {n} uncommitted change(s)"),
+        ));
+    }
+
+    let out = std::process::Command::new("git")
+        .args([
+            "-C", clone.to_str().unwrap(),
+            "worktree", "remove", "--force",
+            worktree_path.to_str().unwrap(),
+        ])
+        .output()
+        .context("git worktree remove")?;
+    if !out.status.success() {
+        return Err(anyhow::anyhow!(
+            "git worktree remove failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // Best-effort: prune metadata and drop the throwaway DevQA branch.
+    let _ = std::process::Command::new("git")
+        .args(["-C", clone.to_str().unwrap(), "worktree", "prune"])
+        .output();
+    let local_branch = format!("devqa-pr-{pr_number}");
+    let _ = std::process::Command::new("git")
+        .args(["-C", clone.to_str().unwrap(), "branch", "-D", &local_branch])
+        .output();
+
+    info!(%ticket_key, %repo, path = %worktree_path.display(), "DevQA worktree removed");
+    Ok((true, dirty, format!("removed worktree {}", worktree_path.display())))
 }
 
 /// Pull GitHub PRs the current user has been requested to review (or

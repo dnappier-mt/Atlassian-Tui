@@ -723,6 +723,29 @@ pub async fn post_pr_comment(repo: &str, number: u64, body: &str) -> Result<()> 
     Ok(())
 }
 
+/// Add a reaction to a PR's top-level body (the PR description). A PR is an
+/// issue at the REST level, so reactions go on the issues endpoint. `content`
+/// is a GitHub reaction name, e.g. "rocket", "+1", "hooray".
+pub async fn add_pr_reaction(repo: &str, number: u64, content: &str) -> Result<()> {
+    let out = Command::new("gh")
+        .args([
+            "api", "-X", "POST",
+            "-H", "Accept: application/vnd.github+json",
+            &format!("repos/{repo}/issues/{number}/reactions"),
+            "-f", &format!("content={content}"),
+        ])
+        .output()
+        .await
+        .context("running gh api reactions")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh api reactions failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
 /// Map of review-comment REST `databaseId` → `isResolved` for every comment
 /// in every review thread on the PR. The merge pass uses this to flag
 /// `kind = "review"` cached comments. Empty map on any GraphQL failure —
