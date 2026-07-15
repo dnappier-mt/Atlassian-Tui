@@ -14,12 +14,19 @@ const MAX_FRAME: u32 = 4 * 1024 * 1024;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Request {
     Ping,
-    ListTickets { jql: Option<String>, limit: u32 },
-    GetTicket { key: String },
+    ListTickets {
+        jql: Option<String>,
+        limit: u32,
+    },
+    GetTicket {
+        key: String,
+    },
     /// Cache-only batch fetch + ancestor walk. Used by Tree mode to avoid N
     /// individual round-trips. Daemon's hourly warmup task keeps the cache
     /// populated with parents.
-    GetTicketsWithAncestors { keys: Vec<String> },
+    GetTicketsWithAncestors {
+        keys: Vec<String>,
+    },
     /// Open tickets where the user is the **reviewer** (per the configured
     /// reviewer custom field) or has been **@-mentioned** in the description /
     /// comments — and is *not* the assignee. Daemon issues both queries and
@@ -42,16 +49,28 @@ pub enum Request {
         #[serde(default)]
         push_remote: Option<String>,
     },
+    /// Close the cached GitHub PR for this ticket, clear local PR metadata, and
+    /// move Jira back toward In Progress so the PR can be created again.
+    ResetPullRequest {
+        ticket_key: String,
+    },
     /// Persist a Jira `account_id` → GitHub handle mapping. Used when the user
     /// picks a teammate in the PR-create modal who isn't yet in the map.
-    SetGithubHandle { account_id: String, handle: String },
+    SetGithubHandle {
+        account_id: String,
+        handle: String,
+    },
     /// Lookup a single mapping. Returns `Response::GithubHandle { handle }` —
     /// `handle` empty when not in the map.
-    GetGithubHandle { account_id: String },
+    GetGithubHandle {
+        account_id: String,
+    },
     /// Cached PR comments for the given Jira ticket (only present when the
     /// ticket is associated with an open PR — daemon populates during the
     /// github-mentions refresh).
-    ListPrComments { ticket_key: String },
+    ListPrComments {
+        ticket_key: String,
+    },
     /// Reply to a GitHub PR comment. `parent_kind = "review"` uses the
     /// threaded reply endpoint; otherwise the body is posted as a new
     /// top-level issue comment on the PR.
@@ -63,15 +82,22 @@ pub enum Request {
     },
     /// Mark the review thread containing the given comment as resolved.
     /// Only meaningful for `kind = "review"` comments; other kinds error.
-    ResolvePrComment { ticket_key: String, comment_id: String },
+    ResolvePrComment {
+        ticket_key: String,
+        comment_id: String,
+    },
     /// Resolve DevQA on the ticket's PR: post a "DevQA: Passed" issue comment
     /// and add a 🚀 reaction to the PR's top-level body. The Jira transition is
     /// handled TUI-side. Errors when no PR is on file for the ticket.
-    ResolveDevQaPr { ticket_key: String },
+    ResolveDevQaPr {
+        ticket_key: String,
+    },
     /// Look for an existing DevQA worktree on disk for the ticket by scanning
-    /// the configured clones' `<repo>-worktrees/<ticket_key>-devqa` paths. Does
+    /// the configured clones' `<repo>/worktrees/<ticket_key>-devqa` paths. Does
     /// not need a cached PR. Replies `DevQaWorktree` when found, else `Err`.
-    FindDevQaWorktree { ticket_key: String },
+    FindDevQaWorktree {
+        ticket_key: String,
+    },
     /// Remove the DevQA git worktree for the ticket (if one was created) and
     /// delete its throwaway `devqa-pr-<n>` branch. No-op when the ticket used
     /// branch-in-repo instead of a worktree. When `force` is false and the
@@ -84,14 +110,14 @@ pub enum Request {
     },
     /// Set up a DevQA worktree for the given PR: locate the user's local clone
     /// of `repo`, fetch `pull/<pr_number>/head` into a local branch, and either
-    /// `git worktree add` it at `<repo>/../<repo>-worktrees/<ticket_key>-devqa`
+    /// `git worktree add` it at `<repo>/worktrees/<ticket_key>-devqa`
     /// (`worktree = true`) or check it out directly in the existing clone
     /// (`worktree = false`, aborts if the clone's working tree is dirty).
     /// Returns the checkout path and the local branch name so the TUI can open a
     /// tmux pane + Claude with PR context.
     SetupDevQaWorktree {
         ticket_key: String,
-        repo: String,        // "<owner>/<name>"
+        repo: String, // "<owner>/<name>"
         pr_number: u64,
         /// When true, isolate the PR branch in a git worktree. When false, check
         /// the branch out in the existing clone (branch-in-repo).
@@ -101,21 +127,43 @@ pub enum Request {
     /// Set the user-managed PR review state for the given ticket. Valid values:
     /// "awaiting", "reviewing", "completed". Persisted via SQLite so the state
     /// survives daemon restarts.
-    SetPrUserState { ticket_key: String, state: String },
+    SetPrUserState {
+        ticket_key: String,
+        state: String,
+    },
     /// Map of ticket_key → state for every PR the user has touched. Tickets
     /// that have never been touched return `Awaiting` by convention (TUI default).
     GetPrUserStates,
-    DeleteTicket { key: String },
+    DeleteTicket {
+        key: String,
+    },
     /// Transition the ticket to a "closed" state. Daemon picks the first available
     /// transition matching (case-insensitive): Won't Do, Cancelled, Closed, Done.
     /// Used by the TUI's archive flow when the user lacks delete permission on Jira.
-    ArchiveTicket { key: String },
-    AssignTicket { key: String, assignee: String },
-    SetReviewer { key: String, assignee_id: String },
-    Refresh { jql: Option<String> },
+    ArchiveTicket {
+        key: String,
+    },
+    AssignTicket {
+        key: String,
+        assignee: String,
+    },
+    SetReviewer {
+        key: String,
+        assignee_id: String,
+    },
+    SetDevQa {
+        key: String,
+        assignee_id: String,
+    },
+    Refresh {
+        jql: Option<String>,
+    },
     StartWork {
         key: String,
         cwd: PathBuf,
+        /// Branch/worktree slug to use. Omitted = daemon generates one.
+        #[serde(default)]
+        slug: Option<String>,
         /// Where to land the checkout. Omitted = worktree (back-compat).
         #[serde(default)]
         location: crate::scm::WorkLocation,
@@ -131,61 +179,139 @@ pub enum Request {
     },
     /// Recent rule-engine fire history (newest first). 5-day rolling window
     /// pruned on each insert by the daemon. `limit` caps the result row count.
-    ListRuleLog { limit: u32 },
+    ListRuleLog {
+        limit: u32,
+    },
     /// Mixed activity feed (jira comments, pr comments, ticket status
     /// changes) sorted newest first. Drives the Home pane.
-    RecentActivity { limit: u32 },
-    AddComment { key: String, body: String },
-    ListComments { key: String },
-    DeleteComment { key: String, comment_id: String },
+    RecentActivity {
+        limit: u32,
+    },
+    AddComment {
+        key: String,
+        body: String,
+    },
+    ListComments {
+        key: String,
+    },
+    DeleteComment {
+        key: String,
+        comment_id: String,
+    },
     Myself,
     ListProjects,
-    AddProject { path: PathBuf, nickname: Option<String> },
-    RemoveProject { path: PathBuf },
+    AddProject {
+        path: PathBuf,
+        nickname: Option<String>,
+    },
+    RemoveProject {
+        path: PathBuf,
+    },
     /// Recursively scan `root` for git/svn repos. Limited depth.
-    ScanRepos { root: PathBuf, max_depth: u32 },
+    ScanRepos {
+        root: PathBuf,
+        max_depth: u32,
+    },
     /// Local-only ticket↔project link. Stored in SQLite, never sent to Jira.
-    LinkProject { ticket_key: String, project_path: PathBuf },
-    UnlinkProject { ticket_key: String, project_path: PathBuf },
+    LinkProject {
+        ticket_key: String,
+        project_path: PathBuf,
+    },
+    UnlinkProject {
+        ticket_key: String,
+        project_path: PathBuf,
+    },
     /// Returns every configured project plus a `linked` flag for this ticket.
-    ListTicketProjects { ticket_key: String },
+    ListTicketProjects {
+        ticket_key: String,
+    },
     /// Promote a 'suggested' link to 'confirmed'.
-    ConfirmSuggestion { ticket_key: String, project_path: PathBuf },
+    ConfirmSuggestion {
+        ticket_key: String,
+        project_path: PathBuf,
+    },
     /// Mark as 'rejected' so we never re-suggest it.
-    RejectSuggestion { ticket_key: String, project_path: PathBuf },
+    RejectSuggestion {
+        ticket_key: String,
+        project_path: PathBuf,
+    },
     /// Manually trigger the suggestion worker for a ticket (mostly for testing).
-    SuggestProject { ticket_key: String },
+    SuggestProject {
+        ticket_key: String,
+    },
     /// Returns the cached implementation suggestion for a ticket, if any.
-    GetImplementation { ticket_key: String },
+    GetImplementation {
+        ticket_key: String,
+    },
     /// Force regeneration of the implementation suggestion.
-    GenerateImplementation { ticket_key: String },
-    GetClaudeSession { ticket_key: String },
-    SaveClaudeSession { ticket_key: String, session_id: String },
-    Transition { key: String, to: String },
-    ListTransitions { key: String },
+    GenerateImplementation {
+        ticket_key: String,
+    },
+    GetAssistantSession {
+        ticket_key: String,
+        assistant: String,
+    },
+    SaveAssistantSession {
+        ticket_key: String,
+        assistant: String,
+        session_id: String,
+    },
+    ClearAssistantSession {
+        ticket_key: String,
+        assistant: String,
+    },
+    Transition {
+        key: String,
+        to: String,
+    },
+    TransitionToStatus {
+        key: String,
+        status: String,
+    },
+    ListTransitions {
+        key: String,
+    },
     /// Fetch the instance's full set of status names (deduped, alpha-sorted).
     /// Used by the Settings status-pickers.
     ListStatuses,
     /// Resolve the on-disk worktree path for a ticket's first linked project.
     /// Used by flows (PR review gate, comment chat) that need to spawn Claude
     /// inside the worktree without going through the full StartWork dance.
-    GetTicketWorktree { ticket_key: String },
+    GetTicketWorktree {
+        ticket_key: String,
+    },
     /// Persisted PR-draft handling. Lets the user resume a review-gated PR
     /// across restarts so an aborted `/review` doesn't lose the form state.
-    GetPrDraft { ticket_key: String },
-    SavePrDraft { ticket_key: String, draft: crate::cache::PrDraft },
-    DeletePrDraft { ticket_key: String },
+    GetPrDraft {
+        ticket_key: String,
+    },
+    SavePrDraft {
+        ticket_key: String,
+        draft: crate::cache::PrDraft,
+    },
+    DeletePrDraft {
+        ticket_key: String,
+    },
     /// Run `/review` headlessly against the ticket's worktree, attached to the
     /// ticket's stored Claude session (created if missing). Returns the raw
     /// markdown Claude printed so the TUI can render it inline.
-    CodeReview { ticket_key: String },
+    CodeReview {
+        ticket_key: String,
+    },
     /// `git remote -v` parsed against the ticket's worktree (or linked project
     /// root if the worktree dir is missing). Returns (name, fetch_url) pairs.
-    ListWorktreeRemotes { ticket_key: String },
+    ListWorktreeRemotes {
+        ticket_key: String,
+    },
     /// Per-project preferred push remote — saved once during the PR-create
     /// picker; reused on subsequent PRs for the same linked project.
-    GetPushRemote { ticket_key: String },
-    SetPushRemote { ticket_key: String, remote_name: String },
+    GetPushRemote {
+        ticket_key: String,
+    },
+    SetPushRemote {
+        ticket_key: String,
+        remote_name: String,
+    },
     CreateTicket {
         project: String,
         issue_type: String,
@@ -196,36 +322,73 @@ pub enum Request {
         #[serde(default)]
         parent: Option<String>,
     },
-    EditSummary { key: String, summary: String },
-    EditDescription { key: String, body: String },
+    EditSummary {
+        key: String,
+        summary: String,
+    },
+    EditDescription {
+        key: String,
+        body: String,
+    },
     /// Ask Claude to rewrite a description more tightly. Pure transform — no Jira write.
-    ImproveDescription { summary: String, body: String },
+    ImproveDescription {
+        summary: String,
+        body: String,
+    },
     /// PR-aware body tightener. Daemon resolves the ticket's worktree, runs
     /// `git diff <base>...HEAD` against the default remote branch, and passes
     /// the diff to Claude alongside the title/body so the rewrite reflects
     /// the actual change. Pure transform — does not touch GitHub.
-    ImprovePrBody { ticket_key: String, title: String, body: String },
-    EditPriority { key: String, priority: String },
+    ImprovePrBody {
+        ticket_key: String,
+        title: String,
+        body: String,
+    },
+    EditPriority {
+        key: String,
+        priority: String,
+    },
     ListPriorities,
-    SetEstimate { key: String, original: Option<String>, remaining: Option<String> },
-    LogWork { key: String, time_spent: String, comment: Option<String>, new_estimate: Option<String> },
+    SetEstimate {
+        key: String,
+        original: Option<String>,
+        remaining: Option<String>,
+    },
+    LogWork {
+        key: String,
+        time_spent: String,
+        comment: Option<String>,
+        new_estimate: Option<String>,
+    },
     PendingNotifications,
     Status,
     Shutdown,
-    SearchUsers { query: String },
-    SaveTeam { name: String, members: Vec<String> },
+    SearchUsers {
+        query: String,
+    },
+    SaveTeam {
+        name: String,
+        members: Vec<String>,
+    },
     ListTeams,
-    DeleteTeam { name: String },
+    DeleteTeam {
+        name: String,
+    },
     ConfluenceListSpaces,
     /// `parent_id = None` → root pages of space; `Some(id)` → children of that page.
-    ConfluenceListPages { space_key: String, parent_id: Option<String> },
+    ConfluenceListPages {
+        space_key: String,
+        parent_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Response {
     Pong,
-    Tickets { items: Vec<Ticket> },
+    Tickets {
+        items: Vec<Ticket>,
+    },
     /// Result lists for `ListMyMentions`. Reviewer wins over GitHub wins over
     /// Mentioned on overlap; daemon dedupes by key before returning.
     /// `authored` is just ticket keys of open PRs the user authored — used to
@@ -239,9 +402,14 @@ pub enum Response {
         authored: Vec<String>,
     },
     /// Reply for `CreatePullRequest`.
-    PullRequestCreated { url: String, number: u64 },
+    PullRequestCreated {
+        url: String,
+        number: u64,
+    },
     /// Reply for `GetGithubHandle`. Empty string == no mapping.
-    GithubHandle { handle: String },
+    GithubHandle {
+        handle: String,
+    },
     /// Reply for `ListPrComments`. `pr_link` is the canonical PR URL tied to
     /// the ticket (populated even when there are zero comments); `None` when
     /// no PR is associated.
@@ -251,51 +419,108 @@ pub enum Response {
         pr_link: Option<String>,
     },
     /// Reply for `SetupDevQaWorktree`.
-    DevQaWorktree { path: std::path::PathBuf, branch: String },
+    DevQaWorktree {
+        path: std::path::PathBuf,
+        branch: String,
+    },
     /// Reply for `CleanupDevQaWorktree`. `removed` is false when there was no
     /// worktree to remove, or when it was left in place because it was dirty and
     /// `force` was not set. `dirty` flags uncommitted changes in the worktree.
     /// `message` is a short human-readable summary.
-    DevQaCleanup { removed: bool, dirty: bool, message: String },
+    DevQaCleanup {
+        removed: bool,
+        dirty: bool,
+        message: String,
+    },
     /// Reply for `GetPrUserStates`.
-    PrUserStates { items: std::collections::HashMap<String, String> },
-    Ticket { ticket: Ticket },
-    StartWork { reply: StartWorkReply },
-    Created { key: String },
-    Notifications { items: Vec<NotificationItem> },
-    Status { status: DaemonStatus },
-    Transitions { items: Vec<TransitionOption> },
-    Statuses { items: Vec<String> },
+    PrUserStates {
+        items: std::collections::HashMap<String, String>,
+    },
+    Ticket {
+        ticket: Ticket,
+    },
+    StartWork {
+        reply: StartWorkReply,
+    },
+    Created {
+        key: String,
+    },
+    Notifications {
+        items: Vec<NotificationItem>,
+    },
+    Status {
+        status: DaemonStatus,
+    },
+    Transitions {
+        items: Vec<TransitionOption>,
+    },
+    Statuses {
+        items: Vec<String>,
+    },
     /// `path = None` when no linked project or the slug's worktree dir is
     /// missing; caller surfaces the appropriate hint to the user.
-    TicketWorktree { path: Option<PathBuf> },
+    TicketWorktree {
+        path: Option<PathBuf>,
+    },
     /// `draft = None` when no in-flight PR draft is on file for this ticket.
-    PrDraft { draft: Option<crate::cache::PrDraft> },
+    PrDraft {
+        draft: Option<crate::cache::PrDraft>,
+    },
     /// Reply for `CodeReview`. Markdown body from `claude -p /review`.
-    ReviewOutput { markdown: String },
+    ReviewOutput {
+        markdown: String,
+    },
     /// Reply for `ListWorktreeRemotes`.
-    Remotes { items: Vec<(String, String)> },
+    Remotes {
+        items: Vec<(String, String)>,
+    },
     /// Reply for `GetPushRemote`. `name = None` means no override on file
     /// (caller falls back to the picker flow).
-    PushRemote { name: Option<String> },
+    PushRemote {
+        name: Option<String>,
+    },
     /// Reply for `ListRuleLog`.
-    RuleLog { items: Vec<crate::cache::RuleLogEntry> },
+    RuleLog {
+        items: Vec<crate::cache::RuleLogEntry>,
+    },
     /// Reply for `RecentActivity`.
-    Activity { items: Vec<crate::cache::ActivityEntry> },
-    Comments { items: Vec<Comment> },
-    Priorities { items: Vec<String> },
-    Implementation { markdown: String, project_paths: Vec<String>, updated_at: String },
+    Activity {
+        items: Vec<crate::cache::ActivityEntry>,
+    },
+    Comments {
+        items: Vec<Comment>,
+    },
+    Priorities {
+        items: Vec<String>,
+    },
+    Implementation {
+        markdown: String,
+        project_paths: Vec<String>,
+        updated_at: String,
+    },
     /// Reply for `ImproveDescription`.
-    Improved { body: String },
+    Improved {
+        body: String,
+    },
     /// Sent immediately when a generation request was queued; the markdown shows up on
     /// a subsequent GetImplementation call.
     Queued,
-    ClaudeSession { session_id: Option<String> },
-    Myself { info: MyselfInfo },
-    Projects { items: Vec<ProjectStatus> },
-    Repos { items: Vec<RepoEntry> },
+    AssistantSession {
+        session_id: Option<String>,
+    },
+    Myself {
+        info: MyselfInfo,
+    },
+    Projects {
+        items: Vec<ProjectStatus>,
+    },
+    Repos {
+        items: Vec<RepoEntry>,
+    },
     /// Each entry's `linked` field tells whether it's currently tied to the ticket.
-    TicketProjects { items: Vec<TicketProjectEntry> },
+    TicketProjects {
+        items: Vec<TicketProjectEntry>,
+    },
     ConfluenceSpaces {
         items: Vec<crate::confluence_api::ConfluenceSpace>,
         /// True when served from SQLite cache without a live API call.
@@ -306,10 +531,17 @@ pub enum Response {
         from_cache: bool,
     },
     Ok,
-    Err { message: String },
+    Err {
+        message: String,
+    },
     /// `from_cache` = true means results came from ticket assignees (users table empty).
-    Users { items: Vec<UserInfo>, from_cache: bool },
-    Teams { items: Vec<TeamEntry> },
+    Users {
+        items: Vec<UserInfo>,
+        from_cache: bool,
+    },
+    Teams {
+        items: Vec<TeamEntry>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,7 +565,9 @@ pub enum StartWorkReply {
         created_branch: bool,
         already_on_branch: bool,
     },
-    SvnExport { value: String },
+    SvnExport {
+        value: String,
+    },
     NoScm,
 }
 
@@ -384,7 +618,9 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin>(w: &mut W, payload: &[u8]) ->
 
 pub async fn read_frame<R: AsyncReadExt + Unpin>(r: &mut R) -> Result<Vec<u8>> {
     let mut len_buf = [0u8; 4];
-    r.read_exact(&mut len_buf).await.context("reading frame length")?;
+    r.read_exact(&mut len_buf)
+        .await
+        .context("reading frame length")?;
     let len = u32::from_be_bytes(len_buf);
     if len > MAX_FRAME {
         return Err(anyhow!("frame too large ({len} bytes)"));

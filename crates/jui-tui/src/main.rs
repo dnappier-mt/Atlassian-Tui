@@ -5,8 +5,8 @@ mod ui;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use jui_core::ipc::{self, Request, Response, StartWorkReply};
-use jui_core::scm::WorkLocation;
 use jui_core::paths;
+use jui_core::scm::WorkLocation;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -37,6 +37,13 @@ enum Cmd {
     /// Emits a single line: `git <branch>` | `svn <value>` | `none` | `error <msg>` | `staged`.
     #[command(name = "_start-machine")]
     StartMachine { key: String },
+    /// Internal: persist an assistant session id from detached launch helpers.
+    #[command(name = "_save-assistant-session", hide = true)]
+    SaveAssistantSession {
+        key: String,
+        assistant: String,
+        session_id: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -45,19 +52,25 @@ fn main() -> Result<()> {
     let (file_writer, guard) = tracing_appender::non_blocking(file);
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,jui=debug,jui_core=debug,jui_tui=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,jui=debug,jui_core=debug,jui_tui=debug")
+            }),
         )
         .with_writer(file_writer)
         .with_ansi(false)
         .init();
     Box::leak(Box::new(guard));
     let cli = Cli::parse();
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(async {
         match cli.cmd.unwrap_or(Cmd::Tui) {
             Cmd::Tui => run_tui().await,
-            Cmd::ShellInit => { print!("{}", SHELL_INIT); Ok(()) }
+            Cmd::ShellInit => {
+                print!("{}", SHELL_INIT);
+                Ok(())
+            }
             Cmd::TmuxSnippet => {
                 let path = paths::status_file()?;
                 println!(
@@ -71,6 +84,11 @@ fn main() -> Result<()> {
             Cmd::Stop => cmd_stop().await,
             Cmd::Start { key } => cmd_start(key).await,
             Cmd::StartMachine { key } => cmd_start_machine(key).await,
+            Cmd::SaveAssistantSession {
+                key,
+                assistant,
+                session_id,
+            } => cmd_save_assistant_session(key, assistant, session_id).await,
         }
     })
 }
@@ -121,7 +139,11 @@ fn spawn_daemon() -> Result<()> {
     let exe = std::env::current_exe().context("current_exe")?;
     let dir = exe.parent().unwrap_or(std::path::Path::new("."));
     let candidate = dir.join("jui-daemon");
-    let bin: PathBuf = if candidate.exists() { candidate } else { PathBuf::from("jui-daemon") };
+    let bin: PathBuf = if candidate.exists() {
+        candidate
+    } else {
+        PathBuf::from("jui-daemon")
+    };
     Command::new(bin)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -137,7 +159,10 @@ async fn cmd_status() -> Result<()> {
         Response::Status { status: st } => {
             println!("pid:        {}", st.pid);
             println!("started:    {}", st.started_at);
-            println!("last poll:  {}", st.last_poll_at.unwrap_or_else(|| "<never>".into()));
+            println!(
+                "last poll:  {}",
+                st.last_poll_at.unwrap_or_else(|| "<never>".into())
+            );
             println!("cached:     {} tickets", st.cached_tickets);
         }
         Response::Err { message } => println!("error: {message}"),
@@ -149,7 +174,10 @@ async fn cmd_status() -> Result<()> {
 async fn cmd_refresh() -> Result<()> {
     let mut s = ensure_daemon().await?;
     match ipc::send_request(&mut s, &Request::Refresh { jql: None }).await? {
-        Response::Ok => { println!("ok"); Ok(()) }
+        Response::Ok => {
+            println!("ok");
+            Ok(())
+        }
         Response::Err { message } => Err(anyhow::anyhow!(message)),
         other => Err(anyhow::anyhow!("unexpected: {other:?}")),
     }
@@ -168,26 +196,69 @@ async fn cmd_start(key: String) -> Result<()> {
     );
     let cwd = std::env::current_dir()?;
     let mut s = ensure_daemon().await?;
-    match ipc::send_request(&mut s, &Request::StartWork { key, cwd, location: WorkLocation::Worktree }).await? {
-        Response::StartWork { reply: StartWorkReply::GitWorktree { branch, path, created_branch, attached_existing_worktree } } => {
-            let action = if attached_existing_worktree { "reusing existing worktree" }
-                else if created_branch { "created new branch + worktree" }
-                else { "attached worktree to existing branch" };
+    match ipc::send_request(
+        &mut s,
+        &Request::StartWork {
+            key,
+            cwd,
+            slug: None,
+            location: WorkLocation::Worktree,
+        },
+    )
+    .await?
+    {
+        Response::StartWork {
+            reply:
+                StartWorkReply::GitWorktree {
+                    branch,
+                    path,
+                    created_branch,
+                    attached_existing_worktree,
+                },
+        } => {
+            let action = if attached_existing_worktree {
+                "reusing existing worktree"
+            } else if created_branch {
+                "created new branch + worktree"
+            } else {
+                "attached worktree to existing branch"
+            };
             println!("{action}\n  branch: {branch}\n  path:   {}", path.display());
             Ok(())
         }
-        Response::StartWork { reply: StartWorkReply::GitBranchInRepo { branch, path, created_branch, already_on_branch } } => {
-            let action = if already_on_branch { "already on branch" }
-                else if created_branch { "created new branch in repo" }
-                else { "checked out existing branch in repo" };
+        Response::StartWork {
+            reply:
+                StartWorkReply::GitBranchInRepo {
+                    branch,
+                    path,
+                    created_branch,
+                    already_on_branch,
+                },
+        } => {
+            let action = if already_on_branch {
+                "already on branch"
+            } else if created_branch {
+                "created new branch in repo"
+            } else {
+                "checked out existing branch in repo"
+            };
             println!("{action}\n  branch: {branch}\n  repo:   {}", path.display());
             Ok(())
         }
-        Response::StartWork { reply: StartWorkReply::SvnExport { value } } => {
-            println!("would export SVN_JIRA_DESCRIPTION={value} (use shell wrapper to actually export)");
+        Response::StartWork {
+            reply: StartWorkReply::SvnExport { value },
+        } => {
+            println!(
+                "would export SVN_JIRA_DESCRIPTION={value} (use shell wrapper to actually export)"
+            );
             Ok(())
         }
-        Response::StartWork { reply: StartWorkReply::NoScm } => { println!("no SCM detected"); Ok(()) }
+        Response::StartWork {
+            reply: StartWorkReply::NoScm,
+        } => {
+            println!("no SCM detected");
+            Ok(())
+        }
         Response::Err { message } => Err(anyhow::anyhow!(message)),
         other => Err(anyhow::anyhow!("unexpected: {other:?}")),
     }
@@ -196,20 +267,59 @@ async fn cmd_start(key: String) -> Result<()> {
 async fn cmd_start_machine(key: String) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let mut s = ensure_daemon().await?;
-    let resp = ipc::send_request(&mut s, &Request::StartWork { key, cwd, location: WorkLocation::Worktree }).await?;
+    let resp = ipc::send_request(
+        &mut s,
+        &Request::StartWork {
+            key,
+            cwd,
+            slug: None,
+            location: WorkLocation::Worktree,
+        },
+    )
+    .await?;
     match resp {
-        Response::StartWork { reply: StartWorkReply::GitWorktree { path, .. } } => {
+        Response::StartWork {
+            reply: StartWorkReply::GitWorktree { path, .. },
+        } => {
             println!("worktree {}", path.display());
         }
-        Response::StartWork { reply: StartWorkReply::GitBranchInRepo { path, .. } } => {
+        Response::StartWork {
+            reply: StartWorkReply::GitBranchInRepo { path, .. },
+        } => {
             println!("repo {}", path.display());
         }
-        Response::StartWork { reply: StartWorkReply::SvnExport { value } } => println!("svn {value}"),
-        Response::StartWork { reply: StartWorkReply::NoScm } => println!("none"),
+        Response::StartWork {
+            reply: StartWorkReply::SvnExport { value },
+        } => println!("svn {value}"),
+        Response::StartWork {
+            reply: StartWorkReply::NoScm,
+        } => println!("none"),
         Response::Err { message } => println!("error {message}"),
         other => println!("error unexpected:{other:?}"),
     }
     Ok(())
+}
+
+async fn cmd_save_assistant_session(
+    key: String,
+    assistant: String,
+    session_id: String,
+) -> Result<()> {
+    let mut s = ensure_daemon().await?;
+    match ipc::send_request(
+        &mut s,
+        &Request::SaveAssistantSession {
+            ticket_key: key,
+            assistant,
+            session_id,
+        },
+    )
+    .await?
+    {
+        Response::Ok => Ok(()),
+        Response::Err { message } => Err(anyhow::anyhow!(message)),
+        other => Err(anyhow::anyhow!("unexpected: {other:?}")),
+    }
 }
 
 async fn run_tui() -> Result<()> {

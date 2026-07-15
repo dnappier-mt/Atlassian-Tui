@@ -157,7 +157,11 @@ impl State {
             }
             Tag::BlockQuote(_) => {
                 self.quote_depth = self.quote_depth.saturating_add(1);
-                self.push_style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC));
+                self.push_style(
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::ITALIC),
+                );
             }
             Tag::CodeBlock(kind) => {
                 self.flush_line();
@@ -173,7 +177,8 @@ impl State {
                 } else {
                     format!("─── {lang} ───")
                 };
-                self.lines.push(Line::from(Span::styled(header, header_style)));
+                self.lines
+                    .push(Line::from(Span::styled(header, header_style)));
                 self.push_style(
                     Style::default()
                         .fg(Color::Yellow)
@@ -204,8 +209,14 @@ impl State {
             }
             Tag::Emphasis => self.push_style(Style::default().add_modifier(Modifier::ITALIC)),
             Tag::Strong => self.push_style(Style::default().add_modifier(Modifier::BOLD)),
-            Tag::Strikethrough => self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT)),
-            Tag::Link { .. } => self.push_style(Style::default().fg(Color::Blue).add_modifier(Modifier::UNDERLINED)),
+            Tag::Strikethrough => {
+                self.push_style(Style::default().add_modifier(Modifier::CROSSED_OUT))
+            }
+            Tag::Link { .. } => self.push_style(
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
             Tag::Image { .. } => self.push_style(Style::default().fg(Color::Magenta)),
             Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
             Tag::FootnoteDefinition(_) => {}
@@ -265,7 +276,8 @@ mod tests {
 
     #[test]
     fn smoke() {
-        let md = "# Hi\n\nSome **bold** and `code`.\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n";
+        let md =
+            "# Hi\n\nSome **bold** and `code`.\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n";
         let lines = render_markdown(md);
         assert!(!lines.is_empty());
     }

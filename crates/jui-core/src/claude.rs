@@ -9,14 +9,13 @@ use tokio::process::Command;
 /// Ask the `claude` CLI to pick up to two matching projects for a ticket. Returns up
 /// to 2 known project paths in claude's order of relevance. Empty vec means "no
 /// match". `Err` only on actual invocation failure.
-pub async fn suggest_projects(
-    ticket: &Ticket,
-    projects: &[ProjectEntry],
-) -> Result<Vec<PathBuf>> {
+pub async fn suggest_projects(ticket: &Ticket, projects: &[ProjectEntry]) -> Result<Vec<PathBuf>> {
     if projects.is_empty() {
         return Ok(vec![]);
     }
-    if which::which("claude").is_err() && tokio::fs::metadata("/usr/local/bin/claude").await.is_err() {
+    if which::which("claude").is_err()
+        && tokio::fs::metadata("/usr/local/bin/claude").await.is_err()
+    {
         return Err(anyhow!("`claude` CLI not on PATH"));
     }
     let prompt = build_prompt(ticket, projects);
@@ -49,9 +48,16 @@ fn match_project(line: &str, projects: &[ProjectEntry]) -> Option<PathBuf> {
     }
     let lower = line.to_ascii_lowercase();
     for p in projects {
-        let basename = p.path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let basename = p
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
         if basename.eq_ignore_ascii_case(line)
-            || p.nickname.as_deref().map(|n| n.eq_ignore_ascii_case(line)).unwrap_or(false)
+            || p.nickname
+                .as_deref()
+                .map(|n| n.eq_ignore_ascii_case(line))
+                .unwrap_or(false)
             || p.path.display().to_string().to_ascii_lowercase() == lower
         {
             return Some(p.path.clone());
@@ -82,8 +88,14 @@ pub async fn propose_implementation(
 
 fn build_implementation_prompt(ticket: &Ticket, project_paths: &[std::path::PathBuf]) -> String {
     let breadcrumb = match (
-        ticket.grandparent_summary.as_deref().or(ticket.grandparent_key.as_deref()),
-        ticket.parent_summary.as_deref().or(ticket.parent_key.as_deref()),
+        ticket
+            .grandparent_summary
+            .as_deref()
+            .or(ticket.grandparent_key.as_deref()),
+        ticket
+            .parent_summary
+            .as_deref()
+            .or(ticket.parent_key.as_deref()),
     ) {
         (Some(g), Some(p)) => format!("{g} > {p}"),
         (Some(g), None) => g.to_string(),
@@ -139,10 +151,7 @@ Be concise. Output Markdown only — no preamble, no \"Sure, here's...\".",
     )
 }
 
-async fn run_claude_with_dirs(
-    prompt: &str,
-    dirs: &[std::path::PathBuf],
-) -> Result<String> {
+async fn run_claude_with_dirs(prompt: &str, dirs: &[std::path::PathBuf]) -> Result<String> {
     let mut cmd = Command::new("claude");
     cmd.arg("-p").arg("--output-format").arg("text");
     // `--add-dir <directories...>` is variadic — without `=` it would swallow our
@@ -153,8 +162,13 @@ async fn run_claude_with_dirs(
         }
     }
     cmd.arg(prompt);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let out = cmd.output().await.context("invoking claude CLI for implementation")?;
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd
+        .output()
+        .await
+        .context("invoking claude CLI for implementation")?;
     if !out.status.success() {
         return Err(anyhow!(
             "claude exited {}: {}",
@@ -241,6 +255,80 @@ code fences, no commentary. Plain text or Markdown body only.",
     Ok(result.trim().to_string())
 }
 
+pub async fn short_branch_slug(
+    ticket: &Ticket,
+    default_slug: &str,
+    assistant: &str,
+) -> Result<String> {
+    let assistant = if assistant.eq_ignore_ascii_case("opencode") {
+        "opencode"
+    } else {
+        "claude"
+    };
+    let prompt = format!(
+        "Create a short git branch/worktree name for this Jira ticket.\n\
+\n\
+Rules:\n\
+- Output exactly one branch name and nothing else.\n\
+- Use this uppercase ticket key prefix exactly, including its dash: {key_prefix}.\n\
+- Add exactly two meaningful lowercase words after the ticket key.\n\
+- Use '-' separators, e.g. {key_prefix}-first-second.\n\
+- Do not use more than three '-' characters total.\n\
+- Keep it concise and descriptive.\n\
+\n\
+Ticket key: {key}\n\
+Summary: {summary}\n\
+Default long branch: {default_slug}",
+        key_prefix = ticket.key.to_ascii_uppercase(),
+        key = ticket.key,
+        summary = ticket.summary,
+        default_slug = default_slug,
+    );
+    let raw = if assistant == "opencode" {
+        run_opencode(&prompt).await?
+    } else {
+        run_claude(&prompt).await?
+    };
+    validate_short_branch_slug(&ticket.key, &raw).ok_or_else(|| {
+        anyhow!(
+            "{assistant} returned an invalid branch name: {}",
+            raw.trim()
+        )
+    })
+}
+
+fn validate_short_branch_slug(ticket_key: &str, raw: &str) -> Option<String> {
+    let first_line = raw.lines().find(|line| !line.trim().is_empty())?.trim();
+    let candidate = first_line.trim_matches(|ch: char| ch == '`' || ch == '"' || ch == '\'');
+    let slug = slugify_short_branch(candidate);
+    if slug.is_empty() || slug.matches('-').count() > 3 || slug.split('-').count() != 4 {
+        return None;
+    }
+    if !slug.starts_with(&format!("{}-", ticket_key.to_ascii_uppercase())) {
+        return None;
+    }
+    Some(slug)
+}
+
+fn slugify_short_branch(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if out.is_empty() || !out.contains('-') {
+                out.push(ch.to_ascii_uppercase());
+            } else {
+                out.push(ch.to_ascii_lowercase());
+            }
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
 /// Run a pre-PR code review headlessly against the given worktree, attached
 /// to the supplied Claude session id so the review turn becomes part of the
 /// conversation history. `resume = true` continues an existing session;
@@ -255,7 +343,9 @@ pub async fn code_review(
     resume: bool,
     worktree: &std::path::Path,
 ) -> Result<String> {
-    if which::which("claude").is_err() && tokio::fs::metadata("/usr/local/bin/claude").await.is_err() {
+    if which::which("claude").is_err()
+        && tokio::fs::metadata("/usr/local/bin/claude").await.is_err()
+    {
         return Err(anyhow!("`claude` CLI not on PATH"));
     }
     let prompt = "You are reviewing a pre-PR branch in a git worktree (cwd). \
@@ -282,7 +372,9 @@ say so in one sentence and stop.";
         cmd.args(["--session-id", session_id]);
     }
     cmd.arg(prompt);
-    cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     // Reviews can be heavy on large diffs; 5 min cap.
     let fut = async {
         let out = cmd.output().await.context("invoking claude review")?;
@@ -320,6 +412,26 @@ async fn run_claude(prompt: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+async fn run_opencode(prompt: &str) -> Result<String> {
+    let out = Command::new("opencode")
+        .args(["run", "--print-logs=false"])
+        .arg(prompt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .context("invoking opencode CLI")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "opencode exited {}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn build_prompt(ticket: &Ticket, projects: &[ProjectEntry]) -> String {
     let mut toml = String::new();
     for p in projects {
@@ -331,8 +443,14 @@ fn build_prompt(ticket: &Ticket, projects: &[ProjectEntry]) -> String {
         toml.push('\n');
     }
     let breadcrumb = match (
-        ticket.grandparent_summary.as_deref().or(ticket.grandparent_key.as_deref()),
-        ticket.parent_summary.as_deref().or(ticket.parent_key.as_deref()),
+        ticket
+            .grandparent_summary
+            .as_deref()
+            .or(ticket.grandparent_key.as_deref()),
+        ticket
+            .parent_summary
+            .as_deref()
+            .or(ticket.parent_key.as_deref()),
     ) {
         (Some(g), Some(p)) => format!("{g} > {p}"),
         (Some(g), None) => g.to_string(),
@@ -369,4 +487,33 @@ newlines, or the word \"none\".",
         summary = ticket.summary,
         description = ticket.description.as_deref().unwrap_or("(none)"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_uppercase_ticket_prefix() {
+        assert_eq!(
+            validate_short_branch_slug("MT-12345", "mt-12345-login-auth"),
+            Some("MT-12345-login-auth".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_too_many_branch_parts() {
+        assert_eq!(
+            validate_short_branch_slug("MT-12345", "MT-12345-login-auth-fix-extra"),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_compact_ticket_prefix() {
+        assert_eq!(
+            validate_short_branch_slug("MT-12345", "MT12345-login-auth"),
+            None
+        );
+    }
 }

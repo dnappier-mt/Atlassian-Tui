@@ -61,11 +61,17 @@ impl Trigger {
                 Trigger::TicketStatusChanged { from: ef, to: et },
             ) => {
                 let from_ok = match from {
-                    Some(f) => ef.as_deref().map(|s| s.eq_ignore_ascii_case(f)).unwrap_or(false),
+                    Some(f) => ef
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case(f))
+                        .unwrap_or(false),
                     None => true,
                 };
                 let to_ok = match to {
-                    Some(t) => et.as_deref().map(|s| s.eq_ignore_ascii_case(t)).unwrap_or(false),
+                    Some(t) => et
+                        .as_deref()
+                        .map(|s| s.eq_ignore_ascii_case(t))
+                        .unwrap_or(false),
                     None => true,
                 };
                 from_ok && to_ok
@@ -94,9 +100,15 @@ pub enum Condition {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
-    JiraTransition { to: String },
-    JiraComment { body: String },
-    GithubPrComment { body: String },
+    JiraTransition {
+        to: String,
+    },
+    JiraComment {
+        body: String,
+    },
+    GithubPrComment {
+        body: String,
+    },
     /// Write the picked DevQA account-id from the PR-create form into the
     /// Jira ticket's DevQA custom field. Uses `jira.devqa_customfield` from
     /// the global config to find the field id; skips with a log when that
@@ -224,7 +236,11 @@ pub fn new_rule_id() -> String {
         .ok()
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
-    let short: String = uuid.chars().filter(|c| c.is_ascii_hexdigit()).take(8).collect();
+    let short: String = uuid
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .take(8)
+        .collect();
     format!("r{now:013}-{short}")
 }
 
@@ -259,7 +275,10 @@ mod tests {
     #[test]
     fn render_known_placeholder() {
         let ctx = ctx_with_key("ENG-42");
-        assert_eq!(render("ticket {ticket_key} ready", &ctx), "ticket ENG-42 ready");
+        assert_eq!(
+            render("ticket {ticket_key} ready", &ctx),
+            "ticket ENG-42 ready"
+        );
     }
 
     #[test]
@@ -321,7 +340,9 @@ mod tests {
 
     #[test]
     fn condition_status_equals_case_insensitive() {
-        let cond = Condition::StatusEquals { value: "In Dev".into() };
+        let cond = Condition::StatusEquals {
+            value: "In Dev".into(),
+        };
         let mut ctx = RuleContext::default();
         ctx.ticket_status = Some("in dev".into());
         assert!(cond.matches(&ctx));

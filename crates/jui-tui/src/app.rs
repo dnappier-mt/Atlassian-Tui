@@ -9,10 +9,10 @@ use jui_core::ipc::{self, ProjectStatus, Request, Response, StartWorkReply, Tick
 use jui_core::jira_api::TransitionOption;
 use jui_core::scm::RepoEntry;
 use jui_core::ticket::{build_reply_body, fmt_date, priority_rank, Comment, Ticket};
-use std::path::PathBuf;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Default issue type when creating a child of `parent`. Jira (classic) refuses to
@@ -29,7 +29,11 @@ fn default_child_type(parent: &Ticket) -> &'static str {
 
 fn trim_to_opt(s: &str) -> Option<String> {
     let s = s.trim();
-    if s.is_empty() { None } else { Some(s.to_string()) }
+    if s.is_empty() {
+        None
+    } else {
+        Some(s.to_string())
+    }
 }
 
 /// Parse `(repo, pr_number)` from a GitHub PR web URL like
@@ -38,7 +42,10 @@ fn trim_to_opt(s: &str) -> Option<String> {
 /// when the PR has no cached comments (so `pr_comments` is empty).
 fn parse_pr_url(url: &str) -> Option<(String, u64)> {
     let (left, right) = url.split_once("/pull/")?;
-    let repo = left.rsplit_once("github.com/").map(|(_, r)| r)?.trim_matches('/');
+    let repo = left
+        .rsplit_once("github.com/")
+        .map(|(_, r)| r)?
+        .trim_matches('/');
     if !repo.contains('/') {
         return None;
     }
@@ -49,7 +56,7 @@ fn parse_pr_url(url: &str) -> Option<(String, u64)> {
 
 /// Shell commands to run in a freshly-created worktree before launching Claude,
 /// extracted from a `WORKTREE_SETUP.md` in the worktree's parent dir (the
-/// `<repo>-worktrees/` root). We concatenate the contents of every ```bash /
+/// `<repo>/worktrees/` root). We concatenate the contents of every ```bash /
 /// ```sh fenced block, in order. Returns None when there's no such file or no
 /// fenced shell blocks — repos without the convention are simply unaffected.
 fn worktree_setup_script(worktree: &std::path::Path) -> Option<String> {
@@ -80,7 +87,11 @@ fn build_claude_context(t: &Ticket, projects: &[std::path::PathBuf], suggestion:
     let projects_block = if projects.is_empty() {
         "—".to_string()
     } else {
-        projects.iter().map(|p| format!("- {}", p.display())).collect::<Vec<_>>().join("\n")
+        projects
+            .iter()
+            .map(|p| format!("- {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n")
     };
     format!(
         "I'm working on a Jira ticket. Here's the context:\n\
@@ -106,8 +117,116 @@ Please help me implement this. You're now in the project's working directory.",
         summary = t.summary,
         description = t.description.as_deref().unwrap_or("(none)"),
         projects = projects_block,
-        suggestion = if suggestion.is_empty() { "(none yet)" } else { suggestion },
+        suggestion = if suggestion.is_empty() {
+            "(none yet)"
+        } else {
+            suggestion
+        },
     )
+}
+
+fn code_assistant_label(value: &str) -> &'static str {
+    if value.eq_ignore_ascii_case("opencode") {
+        "opencode"
+    } else {
+        "claude"
+    }
+}
+
+fn assistant_uses_jui_session(value: &str) -> bool {
+    matches!(code_assistant_label(value), "claude")
+}
+
+fn branch_slug_needs_shortening(slug: &str) -> bool {
+    slug.matches('-').count() > 2 || slug.split('-').filter(|s| !s.is_empty()).count() > 3
+}
+
+fn fallback_short_branch_slug(t: &Ticket) -> String {
+    let key = t.key.to_ascii_uppercase();
+    let summary_slug = jui_core::ticket::slugify(&t.summary);
+    let mut words: Vec<&str> = summary_slug
+        .split('-')
+        .filter(|w| !w.is_empty() && *w != "and" && *w != "the" && *w != "for")
+        .take(2)
+        .collect();
+    if words.is_empty() {
+        words.push("work");
+    }
+    while words.len() < 2 {
+        words.push("ticket");
+    }
+    format!("{}-{}-{}", key, words[0], words[1])
+}
+
+fn normalize_branch_slug_for_submit(ticket_key: &str, raw: &str) -> String {
+    let mut slug = jui_core::ticket::slugify(raw);
+    let upper_key = ticket_key.to_ascii_uppercase();
+    let lower_key = upper_key.to_ascii_lowercase();
+    let compact_upper_key = jui_core::ticket::normalized_ticket_key_upper(ticket_key);
+    let compact_lower_key = compact_upper_key.to_ascii_lowercase();
+    if !upper_key.is_empty() && slug.starts_with(&lower_key) {
+        slug.replace_range(0..lower_key.len(), &upper_key);
+    } else if !compact_upper_key.is_empty() && slug.starts_with(&compact_lower_key) {
+        slug.replace_range(0..compact_lower_key.len(), &upper_key);
+    }
+    slug
+}
+
+fn code_assistant_cmd(value: &str, context_path: Option<&std::path::Path>) -> String {
+    let assistant = code_assistant_label(value);
+    if assistant == "opencode" {
+        if let Some(path) = context_path {
+            let prompt = format!("\"$(cat {})\"", shell_escape(&path.display().to_string()));
+            format!("opencode --prompt {prompt}")
+        } else {
+            "opencode".to_string()
+        }
+    } else if let Some(path) = context_path {
+        format!("cat {} | claude", shell_escape(&path.display().to_string()))
+    } else {
+        "claude".to_string()
+    }
+}
+
+fn code_assistant_session_arg(assistant: &str, session_id: &str, resume: bool) -> String {
+    match code_assistant_label(assistant) {
+        "claude" if resume => format!("--resume {}", shell_escape(session_id)),
+        "claude" => format!("--session-id {}", shell_escape(session_id)),
+        "opencode" => String::new(),
+        _ => String::new(),
+    }
+}
+
+fn code_assistant_launch_cmd(
+    assistant: &str,
+    session_arg: &str,
+    context_path: Option<&std::path::Path>,
+    claude_extra_arg: &str,
+) -> String {
+    match code_assistant_label(assistant) {
+        "claude" => {
+            let args = format!("{}{}", session_arg, claude_extra_arg);
+            if let Some(path) = context_path {
+                format!(
+                    "cat {} | claude {args}",
+                    shell_escape(&path.display().to_string())
+                )
+            } else {
+                format!("claude {args}")
+            }
+        }
+        "opencode" => {
+            if let Some(path) = context_path {
+                format!(
+                    "opencode {session_arg} --prompt \"$(cat {})\"",
+                    shell_escape(&path.display().to_string())
+                )
+            } else {
+                format!("opencode {session_arg}")
+            }
+        }
+        _ => code_assistant_cmd(assistant, context_path),
+    }
 }
 
 /// Single-quote shell escape — wraps the whole arg in '...' and replaces inner ' with '\''.
@@ -158,6 +277,7 @@ pub enum Mode {
     /// Done — daemon picks the first available). Replaces an earlier delete flow
     /// that was rejected by Jira with HTTP 403 on most accounts.
     ArchiveConfirm(ArchiveConfirmForm),
+    TicketOptions(TicketOptionsForm),
     /// Open a GitHub PR for the current ticket: title + body + Reviewer + DevQA
     /// pickers + a final `gh pr create` step that comments back on the Jira
     /// ticket and transitions it to Code Review.
@@ -216,14 +336,54 @@ pub enum HomeTarget {
 }
 
 pub const HOME_TARGETS: &[(HomeTarget, &str, &str, &str)] = &[
-    (HomeTarget::List,       "1", "L", "Tickets list — assigned + mentions"),
-    (HomeTarget::Tree,       "2", "T", "Tree view — parent → child hierarchy"),
-    (HomeTarget::Kanban,     "3", "K", "Kanban board — columns by status"),
-    (HomeTarget::Archive,    "4", "A", "Archive — closed / cancelled tickets"),
-    (HomeTarget::Confluence, "5", "C", "Confluence — spaces + pages"),
-    (HomeTarget::Settings,   "6", ",", "Settings — workflow + defaults"),
-    (HomeTarget::Rules,      "7", ":", "Rules engine — automations + log"),
-    (HomeTarget::Projects,   "8", "P", "Projects — manage linked repos"),
+    (
+        HomeTarget::List,
+        "1",
+        "L",
+        "Tickets list — assigned + mentions",
+    ),
+    (
+        HomeTarget::Tree,
+        "2",
+        "T",
+        "Tree view — parent → child hierarchy",
+    ),
+    (
+        HomeTarget::Kanban,
+        "3",
+        "K",
+        "Kanban board — columns by status",
+    ),
+    (
+        HomeTarget::Archive,
+        "4",
+        "A",
+        "Archive — closed / cancelled tickets",
+    ),
+    (
+        HomeTarget::Confluence,
+        "5",
+        "C",
+        "Confluence — spaces + pages",
+    ),
+    (
+        HomeTarget::Settings,
+        "6",
+        ",",
+        "Settings — workflow + defaults",
+    ),
+    (
+        HomeTarget::Rules,
+        "7",
+        ":",
+        "Rules engine — automations + log",
+    ),
+    (
+        HomeTarget::Projects,
+        "8",
+        "P",
+        "Projects — manage linked repos",
+    ),
 ];
 
 pub struct RuleLogForm {
@@ -283,7 +443,10 @@ pub const RULE_VARS: &[(&str, &str)] = &[
     ("ticket_key", "Jira ticket key (e.g. ENG-1234)"),
     ("ticket_summary", "Ticket title"),
     ("ticket_status", "Current ticket status"),
-    ("project_key", "Project prefix from the ticket key (e.g. ENG)"),
+    (
+        "project_key",
+        "Project prefix from the ticket key (e.g. ENG)",
+    ),
     ("issue_type", "Issue type (Story, Bug, …)"),
     ("from_status", "Status before a TicketStatusChanged trigger"),
     ("to_status", "Status after a TicketStatusChanged trigger"),
@@ -292,7 +455,10 @@ pub const RULE_VARS: &[(&str, &str)] = &[
     ("pr_repo", "<owner>/<repo> slug for the linked PR"),
     ("reviewer_handle", "GitHub handle of the picked reviewer"),
     ("devqa_handle", "GitHub handle of the picked DevQA"),
-    ("reviewer_account_id", "Jira account-id of the picked reviewer"),
+    (
+        "reviewer_account_id",
+        "Jira account-id of the picked reviewer",
+    ),
     ("devqa_account_id", "Jira account-id of the picked DevQA"),
     ("actor", "Display name of the user who triggered the event"),
 ];
@@ -357,6 +523,8 @@ pub struct SettingsForm {
     pub default_create_status: String,
     pub all_mine_exclude_status: String,
     pub pr_submit_status: String,
+    /// Interactive coding assistant launched from tmux-backed flows.
+    pub code_assistant: String,
     /// Default `--permission-mode` for Claude Code on start-work. Row 3 picks
     /// from the fixed [`jui_core::config::CLAUDE_PERMISSION_MODES`] list rather
     /// than the live Jira statuses used by rows 0–2.
@@ -394,7 +562,7 @@ impl StatusPicker {
 }
 
 impl SettingsForm {
-    pub const ROW_COUNT: usize = 4;
+    pub const ROW_COUNT: usize = 5;
 }
 
 pub struct ActiveStatusForm {
@@ -449,6 +617,8 @@ pub struct PrCreateForm {
     /// When set, the user is picking which git remote to push to. Preempts
     /// the normal form keys until they confirm or Esc.
     pub remote_pick: Option<RemotePickerForm>,
+    /// Human-readable push/PR route shown in the form.
+    pub route_hint: String,
 }
 
 #[derive(Debug, Clone)]
@@ -505,9 +675,29 @@ pub struct ArchiveConfirmForm {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TicketOptionAction {
+    Time,
+    Priority,
+    Reviewer,
+    DevQa,
+    ResetPullRequest,
+    ClearClaudeSession,
+    ClearOpencodeSession,
+}
+
+pub struct TicketOptionsForm {
+    pub key: String,
+    pub selected: usize,
+    pub claude_session: Option<String>,
+    pub opencode_session: Option<String>,
+    pub actions: Vec<TicketOptionAction>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AssignPurpose {
     Assignee,
     Reviewer,
+    DevQa,
 }
 
 pub struct AssignPickerForm {
@@ -560,7 +750,11 @@ pub enum PageLine {
     Spans(Vec<ratatui::text::Span<'static>>),
     Blank,
     /// One row inside an image. `id` indexes into PageViewForm.images, `row` is 0..height.
-    Image { id: usize, row: u16, height: u16 },
+    Image {
+        id: usize,
+        row: u16,
+        height: u16,
+    },
 }
 
 pub struct PageImage {
@@ -663,11 +857,13 @@ pub struct ImplementationForm {
 
 pub struct StartWorkPromptForm {
     pub ticket_key: String,
+    pub branch_slug: String,
+    pub branch_cursor: usize,
     pub time_estimate: String,
     pub priority: String,
     pub need_time: bool,
     pub need_priority: bool,
-    /// 0 → location, 1 → time, 2 → priority. Skipped fields drop out of cycling.
+    /// 0 → location, 1 → branch, 2 → time, 3 → priority. Skipped fields drop out of cycling.
     pub field: u8,
     pub error: Option<String>,
     /// Valid priorities for this Jira instance (live-fetched). Used both as a hint
@@ -862,7 +1058,7 @@ pub enum PendingDelete {
 #[derive(Clone)]
 pub struct DetailLinkedProject {
     pub project: ProjectStatus,
-    /// "confirmed" | "suggested"
+    /// "confirmed" | "suggested" | "worktree" | "no_match"
     pub state: String,
 }
 
@@ -956,19 +1152,65 @@ pub struct EditForm {
     pub description_cursor: usize,
 }
 
+fn ticket_edit_file(summary: &str, description: &str) -> String {
+    format!("{summary}\n\n{description}")
+}
+
+fn parse_ticket_edit_file(raw: &str) -> (String, String) {
+    let raw = raw.strip_prefix('\u{feff}').unwrap_or(raw);
+    let mut lines = raw.lines();
+    let summary = lines.next().unwrap_or_default().trim().to_string();
+    let mut description = lines.collect::<Vec<_>>().join("\n");
+    if description.starts_with('\n') {
+        description.remove(0);
+    }
+    (summary, description)
+}
+
+fn editor_command(editor: &str, path: &std::path::Path) -> String {
+    let arg = shell_escape(&path.display().to_string());
+    let first = editor
+        .split_whitespace()
+        .next()
+        .and_then(|s| std::path::Path::new(s).file_name())
+        .and_then(|s| s.to_str())
+        .unwrap_or(editor);
+    let has_wait = editor.contains("--wait") || editor.split_whitespace().any(|s| s == "-w");
+    let wait = if has_wait {
+        ""
+    } else if matches!(first, "code" | "code-insiders" | "codium" | "zed" | "atom") {
+        " --wait"
+    } else if matches!(first, "subl" | "sublime_text" | "mate") {
+        " -w"
+    } else if matches!(first, "gvim" | "mvim") {
+        " -f"
+    } else {
+        ""
+    };
+    format!("{editor}{wait} {arg}")
+}
+
 /// Caret helpers. Treat the buffer as a flat `&str`; offsets are byte indices
 /// that always land on UTF-8 char boundaries.
 pub fn edit_left(s: &str, cur: usize) -> usize {
-    if cur == 0 { return 0; }
+    if cur == 0 {
+        return 0;
+    }
     let mut new = cur - 1;
-    while new > 0 && !s.is_char_boundary(new) { new -= 1; }
+    while new > 0 && !s.is_char_boundary(new) {
+        new -= 1;
+    }
     new
 }
 
 pub fn edit_right(s: &str, cur: usize) -> usize {
-    if cur >= s.len() { return s.len(); }
+    if cur >= s.len() {
+        return s.len();
+    }
     let mut new = cur + 1;
-    while new < s.len() && !s.is_char_boundary(new) { new += 1; }
+    while new < s.len() && !s.is_char_boundary(new) {
+        new += 1;
+    }
     new
 }
 
@@ -983,7 +1225,9 @@ pub fn edit_line_end(s: &str, cur: usize) -> usize {
 fn step_forward_chars(s: &str, mut pos: usize, end: usize, mut chars: usize) -> usize {
     while chars > 0 && pos < end {
         pos += 1;
-        while pos < s.len() && !s.is_char_boundary(pos) { pos += 1; }
+        while pos < s.len() && !s.is_char_boundary(pos) {
+            pos += 1;
+        }
         chars -= 1;
     }
     pos
@@ -991,7 +1235,9 @@ fn step_forward_chars(s: &str, mut pos: usize, end: usize, mut chars: usize) -> 
 
 pub fn edit_up(s: &str, cur: usize) -> usize {
     let cur_ls = edit_line_start(s, cur);
-    if cur_ls == 0 { return 0; }
+    if cur_ls == 0 {
+        return 0;
+    }
     let col = s[cur_ls..cur].chars().count();
     let prev_nl = cur_ls - 1;
     let prev_ls = edit_line_start(s, prev_nl);
@@ -1000,7 +1246,9 @@ pub fn edit_up(s: &str, cur: usize) -> usize {
 
 pub fn edit_down(s: &str, cur: usize) -> usize {
     let cur_le = edit_line_end(s, cur);
-    if cur_le == s.len() { return s.len(); }
+    if cur_le == s.len() {
+        return s.len();
+    }
     let cur_ls = edit_line_start(s, cur);
     let col = s[cur_ls..cur].chars().count();
     let next_ls = cur_le + 1;
@@ -1053,6 +1301,8 @@ pub struct App {
     pub tickets: Vec<Ticket>,
     pub active_idxs: Vec<usize>,
     pub inactive_idxs: Vec<usize>,
+    pub ticket_search_active: bool,
+    pub ticket_search_query: String,
     pub list_selected: usize,
     pub archive_selected: usize,
     pub mode: Mode,
@@ -1117,6 +1367,9 @@ pub struct App {
     /// Mirrors `GlobalConfig.workflow.claude_permission_mode`; editable from
     /// `Mode::Settings` and overridable per-launch in the start-work pane.
     pub claude_permission_mode: String,
+    /// Interactive coding assistant launched from start-work / implementation /
+    /// DevQA flows. Mirrors `GlobalConfig.workflow.code_assistant`.
+    pub code_assistant: String,
     /// Preferred left-to-right Kanban column order by status name. Mirrors
     /// `GlobalConfig.workflow.kanban_column_order`; reordered live with Shift+←/→
     /// on the Kanban board and persisted on each change.
@@ -1222,11 +1475,205 @@ pub enum NavFrame {
 const KANBAN_EXTRA_OFFSET: usize = 1 << 24;
 
 impl App {
+    async fn get_or_create_assistant_session(
+        &self,
+        ticket_key: &str,
+        assistant: &str,
+    ) -> Result<(String, bool)> {
+        let assistant = code_assistant_label(assistant);
+        let mut s = ipc::connect().await?;
+        let existing = match ipc::send_request(
+            &mut s,
+            &Request::GetAssistantSession {
+                ticket_key: ticket_key.to_string(),
+                assistant: assistant.to_string(),
+            },
+        )
+        .await?
+        {
+            Response::AssistantSession { session_id } => session_id,
+            _ => None,
+        };
+        if let Some(id) = existing {
+            return Ok((id, true));
+        }
+        if assistant == "opencode" {
+            return Ok((String::new(), false));
+        }
+        let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
+        let mut s = ipc::connect().await?;
+        let _ = ipc::send_request(
+            &mut s,
+            &Request::SaveAssistantSession {
+                ticket_key: ticket_key.to_string(),
+                assistant: assistant.to_string(),
+                session_id: new_id.clone(),
+            },
+        )
+        .await?;
+        Ok((new_id, false))
+    }
+
+    async fn get_assistant_session_value(
+        &self,
+        ticket_key: &str,
+        assistant: &str,
+    ) -> Result<Option<String>> {
+        let mut s = ipc::connect().await?;
+        match ipc::send_request(
+            &mut s,
+            &Request::GetAssistantSession {
+                ticket_key: ticket_key.to_string(),
+                assistant: assistant.to_string(),
+            },
+        )
+        .await?
+        {
+            Response::AssistantSession { session_id } => Ok(session_id),
+            Response::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!("unexpected response: {other:?}")),
+        }
+    }
+
+    pub async fn open_ticket_options(&mut self) -> Result<()> {
+        let Some(t) = &self.detail else { return Ok(()) };
+        let key = t.key.clone();
+        let claude_session = self
+            .get_assistant_session_value(&key, "claude")
+            .await
+            .ok()
+            .flatten();
+        let opencode_session = self
+            .get_assistant_session_value(&key, "opencode")
+            .await
+            .ok()
+            .flatten();
+        let mut actions = vec![
+            TicketOptionAction::Time,
+            TicketOptionAction::Priority,
+            TicketOptionAction::Reviewer,
+            TicketOptionAction::DevQa,
+        ];
+        if ticket_has_pr(self) {
+            actions.push(TicketOptionAction::ResetPullRequest);
+        }
+        if claude_session.is_some() {
+            actions.push(TicketOptionAction::ClearClaudeSession);
+        }
+        if opencode_session.is_some() {
+            actions.push(TicketOptionAction::ClearOpencodeSession);
+        }
+        self.mode = Mode::TicketOptions(TicketOptionsForm {
+            key,
+            selected: 0,
+            claude_session,
+            opencode_session,
+            actions,
+        });
+        Ok(())
+    }
+
+    pub async fn submit_ticket_option(&mut self) -> Result<()> {
+        let Mode::TicketOptions(form) = &self.mode else {
+            return Ok(());
+        };
+        let Some(action) = form.actions.get(form.selected).copied() else {
+            return Ok(());
+        };
+        let key = form.key.clone();
+        match action {
+            TicketOptionAction::Time => {
+                self.mode = Mode::EditTime(EditTimeForm {
+                    key,
+                    original_estimate: String::new(),
+                    log_work: String::new(),
+                    field: 0,
+                });
+            }
+            TicketOptionAction::Priority => {
+                self.mode = Mode::Detail;
+                self.open_priority_picker().await?;
+            }
+            TicketOptionAction::Reviewer => {
+                self.mode = Mode::AssignPicker(AssignPickerForm {
+                    key,
+                    purpose: AssignPurpose::Reviewer,
+                    query: String::new(),
+                    results: vec![],
+                    selected: 0,
+                    error: None,
+                });
+            }
+            TicketOptionAction::DevQa => {
+                self.mode = Mode::AssignPicker(AssignPickerForm {
+                    key,
+                    purpose: AssignPurpose::DevQa,
+                    query: String::new(),
+                    results: vec![],
+                    selected: 0,
+                    error: None,
+                });
+            }
+            TicketOptionAction::ResetPullRequest => {
+                let mut s = ipc::connect().await?;
+                match ipc::send_request(
+                    &mut s,
+                    &Request::ResetPullRequest {
+                        ticket_key: key.clone(),
+                    },
+                )
+                .await?
+                {
+                    Response::Ok => {
+                        self.status = format!("reset PR for {key}");
+                        self.mode = Mode::Detail;
+                        self.pr_comments.clear();
+                        self.detail_pr_link = None;
+                        self.pr_user_states.remove(&key);
+                        self.load_detail().await?;
+                        self.refresh_list_preserving_status().await?;
+                    }
+                    Response::Err { message } => self.status = format!("err: {message}"),
+                    _ => self.status = "unexpected response".into(),
+                }
+            }
+            TicketOptionAction::ClearClaudeSession | TicketOptionAction::ClearOpencodeSession => {
+                let assistant = if action == TicketOptionAction::ClearClaudeSession {
+                    "claude"
+                } else {
+                    "opencode"
+                };
+                let mut s = ipc::connect().await?;
+                match ipc::send_request(
+                    &mut s,
+                    &Request::ClearAssistantSession {
+                        ticket_key: key.clone(),
+                        assistant: assistant.to_string(),
+                    },
+                )
+                .await?
+                {
+                    Response::Ok => {
+                        self.status = format!("cleared {assistant} session for {key}");
+                        self.open_ticket_options().await?;
+                    }
+                    Response::Err { message } => self.status = format!("err: {message}"),
+                    _ => self.status = "unexpected response".into(),
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn new() -> Self {
         Self {
             tickets: vec![],
             active_idxs: vec![],
             inactive_idxs: vec![],
+            ticket_search_active: false,
+            ticket_search_query: String::new(),
             list_selected: 0,
             archive_selected: 0,
             mode: Mode::Home(HomeForm {
@@ -1273,6 +1720,10 @@ impl App {
                 .unwrap_or_default()
                 .workflow
                 .pr_submit_status,
+            code_assistant: jui_core::config::GlobalConfig::load()
+                .unwrap_or_default()
+                .workflow
+                .code_assistant,
             claude_permission_mode: jui_core::config::GlobalConfig::load()
                 .unwrap_or_default()
                 .workflow
@@ -1317,6 +1768,52 @@ impl App {
         } else {
             self.tickets.get(idx)
         }
+    }
+
+    pub fn ticket_matches_search(&self, t: &Ticket) -> bool {
+        let q = self.ticket_search_query.trim().to_ascii_lowercase();
+        q.is_empty()
+            || t.key.to_ascii_lowercase().contains(&q)
+            || t.summary.to_ascii_lowercase().contains(&q)
+    }
+
+    pub fn active_search_rows(&self) -> Vec<(usize, usize)> {
+        self.active_idxs
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, idx)| {
+                self.tickets
+                    .get(*idx)
+                    .map(|t| self.ticket_matches_search(t))
+                    .unwrap_or(false)
+            })
+            .collect()
+    }
+
+    pub fn clamp_list_search_selection(&mut self) {
+        let n = self.active_search_rows().len();
+        self.list_selected = self.list_selected.min(n.saturating_sub(1));
+    }
+
+    pub fn tree_search_visible(&self, form: &TreeForm) -> Vec<usize> {
+        let q = self.ticket_search_query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return form.visible.clone();
+        }
+        form.visible
+            .iter()
+            .copied()
+            .filter(|idx| {
+                form.nodes
+                    .get(*idx)
+                    .map(|n| {
+                        n.key.to_ascii_lowercase().contains(&q)
+                            || n.summary.to_ascii_lowercase().contains(&q)
+                    })
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 
     pub async fn load_myself(&mut self) -> Result<()> {
@@ -1376,15 +1873,21 @@ impl App {
     /// the UI reflects it immediately.
     pub async fn set_pr_state(&mut self, ticket_key: &str, new_state: PrUserState) -> Result<()> {
         let mut s = ipc::connect().await?;
-        let _ = ipc::send_request(
+        match ipc::send_request(
             &mut s,
             &Request::SetPrUserState {
                 ticket_key: ticket_key.to_string(),
                 state: new_state.to_db().to_string(),
             },
         )
-        .await?;
-        self.pr_user_states.insert(ticket_key.to_string(), new_state);
+        .await?
+        {
+            Response::Ok => {}
+            Response::Err { message } => return Err(anyhow::anyhow!(message)),
+            other => return Err(anyhow::anyhow!("unexpected response: {other:?}")),
+        }
+        self.pr_user_states
+            .insert(ticket_key.to_string(), new_state);
         Ok(())
     }
 
@@ -1407,7 +1910,12 @@ impl App {
     pub async fn refresh_mentioned(&mut self) -> Result<()> {
         let mut s = ipc::connect().await?;
         match ipc::send_request(&mut s, &Request::ListMyMentions).await? {
-            Response::MyMentions { reviewing, mentioned, github, authored } => {
+            Response::MyMentions {
+                reviewing,
+                mentioned,
+                github,
+                authored,
+            } => {
                 self.reviewing_tickets = reviewing;
                 self.github_tickets = github;
                 self.mentioned_tickets = mentioned;
@@ -1429,9 +1937,7 @@ impl App {
     /// renders them (reviewer rows first). `(role, ticket)` tuples.
     pub fn combined_mentions(&self) -> Vec<(MentionRole, &Ticket)> {
         let mut out: Vec<(MentionRole, &Ticket)> = Vec::with_capacity(
-            self.reviewing_tickets.len()
-                + self.github_tickets.len()
-                + self.mentioned_tickets.len(),
+            self.reviewing_tickets.len() + self.github_tickets.len() + self.mentioned_tickets.len(),
         );
         let drop_completed = !self.show_completed_prs;
         let keep = |key: &str| -> bool {
@@ -1440,16 +1946,26 @@ impl App {
             }
             true
         };
-        for t in &self.reviewing_tickets { if keep(&t.key) { out.push((MentionRole::Reviewer, t)); } }
-        for t in &self.github_tickets { if keep(&t.key) { out.push((MentionRole::Github, t)); } }
-        for t in &self.mentioned_tickets { if keep(&t.key) { out.push((MentionRole::Mentioned, t)); } }
+        for t in &self.reviewing_tickets {
+            if keep(&t.key) {
+                out.push((MentionRole::Reviewer, t));
+            }
+        }
+        for t in &self.github_tickets {
+            if keep(&t.key) {
+                out.push((MentionRole::Github, t));
+            }
+        }
+        for t in &self.mentioned_tickets {
+            if keep(&t.key) {
+                out.push((MentionRole::Mentioned, t));
+            }
+        }
         // Stable sort: rows whose user-managed PR state is Completed sink to
         // the bottom (only meaningful when show_completed_prs is on, since
         // they're filtered out entirely otherwise). Other rows keep their
         // role-grouped order.
-        out.sort_by_key(|(_, t)| {
-            (self.pr_state(&t.key) == PrUserState::Completed) as u8
-        });
+        out.sort_by_key(|(_, t)| (self.pr_state(&t.key) == PrUserState::Completed) as u8);
         out
     }
 
@@ -1461,11 +1977,23 @@ impl App {
     }
 
     pub async fn delete_selected_comment(&mut self) -> Result<()> {
-        let Some(c) = self.comments.get(self.comment_selected) else { return Ok(()) };
+        let Some(c) = self.comments.get(self.comment_selected) else {
+            return Ok(());
+        };
         let (Some(id), Some(t)) = (c.id.clone(), self.detail.as_ref().map(|t| t.key.clone()))
-            else { return Ok(()) };
+        else {
+            return Ok(());
+        };
         let mut s = ipc::connect().await?;
-        match ipc::send_request(&mut s, &Request::DeleteComment { key: t, comment_id: id }).await? {
+        match ipc::send_request(
+            &mut s,
+            &Request::DeleteComment {
+                key: t,
+                comment_id: id,
+            },
+        )
+        .await?
+        {
             Response::Ok => {
                 self.status = "comment deleted".into();
                 self.load_detail().await?;
@@ -1498,13 +2026,20 @@ impl App {
             match sort {
                 SortMode::Updated => tb.updated.cmp(&ta.updated),
                 SortMode::Created => tb.created.cmp(&ta.created),
-                SortMode::Status => ta.status.cmp(&tb.status).then_with(|| tb.updated.cmp(&ta.updated)),
+                SortMode::Status => ta
+                    .status
+                    .cmp(&tb.status)
+                    .then_with(|| tb.updated.cmp(&ta.updated)),
                 SortMode::Breadcrumb => {
                     let key_of = |t: &Ticket| -> (String, String, String) {
-                        let g = t.grandparent_summary.clone()
+                        let g = t
+                            .grandparent_summary
+                            .clone()
                             .or_else(|| t.grandparent_key.clone())
                             .unwrap_or_default();
-                        let p = t.parent_summary.clone()
+                        let p = t
+                            .parent_summary
+                            .clone()
                             .or_else(|| t.parent_key.clone())
                             .unwrap_or_default();
                         let g = if g.is_empty() { "~~~".into() } else { g };
@@ -1617,7 +2152,14 @@ impl App {
         }
         let mut rows: Vec<(usize, usize)> = Vec::new();
         for &top in &top_level {
-            walk(top, 0, &mut rows, &children_of, &self.expanded_parents, &self.tickets);
+            walk(
+                top,
+                0,
+                &mut rows,
+                &children_of,
+                &self.expanded_parents,
+                &self.tickets,
+            );
         }
 
         // Sliding window: when max depth ≥ 3 (i.e. great-grandchild is visible), hide
@@ -1636,14 +2178,25 @@ impl App {
         self.active_idxs = visible_idxs;
         self.active_row_depths = depths;
         self.inactive_idxs = inactive;
-        self.list_selected = self.list_selected.min(self.active_idxs.len().saturating_sub(1));
-        self.archive_selected = self.archive_selected.min(self.inactive_idxs.len().saturating_sub(1));
+        self.list_selected = self
+            .list_selected
+            .min(self.active_idxs.len().saturating_sub(1));
+        self.archive_selected = self
+            .archive_selected
+            .min(self.inactive_idxs.len().saturating_sub(1));
     }
 
     /// Returns the ticket currently selected in whichever list view is active.
     pub fn current_ticket(&self) -> Option<&Ticket> {
         let (idxs, sel) = match self.mode {
             Mode::List => match self.list_focus {
+                ListFocus::Active
+                    if self.ticket_search_active || !self.ticket_search_query.is_empty() =>
+                {
+                    let rows = self.active_search_rows();
+                    let idx = rows.get(self.list_selected).map(|(_, idx)| *idx)?;
+                    return self.tickets.get(idx);
+                }
                 ListFocus::Active => (&self.active_idxs, self.list_selected),
                 ListFocus::Mentioned => {
                     // Reviewer → GitHub → Mentioned. Index across all three.
@@ -1663,7 +2216,11 @@ impl App {
             Mode::Kanban | Mode::KanbanFilter(_) => {
                 let cols = self.kanban_columns();
                 let col = cols.get(self.kanban_col)?;
-                let card = self.kanban_card_per_col.get(self.kanban_col).copied().unwrap_or(0);
+                let card = self
+                    .kanban_card_per_col
+                    .get(self.kanban_col)
+                    .copied()
+                    .unwrap_or(0);
                 let idx = *col.1.get(card)?;
                 return self.kanban_ticket(idx);
             }
@@ -1686,15 +2243,23 @@ impl App {
         let mut errors: Vec<String> = Vec::new();
         for name in &names {
             let escaped = name.replace('"', "\\\"");
-            let jql = format!(
-                "assignee = \"{}\" AND statusCategory != Done",
-                escaped
-            );
+            let jql = format!("assignee = \"{}\" AND statusCategory != Done", escaped);
             let mut s = match ipc::connect().await {
                 Ok(s) => s,
-                Err(e) => { errors.push(format!("{name}: {e}")); continue; }
+                Err(e) => {
+                    errors.push(format!("{name}: {e}"));
+                    continue;
+                }
             };
-            match ipc::send_request(&mut s, &ipc::Request::ListTickets { jql: Some(jql), limit: 100 }).await {
+            match ipc::send_request(
+                &mut s,
+                &ipc::Request::ListTickets {
+                    jql: Some(jql),
+                    limit: 100,
+                },
+            )
+            .await
+            {
                 Ok(ipc::Response::Tickets { items }) => {
                     for t in items {
                         if seen.insert(t.key.clone()) {
@@ -1702,17 +2267,29 @@ impl App {
                         }
                     }
                 }
-                Ok(ipc::Response::Err { message }) => { errors.push(format!("{name}: {message}")); }
-                Err(e) => { errors.push(format!("{name}: {e}")); }
+                Ok(ipc::Response::Err { message }) => {
+                    errors.push(format!("{name}: {message}"));
+                }
+                Err(e) => {
+                    errors.push(format!("{name}: {e}"));
+                }
                 _ => {}
             }
         }
         // Always write results even when some users failed.
         self.kanban_extra = combined;
         if errors.is_empty() {
-            self.status = format!("kanban: {} tickets · {} user(s)", self.kanban_extra.len(), names.len());
+            self.status = format!(
+                "kanban: {} tickets · {} user(s)",
+                self.kanban_extra.len(),
+                names.len()
+            );
         } else {
-            self.status = format!("kanban: {} tickets · errors: {}", self.kanban_extra.len(), errors.join("; "));
+            self.status = format!(
+                "kanban: {} tickets · errors: {}",
+                self.kanban_extra.len(),
+                errors.join("; ")
+            );
         }
         Ok(())
     }
@@ -1746,7 +2323,10 @@ impl App {
         // Indices >= KANBAN_EXTRA_OFFSET come from kanban_extra; see kanban_ticket().
         for i in 0..self.kanban_extra.len() {
             let status = self.kanban_extra[i].status.clone();
-            buckets.entry(status).or_default().push(KANBAN_EXTRA_OFFSET + i);
+            buckets
+                .entry(status)
+                .or_default()
+                .push(KANBAN_EXTRA_OFFSET + i);
         }
         let mut cols: Vec<(String, Vec<usize>)> = buckets.into_iter().collect();
         // Statuses listed in the saved column order come first, in that order;
@@ -1819,7 +2399,8 @@ impl App {
             self.kanban_expanded_col = None;
             match self.save_kanban_column_order() {
                 Ok(()) => {
-                    self.status = format!("moved \"{sel_status}\" {}", if right { "→" } else { "←" })
+                    self.status =
+                        format!("moved \"{sel_status}\" {}", if right { "→" } else { "←" })
                 }
                 Err(e) => self.status = format!("kanban order save err: {e:#}"),
             }
@@ -1901,6 +2482,13 @@ impl App {
         Ok(())
     }
 
+    async fn refresh_list_preserving_status(&mut self) -> Result<()> {
+        let status = self.status.clone();
+        self.refresh().await?;
+        self.status = status;
+        Ok(())
+    }
+
     /// Replace the currently-displayed detail with a different ticket key (used when
     /// drilling into a subtask). Reloads ticket fields, comments, and linked projects.
     pub async fn open_ticket_by_key(&mut self, key: String) -> Result<()> {
@@ -1939,7 +2527,9 @@ impl App {
         match ipc::send_request(&mut s, &Request::ListComments { key: key.clone() }).await? {
             Response::Comments { items } => {
                 self.comments = items;
-                self.comment_selected = self.comment_selected.min(self.comments.len().saturating_sub(1));
+                self.comment_selected = self
+                    .comment_selected
+                    .min(self.comments.len().saturating_sub(1));
             }
             Response::Err { message } => self.status = format!("comments err: {message}"),
             _ => {}
@@ -1948,15 +2538,28 @@ impl App {
         let mut s = ipc::connect().await?;
         if let Response::TicketProjects { items } = ipc::send_request(
             &mut s,
-            &Request::ListTicketProjects { ticket_key: key.clone() },
+            &Request::ListTicketProjects {
+                ticket_key: key.clone(),
+            },
         )
         .await?
         {
             self.detail_linked_projects = items
                 .into_iter()
                 .filter(|i| i.linked)
-                .map(|i| DetailLinkedProject { project: i.project, state: i.state })
+                .map(|i| DetailLinkedProject {
+                    project: i.project,
+                    state: i.state,
+                })
                 .collect();
+            if self
+                .detail_linked_projects
+                .iter()
+                .any(|p| p.state == "worktree")
+            {
+                self.detail_linked_projects
+                    .retain(|p| p.state == "worktree" || p.state == "confirmed");
+            }
             self.linked_project_selected = self
                 .linked_project_selected
                 .min(self.detail_linked_projects.len().saturating_sub(1));
@@ -1970,8 +2573,7 @@ impl App {
             self.pr_comments = items;
             // Index into the visible-list (resolved filter may hide some).
             let v = self.visible_pr_comments();
-            self.pr_comment_selected =
-                self.pr_comment_selected.min(v.len().saturating_sub(1));
+            self.pr_comment_selected = self.pr_comment_selected.min(v.len().saturating_sub(1));
             self.detail_pr_link = pr_link;
         } else {
             self.pr_comments.clear();
@@ -2015,8 +2617,27 @@ impl App {
         } else {
             Vec::new()
         };
+        let default_branch_slug = t.branch_slug();
+        let branch_slug = if branch_slug_needs_shortening(&default_branch_slug) {
+            self.status = "shortening branch name…".into();
+            match jui_core::claude::short_branch_slug(
+                &t,
+                &default_branch_slug,
+                &self.code_assistant,
+            )
+            .await
+            {
+                Ok(slug) => slug,
+                Err(_) => fallback_short_branch_slug(&t),
+            }
+        } else {
+            default_branch_slug
+        };
+        let branch_cursor = branch_slug.len();
         self.mode = Mode::StartWorkPrompt(StartWorkPromptForm {
             ticket_key: t.key.clone(),
+            branch_slug,
+            branch_cursor,
             time_estimate: String::new(),
             priority: String::new(),
             need_time,
@@ -2039,7 +2660,11 @@ impl App {
         // the StopWork request to the daemon, where the transition + comment
         // + rules-engine fire happen atomically. Esc on the form skips the
         // comment but still stops the work (handled in the key handler).
-        let Some(t) = self.detail.clone().or_else(|| self.current_ticket().cloned()) else {
+        let Some(t) = self
+            .detail
+            .clone()
+            .or_else(|| self.current_ticket().cloned())
+        else {
             return Ok(());
         };
         self.mode = Mode::Comment(CommentForm {
@@ -2048,7 +2673,10 @@ impl App {
             reply_to: None,
             from_stop_work: true,
         });
-        self.status = format!("stop {}: add optional note then Ctrl-S / Enter, or Esc to skip", t.key);
+        self.status = format!(
+            "stop {}: add optional note then Ctrl-S / Enter, or Esc to skip",
+            t.key
+        );
         Ok(())
     }
 
@@ -2058,11 +2686,17 @@ impl App {
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::StopWork { key: key.clone(), comment: None },
+            &Request::StopWork {
+                key: key.clone(),
+                comment: None,
+            },
         )
         .await?;
         match resp {
-            Response::Ok => self.status = format!("stopped work on {key}"),
+            Response::Ok => {
+                self.status = format!("stopped work on {key}");
+                self.refresh_list_preserving_status().await?;
+            }
             Response::Err { message } => self.status = format!("stop-work err: {message}"),
             _ => self.status = "unexpected response".into(),
         }
@@ -2072,12 +2706,29 @@ impl App {
     }
 
     pub async fn submit_start_work_prompt(&mut self) -> Result<()> {
-        let Mode::StartWorkPrompt(form) = &self.mode else { return Ok(()) };
+        let Mode::StartWorkPrompt(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.ticket_key.clone();
-        let estimate = if form.need_time { trim_to_opt(&form.time_estimate) } else { None };
-        let priority = if form.need_priority { trim_to_opt(&form.priority) } else { None };
+        let estimate = if form.need_time {
+            trim_to_opt(&form.time_estimate)
+        } else {
+            None
+        };
+        let priority = if form.need_priority {
+            trim_to_opt(&form.priority)
+        } else {
+            None
+        };
         let location = form.location;
         let open_shell_pane = form.open_shell_pane;
+        let branch_slug = normalize_branch_slug_for_submit(&key, &form.branch_slug);
+        if branch_slug.is_empty() {
+            if let Mode::StartWorkPrompt(f) = &mut self.mode {
+                f.error = Some("branch name cannot be empty".into());
+            }
+            return Ok(());
+        }
         // Effective permission mode: plan-toggle wins, else the configured default.
         let permission_mode = if form.plan_mode {
             "plan".to_string()
@@ -2108,7 +2759,10 @@ impl App {
             let mut s = ipc::connect().await?;
             let resp = ipc::send_request(
                 &mut s,
-                &Request::EditPriority { key: key.clone(), priority: p.clone() },
+                &Request::EditPriority {
+                    key: key.clone(),
+                    priority: p.clone(),
+                },
             )
             .await?;
             if let Response::Err { message } = resp {
@@ -2139,7 +2793,8 @@ impl App {
         // Reload ticket so subsequent steps see the new values.
         self.load_detail().await?;
         self.mode = Mode::Detail;
-        self.execute_start_work(location, permission_mode, open_shell_pane).await
+        self.execute_start_work(location, permission_mode, open_shell_pane, branch_slug)
+            .await
     }
 
     async fn execute_start_work(
@@ -2147,19 +2802,28 @@ impl App {
         location: jui_core::scm::WorkLocation,
         permission_mode: String,
         open_shell_pane: bool,
+        branch_slug: String,
     ) -> Result<()> {
         // Append-only debug log so we can diagnose silent failures of this flow.
         let dbg = |msg: &str| {
             use std::io::Write;
             if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true).append(true)
+                .create(true)
+                .append(true)
                 .open("/tmp/jui-startwork.log")
             {
                 let _ = writeln!(f, "{} {msg}", chrono::Utc::now().to_rfc3339());
             }
         };
-        dbg(&format!("=== execute_start_work location={:?} ===", location));
-        let Some(t) = self.detail.clone().or_else(|| self.current_ticket().cloned()) else {
+        dbg(&format!(
+            "=== execute_start_work location={:?} ===",
+            location
+        ));
+        let Some(t) = self
+            .detail
+            .clone()
+            .or_else(|| self.current_ticket().cloned())
+        else {
             dbg("no ticket in detail/current — bailing");
             self.status = "start-work: no ticket selected".into();
             return Ok(());
@@ -2168,45 +2832,53 @@ impl App {
         dbg(&format!("ticket key={key} status={:?}", t.status));
         let mut status_parts: Vec<String> = Vec::new();
 
-        // 1. Transition to "In Dev" (best-effort).
+        // 1. Transition toward the configured in-progress status (best-effort).
+        // Jira workflows may require stepping through "Next" states (e.g.
+        // Reported → Firmware Active → Firmware In Progress), so the daemon
+        // follows Next until a status matching this target is available.
+        let target_status = self
+            .active_statuses
+            .iter()
+            .find(|s| s.to_ascii_lowercase().contains("in progress"))
+            .cloned()
+            .unwrap_or_else(|| "In Progress".to_string());
         let mut s = ipc::connect().await?;
-        if let Response::Transitions { items } =
-            ipc::send_request(&mut s, &Request::ListTransitions { key: key.clone() }).await?
-        {
-            let target = items
-                .iter()
-                .find(|t| {
-                    t.to_status
-                        .as_deref()
-                        .map(|s| s.eq_ignore_ascii_case("In Dev"))
-                        .unwrap_or(false)
-                })
-                .or_else(|| {
-                    items.iter().find(|t| {
-                        let n = t.name.to_ascii_lowercase();
-                        n.contains("dev") || n.contains("in progress")
-                    })
-                });
-            if let Some(tr) = target {
-                let mut s = ipc::connect().await?;
-                let _ = ipc::send_request(
-                    &mut s,
-                    &Request::Transition { key: key.clone(), to: tr.name.clone() },
-                )
-                .await;
-                status_parts.push(format!("→ {}", tr.to_status.clone().unwrap_or(tr.name.clone())));
-            }
+        let transitioned = matches!(
+            ipc::send_request(
+                &mut s,
+                &Request::TransitionToStatus {
+                    key: key.clone(),
+                    status: target_status.clone(),
+                },
+            )
+            .await,
+            Ok(Response::Ok)
+        );
+        if transitioned {
+            status_parts.push(format!("→ {target_status}"));
+            self.status = status_parts.join(" · ");
+            self.refresh_list_preserving_status().await?;
         }
 
         // 2. SCM branch switch. Daemon resolves the worktree anchor from the
         // ticket's linked project (cached); `cwd` is only the fallback when
         // the ticket has no linked project on file.
         let cwd = std::env::current_dir()?;
-        dbg(&format!("sending StartWork key={key} cwd={} location={:?}", cwd.display(), location));
+        dbg(&format!(
+            "sending StartWork key={key} cwd={} slug={} location={:?}",
+            cwd.display(),
+            branch_slug,
+            location
+        ));
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::StartWork { key: key.clone(), cwd, location },
+            &Request::StartWork {
+                key: key.clone(),
+                cwd,
+                slug: Some(branch_slug),
+                location,
+            },
         )
         .await?;
         dbg(&format!("StartWork resp={:?}", resp));
@@ -2216,19 +2888,37 @@ impl App {
         match &resp {
             Response::StartWork { reply } => {
                 let part = match reply {
-                    StartWorkReply::GitWorktree { branch, path, created_branch, attached_existing_worktree } => {
+                    StartWorkReply::GitWorktree {
+                        branch,
+                        path,
+                        created_branch,
+                        attached_existing_worktree,
+                    } => {
                         launch_path = Some(path.clone());
-                        let action = if *attached_existing_worktree { "reused" }
-                            else if *created_branch { "created" }
-                            else { "attached" };
+                        let action = if *attached_existing_worktree {
+                            "reused"
+                        } else if *created_branch {
+                            "created"
+                        } else {
+                            "attached"
+                        };
                         format!("worktree {action} {branch} → {}", path.display())
                     }
-                    StartWorkReply::GitBranchInRepo { branch, path, created_branch, already_on_branch } => {
+                    StartWorkReply::GitBranchInRepo {
+                        branch,
+                        path,
+                        created_branch,
+                        already_on_branch,
+                    } => {
                         launch_path = Some(path.clone());
                         used_branch_in_repo = true;
-                        let action = if *already_on_branch { "already on" }
-                            else if *created_branch { "created" }
-                            else { "checked out" };
+                        let action = if *already_on_branch {
+                            "already on"
+                        } else if *created_branch {
+                            "created"
+                        } else {
+                            "checked out"
+                        };
                         format!("repo {action} {branch} → {}", path.display())
                     }
                     StartWorkReply::SvnExport { value } => format!("svn export {value}"),
@@ -2237,7 +2927,11 @@ impl App {
                 status_parts.push(part);
             }
             Response::Err { message } => {
-                let prior = if status_parts.is_empty() { String::new() } else { format!("{} · ", status_parts.join(" · ")) };
+                let prior = if status_parts.is_empty() {
+                    String::new()
+                } else {
+                    format!("{} · ", status_parts.join(" · "))
+                };
                 self.status = format!("{prior}start-work failed: {message}");
                 dbg(&format!("daemon err: {message}"));
                 return Ok(());
@@ -2288,7 +2982,9 @@ impl App {
         // linked project only when there's no SCM path (NoScm / SvnExport). The old
         // code cd'd into project_paths.first() for worktree mode, which dropped
         // Claude into the main repo on its existing branch instead of the worktree.
-        let top = launch_path.clone().or_else(|| project_paths.first().cloned());
+        let top = launch_path
+            .clone()
+            .or_else(|| project_paths.first().cloned());
         let Some(top) = top else {
             self.status = format!(
                 "{} · no linked project available — link one (P) and retry",
@@ -2299,40 +2995,25 @@ impl App {
         };
         dbg(&format!("top={}", top.display()));
 
-        // 4. Get or create the Claude session id.
-        let mut s = ipc::connect().await?;
-        let existing = match ipc::send_request(
-            &mut s,
-            &Request::GetClaudeSession { ticket_key: key.clone() },
-        )
-        .await?
-        {
-            Response::ClaudeSession { session_id } => session_id,
-            _ => None,
-        };
-        let (session_arg, is_resume, session_id) = if let Some(id) = existing {
-            (vec!["--resume".into(), id.clone()], true, id)
+        let assistant = code_assistant_label(&self.code_assistant);
+
+        // 4. Get or create a per-assistant session id so future starts resume
+        // the same conversation for the chosen assistant.
+        let (session_id, is_resume) = if assistant_uses_jui_session(assistant) {
+            self.get_or_create_assistant_session(&key, assistant)
+                .await?
         } else {
-            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
-            let mut s = ipc::connect().await?;
-            let _ = ipc::send_request(
-                &mut s,
-                &Request::SaveClaudeSession {
-                    ticket_key: key.clone(),
-                    session_id: new_id.clone(),
-                },
-            )
-            .await?;
-            (vec!["--session-id".into(), new_id.clone()], false, new_id)
+            (String::new(), false)
         };
+        let session_arg = code_assistant_session_arg(assistant, &session_id, is_resume);
 
         // 5. Pull the cached implementation suggestion (if any) for the context.
         let mut s = ipc::connect().await?;
         let impl_md = match ipc::send_request(
             &mut s,
-            &Request::GetImplementation { ticket_key: key.clone() },
+            &Request::GetImplementation {
+                ticket_key: key.clone(),
+            },
         )
         .await?
         {
@@ -2344,43 +3025,45 @@ impl App {
         let perm_arg = if permission_mode.trim().is_empty() {
             String::new()
         } else {
-            format!(" --permission-mode {}", shell_escape(permission_mode.trim()))
+            format!(
+                " --permission-mode {}",
+                shell_escape(permission_mode.trim())
+            )
         };
 
         // 6. Tmux check + width.
         if std::env::var("TMUX").is_err() {
+            let run_cmd = code_assistant_launch_cmd(assistant, &session_arg, None, &perm_arg);
             self.status = format!(
-                "{} · not in tmux — run: cd {} && claude {}{} ({})",
+                "{} · not in tmux — run: cd {} && {} ({})",
                 status_parts.join(" · "),
                 top.display(),
-                session_arg.join(" "),
-                perm_arg,
+                run_cmd,
                 if is_resume { "resume" } else { "new" }
             );
             return Ok(());
         }
         let width = tmux_window_width().unwrap_or(0);
 
-        // 7. Build the launch command. On resume, claude already has prior context;
-        // skip piping the file. On new sessions, pipe the context as the first message.
-        let session_arg_str = session_arg.join(" ");
-        let cmd = if is_resume {
+        // 7. Build the launch command. Claude resumes already have prior
+        // context. Opencode always receives the prompt on process start.
+        let resume_without_context = assistant == "claude" && is_resume;
+        let cmd = if resume_without_context {
             format!(
-                "cd {} && claude {}{}",
+                "cd {} && {}",
                 shell_escape(&top.display().to_string()),
-                session_arg_str,
-                perm_arg,
+                code_assistant_launch_cmd(assistant, &session_arg, None, &perm_arg),
             )
         } else {
             let context = build_claude_context(&t, &project_paths, &impl_md);
             let ctx_path = std::env::temp_dir().join(format!("jui-ctx-{}.md", key));
             std::fs::write(&ctx_path, context)?;
+            let launch =
+                code_assistant_launch_cmd(assistant, &session_arg, Some(&ctx_path), &perm_arg);
             format!(
-                "cd {} && cat {} | claude {}{}",
+                "cd {} && {}",
                 shell_escape(&top.display().to_string()),
-                shell_escape(&ctx_path.display().to_string()),
-                session_arg_str,
-                perm_arg,
+                launch,
             )
         };
 
@@ -2420,26 +3103,44 @@ impl App {
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
 
-        // 9. After Claude has settled, send `/remote-control` to enable RC mode.
-        // Detached subshell so we don't block the TUI.
-        let send_cmd = format!(
-            "(sleep 4; tmux send-keys -t {pane} '/remote-control' Enter) >/dev/null 2>&1 &",
-            pane = pane_target,
-        );
-        let _ = std::process::Command::new("sh").arg("-c").arg(&send_cmd).spawn();
+        if assistant == "claude" {
+            // After Claude has settled, send `/remote-control` to enable RC mode.
+            // Detached subshell so we don't block the TUI.
+            let send_cmd = format!(
+                "(sleep 4; tmux send-keys -t {pane} '/remote-control' Enter) >/dev/null 2>&1 &",
+                pane = pane_target,
+            );
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&send_cmd)
+                .spawn();
+        } else if assistant == "opencode" {
+            if let Ok(jui_bin) = std::env::current_exe() {
+                let capture_cmd = format!(
+                    "(sleep 60; sid=$(opencode session list | grep -m1 '^ses_' | awk '{{print $1}}'); if [ -n \"$sid\" ]; then {jui} _save-assistant-session {key_arg} opencode \"$sid\"; fi) >/dev/null 2>&1 &",
+                    jui = shell_escape(&jui_bin.display().to_string()),
+                    key_arg = shell_escape(&key),
+                );
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&capture_cmd)
+                    .spawn();
+            }
+        }
 
         let mode = if is_resume { "resumed" } else { "new" };
         let layout = if width >= 400 { "split" } else { "window" };
         self.status = format!(
-            "{} · claude {mode} ({layout}) · session {}",
+            "{} · {assistant} {mode} ({layout})",
             status_parts.join(" · "),
-            &session_id[..8.min(session_id.len())]
         );
         Ok(())
     }
 
     pub async fn submit_create(&mut self) -> Result<()> {
-        let Mode::Create(form) = &self.mode else { return Ok(()) };
+        let Mode::Create(form) = &self.mode else {
+            return Ok(());
+        };
         let description = trim_to_opt(&form.description);
         let priority = trim_to_opt(&form.priority);
         let estimate = trim_to_opt(&form.time_estimate);
@@ -2480,7 +3181,10 @@ impl App {
             let mut s = ipc::connect().await?;
             match ipc::send_request(
                 &mut s,
-                &Request::EditPriority { key: new_key.clone(), priority: p.clone() },
+                &Request::EditPriority {
+                    key: new_key.clone(),
+                    priority: p.clone(),
+                },
             )
             .await?
             {
@@ -2521,7 +3225,10 @@ impl App {
             let mut s = ipc::connect().await?;
             match ipc::send_request(
                 &mut s,
-                &Request::AssignTicket { key: new_key.clone(), assignee: a },
+                &Request::AssignTicket {
+                    key: new_key.clone(),
+                    assignee: a,
+                },
             )
             .await?
             {
@@ -2539,43 +3246,28 @@ impl App {
         // value skips this step.
         let target = self.default_create_status.trim().to_string();
         if !target.is_empty() {
+            // Route through TransitionToStatus so the daemon's smart picker
+            // resolves ambiguous workflows (multiple transitions landing on
+            // the same status) the same way the Jira web UI button does.
             let mut s = ipc::connect().await?;
-            let tr_resp = ipc::send_request(
+            match ipc::send_request(
                 &mut s,
-                &Request::ListTransitions { key: new_key.clone() },
+                &Request::TransitionToStatus {
+                    key: new_key.clone(),
+                    status: target.clone(),
+                },
             )
-            .await?;
-            if let Response::Transitions { items } = tr_resp {
-                let matched = items.iter().find(|tr| {
-                    tr.to_status
-                        .as_deref()
-                        .map(|s| s.eq_ignore_ascii_case(&target))
-                        .unwrap_or(false)
-                        || tr.name.eq_ignore_ascii_case(&target)
-                });
-                if let Some(tr) = matched {
-                    let mut s = ipc::connect().await?;
-                    match ipc::send_request(
-                        &mut s,
-                        &Request::Transition {
-                            key: new_key.clone(),
-                            to: tr.name.clone(),
-                        },
-                    )
-                    .await?
-                    {
-                        Response::Ok => extras.push("status"),
-                        Response::Err { message } => {
-                            self.status = format!(
-                                "created {new_key}, but transition to \"{target}\" failed: {message}"
-                            );
-                        }
-                        _ => {}
-                    }
-                } else {
+            .await?
+            {
+                Response::Ok => extras.push("status"),
+                Response::Err { message } => {
                     self.status = format!(
-                        "created {new_key}, but no transition leads to \"{target}\""
+                        "created {new_key}, but transition to \"{target}\" failed: {message}"
                     );
+                }
+                _ => {
+                    self.status =
+                        format!("created {new_key}, but no transition leads to \"{target}\"");
                 }
             }
         }
@@ -2593,7 +3285,9 @@ impl App {
 
     pub async fn improve_edit_description(&mut self) -> Result<()> {
         let (summary, body) = {
-            let Mode::Edit(form) = &self.mode else { return Ok(()) };
+            let Mode::Edit(form) = &self.mode else {
+                return Ok(());
+            };
             (form.summary.clone(), form.description.clone())
         };
         if body.trim().is_empty() {
@@ -2630,7 +3324,9 @@ impl App {
     /// not in `PrCreate` or the body is empty.
     pub async fn improve_pr_body(&mut self) -> Result<()> {
         let (ticket_key, title, body) = {
-            let Mode::PrCreate(f) = &self.mode else { return Ok(()) };
+            let Mode::PrCreate(f) = &self.mode else {
+                return Ok(());
+            };
             (f.key.clone(), f.title.clone(), f.body.clone())
         };
         if body.trim().is_empty() {
@@ -2650,7 +3346,11 @@ impl App {
         tokio::spawn(async move {
             let result: anyhow::Result<String> = async {
                 let mut s = ipc::connect().await?;
-                let req = Request::ImprovePrBody { ticket_key, title, body };
+                let req = Request::ImprovePrBody {
+                    ticket_key,
+                    title,
+                    body,
+                };
                 match ipc::send_request(&mut s, &req).await? {
                     Response::Improved { body } => Ok(body),
                     Response::Err { message } => Err(anyhow::anyhow!("{message}")),
@@ -2668,7 +3368,9 @@ impl App {
     /// modal can show the y/n prompt, or surfaces an error in the status bar.
     pub fn poll_pending_pr_body_improve(&mut self) -> bool {
         use tokio::sync::oneshot::error::TryRecvError;
-        let Some(rx) = self.pending_pr_body_improve.as_mut() else { return false };
+        let Some(rx) = self.pending_pr_body_improve.as_mut() else {
+            return false;
+        };
         match rx.try_recv() {
             Ok(Ok(body)) => {
                 if let Mode::PrCreate(f) = &mut self.mode {
@@ -2697,7 +3399,9 @@ impl App {
     /// `true` when something changed (so the loop can force-redraw if it cares).
     pub fn poll_pending_improve(&mut self) -> bool {
         use tokio::sync::oneshot::error::TryRecvError;
-        let Some(rx) = self.pending_improve.as_mut() else { return false };
+        let Some(rx) = self.pending_improve.as_mut() else {
+            return false;
+        };
         match rx.try_recv() {
             Ok(Ok(body)) => {
                 if let Mode::Edit(form) = &mut self.mode {
@@ -2722,7 +3426,9 @@ impl App {
     }
 
     pub async fn submit_edit(&mut self) -> Result<()> {
-        let Mode::Edit(form) = &self.mode else { return Ok(()) };
+        let Mode::Edit(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.key.clone();
         let sum_changed = form.summary != form.original_summary;
         let desc_changed = form.description != form.original_description;
@@ -2736,7 +3442,10 @@ impl App {
         let mut errs: Vec<String> = Vec::new();
         if sum_changed {
             let mut s = ipc::connect().await?;
-            let req = Request::EditSummary { key: key.clone(), summary };
+            let req = Request::EditSummary {
+                key: key.clone(),
+                summary: summary.clone(),
+            };
             match ipc::send_request(&mut s, &req).await? {
                 Response::Ok => {}
                 Response::Err { message } => errs.push(format!("summary: {message}")),
@@ -2745,7 +3454,10 @@ impl App {
         }
         if desc_changed {
             let mut s = ipc::connect().await?;
-            let req = Request::EditDescription { key: key.clone(), body: description };
+            let req = Request::EditDescription {
+                key: key.clone(),
+                body: description.clone(),
+            };
             match ipc::send_request(&mut s, &req).await? {
                 Response::Ok => {}
                 Response::Err { message } => errs.push(format!("description: {message}")),
@@ -2762,8 +3474,66 @@ impl App {
         Ok(())
     }
 
+    pub async fn edit_ticket_in_editor(&mut self) -> Result<()> {
+        let (key, summary, description) = {
+            let Mode::Edit(form) = &self.mode else {
+                return Ok(());
+            };
+            (
+                form.key.clone(),
+                form.summary.clone(),
+                form.description.clone(),
+            )
+        };
+        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+        let path =
+            std::env::temp_dir().join(format!("jui-ticket-{}-{}.md", key, std::process::id()));
+        std::fs::write(&path, ticket_edit_file(&summary, &description))?;
+
+        disable_raw_mode()?;
+        execute!(io::stdout(), LeaveAlternateScreen)?;
+        let cmd = editor_command(&editor, &path);
+        let editor_result = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(cmd)
+            .status();
+        let restore_result = (|| -> Result<()> {
+            enable_raw_mode()?;
+            execute!(io::stdout(), EnterAlternateScreen)?;
+            Ok(())
+        })();
+        self.needs_clear = true;
+        restore_result?;
+
+        let status = editor_result?;
+        if !status.success() {
+            self.status = format!("editor exited with {status}");
+            return Ok(());
+        }
+
+        let edited = std::fs::read_to_string(&path)?;
+        let _ = std::fs::remove_file(&path);
+        let (new_summary, new_description) = parse_ticket_edit_file(&edited);
+        if new_summary.is_empty() {
+            self.status = "summary cannot be empty".into();
+            return Ok(());
+        }
+        if let Mode::Edit(form) = &mut self.mode {
+            form.summary = new_summary;
+            form.description = new_description;
+            form.summary_cursor = form.summary.len();
+            form.description_cursor = form.description.len();
+            form.suggestion = None;
+        }
+        self.submit_edit().await
+    }
+
     pub async fn submit_comment(&mut self) -> Result<()> {
-        let Mode::Comment(form) = &self.mode else { return Ok(()) };
+        let Mode::Comment(form) = &self.mode else {
+            return Ok(());
+        };
+        let from_stop_work = form.from_stop_work;
+        let key = form.key.clone();
         // If this is a reply, prefix the body with the visible quote marker so other Jira
         // clients see the context too, and so jui can detect it on render.
         let body = if let Some(ctx) = &form.reply_to {
@@ -2776,25 +3546,38 @@ impl App {
         } else {
             form.body.clone()
         };
-        let req = if form.from_stop_work {
+        let req = if from_stop_work {
             // Stop-work flow: send StopWork so daemon does transition +
             // comment + rules-engine fire as one atomic step. Empty body is
             // still valid — daemon skips the comment write.
-            let comment = if body.trim().is_empty() { None } else { Some(body) };
-            Request::StopWork { key: form.key.clone(), comment }
+            let comment = if body.trim().is_empty() {
+                None
+            } else {
+                Some(body)
+            };
+            Request::StopWork {
+                key: key.clone(),
+                comment,
+            }
         } else {
-            Request::AddComment { key: form.key.clone(), body }
+            Request::AddComment {
+                key: key.clone(),
+                body,
+            }
         };
         let mut s = ipc::connect().await?;
         match ipc::send_request(&mut s, &req).await? {
             Response::Ok => {
-                self.status = if form.from_stop_work {
-                    format!("stopped work on {}", form.key)
+                self.status = if from_stop_work {
+                    format!("stopped work on {key}")
                 } else {
-                    format!("commented on {}", form.key)
+                    format!("commented on {key}")
                 };
                 self.mode = Mode::Detail;
                 self.load_detail().await?;
+                if from_stop_work {
+                    self.refresh_list_preserving_status().await?;
+                }
             }
             Response::Err { message } => self.status = format!("err: {message}"),
             _ => self.status = "unexpected response".into(),
@@ -2832,7 +3615,13 @@ impl App {
         let Some(t) = &self.detail else { return Ok(()) };
         let key = t.key.clone();
         let mut s = ipc::connect().await?;
-        let resp = ipc::send_request(&mut s, &Request::GetImplementation { ticket_key: key.clone() }).await?;
+        let resp = ipc::send_request(
+            &mut s,
+            &Request::GetImplementation {
+                ticket_key: key.clone(),
+            },
+        )
+        .await?;
         let mut form = ImplementationForm {
             key: key.clone(),
             markdown: String::new(),
@@ -2842,16 +3631,26 @@ impl App {
             status_line: String::new(),
         };
         match resp {
-            Response::Implementation { markdown, project_paths, updated_at } => {
+            Response::Implementation {
+                markdown,
+                project_paths,
+                updated_at,
+            } => {
                 form.markdown = markdown;
-                form.project_paths = project_paths.into_iter().map(std::path::PathBuf::from).collect();
+                form.project_paths = project_paths
+                    .into_iter()
+                    .map(std::path::PathBuf::from)
+                    .collect();
                 form.updated_at = updated_at;
             }
             Response::Err { .. } => {
                 // Nothing cached. Trigger generation and show a placeholder.
                 let mut s = ipc::connect().await?;
-                let _ = ipc::send_request(&mut s, &Request::GenerateImplementation { ticket_key: key }).await?;
-                form.status_line = "no cached suggestion — generation queued. press 'r' to reload.".into();
+                let _ =
+                    ipc::send_request(&mut s, &Request::GenerateImplementation { ticket_key: key })
+                        .await?;
+                form.status_line =
+                    "no cached suggestion — generation queued. press 'r' to reload.".into();
             }
             _ => form.status_line = "unexpected response".into(),
         }
@@ -2860,10 +3659,13 @@ impl App {
     }
 
     pub async fn regenerate_implementation(&mut self) -> Result<()> {
-        let Mode::Implementation(form) = &self.mode else { return Ok(()) };
+        let Mode::Implementation(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.key.clone();
         let mut s = ipc::connect().await?;
-        let _ = ipc::send_request(&mut s, &Request::GenerateImplementation { ticket_key: key }).await?;
+        let _ =
+            ipc::send_request(&mut s, &Request::GenerateImplementation { ticket_key: key }).await?;
         if let Mode::Implementation(form) = &mut self.mode {
             form.status_line = "generation queued. press 'r' again later to reload.".into();
         }
@@ -2871,17 +3673,30 @@ impl App {
     }
 
     pub async fn reload_implementation(&mut self) -> Result<()> {
-        let Mode::Implementation(form) = &self.mode else { return Ok(()) };
+        let Mode::Implementation(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.key.clone();
         let mut s = ipc::connect().await?;
-        let resp = ipc::send_request(&mut s, &Request::GetImplementation { ticket_key: key }).await?;
+        let resp =
+            ipc::send_request(&mut s, &Request::GetImplementation { ticket_key: key }).await?;
         if let Mode::Implementation(form) = &mut self.mode {
             match resp {
-                Response::Implementation { markdown, project_paths, updated_at } => {
+                Response::Implementation {
+                    markdown,
+                    project_paths,
+                    updated_at,
+                } => {
                     form.markdown = markdown;
-                    form.project_paths = project_paths.into_iter().map(std::path::PathBuf::from).collect();
+                    form.project_paths = project_paths
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect();
                     form.updated_at = updated_at;
-                    form.status_line = format!("loaded · updated {updated_at}", updated_at = form.updated_at);
+                    form.status_line = format!(
+                        "loaded · updated {updated_at}",
+                        updated_at = form.updated_at
+                    );
                 }
                 Response::Err { message } => form.status_line = format!("not yet ready: {message}"),
                 _ => form.status_line = "unexpected response".into(),
@@ -2891,7 +3706,9 @@ impl App {
     }
 
     pub async fn save_implementation_to_file(&mut self) -> Result<()> {
-        let Mode::Implementation(form) = &self.mode else { return Ok(()) };
+        let Mode::Implementation(form) = &self.mode else {
+            return Ok(());
+        };
         if form.markdown.is_empty() {
             self.status = "nothing to save (no implementation yet)".into();
             return Ok(());
@@ -2944,6 +3761,116 @@ impl App {
             .or_else(|| self.detail_pr_link.clone())
     }
 
+    fn current_pr_identity(&self) -> Option<(String, String, u64)> {
+        if let Some(c) = self.pr_comments.first() {
+            return Some((c.repo.clone(), c.pr_url.clone(), c.pr_number));
+        }
+        self.detail_pr_link
+            .as_deref()
+            .and_then(parse_pr_url)
+            .map(|(repo, number)| {
+                (
+                    repo,
+                    self.detail_pr_link.clone().unwrap_or_default(),
+                    number,
+                )
+            })
+    }
+
+    async fn build_devqa_context(
+        &self,
+        key: &str,
+        repo: Option<&str>,
+        pr_url: Option<&str>,
+        pr_number: Option<u64>,
+        branch: Option<&str>,
+    ) -> String {
+        let mut ctx = String::new();
+        if let Some(t) = &self.detail {
+            ctx.push_str(&format!("# DevQA: {}\n\n", t.key));
+            ctx.push_str("## Jira ticket\n\n");
+            ctx.push_str(&format!("- **Status:** {}\n", t.status));
+            ctx.push_str(&format!("- **Summary:** {}\n", t.summary));
+            if let Some(issue_type) = t.issue_type.as_deref() {
+                ctx.push_str(&format!("- **Type:** {issue_type}\n"));
+            }
+            if let Some(priority) = t.priority.as_deref() {
+                ctx.push_str(&format!("- **Priority:** {priority}\n"));
+            }
+            if let Some(assignee) = t.assignee.as_deref() {
+                ctx.push_str(&format!("- **Assignee:** {assignee}\n"));
+            }
+            if let Some(parent) = t.parent_key.as_deref() {
+                ctx.push_str(&format!("- **Parent:** {parent}\n"));
+            }
+            if let Some(d) = &t.description {
+                if !d.trim().is_empty() {
+                    ctx.push_str("\n### Jira description\n\n");
+                    ctx.push_str(d.trim());
+                    ctx.push('\n');
+                }
+            }
+        } else {
+            ctx.push_str(&format!("# DevQA: {key}\n\n"));
+        }
+
+        ctx.push_str("\n## Pull request\n\n");
+        if let Some(url) = pr_url {
+            ctx.push_str(&format!("- **URL:** {url}\n"));
+        }
+        if let Some(repo) = repo {
+            ctx.push_str(&format!("- **Repo:** `{repo}`\n"));
+        }
+        if let Some(number) = pr_number {
+            ctx.push_str(&format!("- **PR number:** `{number}`\n"));
+        }
+        if let Some(branch) = branch {
+            ctx.push_str(&format!("- **Local branch:** `{branch}`\n"));
+        }
+
+        if let (Some(repo), Some(number)) = (repo, pr_number) {
+            if let Ok(author) = jui_core::github::pr_author_login(repo, number).await {
+                if !author.trim().is_empty() {
+                    ctx.push_str(&format!("- **Author:** @{author}\n"));
+                }
+            }
+            if let Ok(body) = jui_core::github::pr_body(repo, number).await {
+                if !body.trim().is_empty() {
+                    ctx.push_str("\n### PR request message\n\n");
+                    ctx.push_str(body.trim());
+                    ctx.push('\n');
+                }
+            }
+        }
+
+        if !self.pr_comments.is_empty() {
+            ctx.push_str("\n## PR discussion and reviews\n\n");
+            for c in &self.pr_comments {
+                let kind = if c.kind.is_empty() {
+                    "comment"
+                } else {
+                    &c.kind
+                };
+                ctx.push_str(&format!(
+                    "### @{author} · {date} · {kind}\n\n{body}\n\n",
+                    author = c.author,
+                    date = c.created.split('T').next().unwrap_or(&c.created),
+                    body = c.body.trim(),
+                ));
+            }
+        }
+
+        ctx.push_str(
+            "\n## DevQA instructions\n\n\
+You are doing a DevQA pass on this pull request. The PR branch is already checked out in this directory. Your job is to **test and verify the existing change**, not to implement the ticket or write a solution. Run / smoke-test the change as it stands, look for regressions, and report findings to me directly here. Do **not** modify code to 'fix' or 'finish' the ticket; only change files if I explicitly ask you to (e.g. to reproduce or probe a bug).\n\n\
+## Rules for posting on the PR\n\n\
+- **Never** post a pass / fail / approval comment to GitHub (`gh pr comment`, `gh pr review --approve`, `gh pr review --request-changes`, etc.) without my explicit approval first. Show me the proposed comment text here and wait for me to say go.\n\
+- When I do approve and you post the pass/fail comment, also add a rocket reaction to the PR description itself (the top-level body posted by the author, not your own comment).\n",
+        );
+
+        ctx
+    }
+
     /// Set up a DevQA checkout for the ticket's PR (daemon side) and open a
     /// tmux pane in it running `claude` with PR context. With `use_worktree` the
     /// PR branch is isolated in a git worktree; otherwise it's checked out in the
@@ -2954,9 +3881,7 @@ impl App {
         // has zero comments. Without either there's no PR to DevQA.
         let (repo, pr_url, pr_number) = if let Some(c) = self.pr_comments.first().cloned() {
             (c.repo, c.pr_url, c.pr_number)
-        } else if let Some((repo, num)) =
-            self.detail_pr_link.as_deref().and_then(parse_pr_url)
-        {
+        } else if let Some((repo, num)) = self.detail_pr_link.as_deref().and_then(parse_pr_url) {
             (repo, self.detail_pr_link.clone().unwrap_or_default(), num)
         } else {
             self.status = format!("DevQA: no PR associated with {key}");
@@ -2981,47 +3906,28 @@ impl App {
             _ => return Err(anyhow::anyhow!("unexpected daemon response")),
         };
 
+        let assistant = code_assistant_label(&self.code_assistant);
+
         // 2. Tmux check.
         if std::env::var("TMUX").is_err() {
             self.status = format!(
-                "DevQA checkout at {} (branch {branch}) — open tmux to launch claude",
+                "DevQA checkout at {} (branch {branch}) — open tmux to launch {assistant}",
                 path.display()
             );
             return Ok(());
         }
 
-        // 3. Get/create a Claude session id for the ticket so subsequent
-        //    DevQA passes resume the same session.
-        let mut s = ipc::connect().await?;
-        let existing = match ipc::send_request(
-            &mut s,
-            &Request::GetClaudeSession { ticket_key: key.to_string() },
-        )
-        .await?
-        {
-            Response::ClaudeSession { session_id } => session_id,
-            _ => None,
-        };
-        let (session_arg, is_resume, _session_id) = if let Some(id) = existing {
-            (format!("--resume {}", shell_escape(&id)), true, id)
+        // 3. Get/create a session id for assistants with explicit resume
+        // support.
+        let (session_id, is_resume) = if assistant_uses_jui_session(assistant) {
+            self.get_or_create_assistant_session(key, assistant).await?
         } else {
-            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
-            let mut s = ipc::connect().await?;
-            let _ = ipc::send_request(
-                &mut s,
-                &Request::SaveClaudeSession {
-                    ticket_key: key.to_string(),
-                    session_id: new_id.clone(),
-                },
-            )
-            .await?;
-            (format!("--session-id {}", shell_escape(&new_id)), false, new_id)
+            (String::new(), false)
         };
+        let session_arg = code_assistant_session_arg(assistant, &session_id, is_resume);
 
         // 3b. Worktree setup fixes. For a worktree checkout, run any commands
-        // from `<repo>-worktrees/WORKTREE_SETUP.md` (submodule init, shared
+        // from `<repo>/worktrees/WORKTREE_SETUP.md` (submodule init, shared
         // downloads/sstate symlinks, …) in the worktree before Claude starts.
         // Best-effort and idempotent, so re-running on resume is harmless.
         let setup_prefix = if use_worktree {
@@ -3035,69 +3941,24 @@ impl App {
         let pdisp = shell_escape(&path.display().to_string());
 
         // 4. Build PR context file (ticket info + PR url + cached PR comments).
-        let cmd = if is_resume {
-            format!("cd {pdisp} || exit 1\n{setup_prefix}claude {session_arg}")
+        let cmd = if assistant == "claude" && is_resume {
+            let launch = code_assistant_launch_cmd(assistant, &session_arg, None, "");
+            format!("cd {pdisp} || exit 1\n{setup_prefix}{launch}")
         } else {
-            let mut ctx = String::new();
-            if let Some(t) = &self.detail {
-                ctx.push_str(&format!("# DevQA: {}\n\n", t.key));
-                ctx.push_str(&format!("**Status**: {}\n", t.status));
-                if !t.summary.is_empty() {
-                    ctx.push_str(&format!("**Summary**: {}\n", t.summary));
-                }
-                if let Some(d) = &t.description {
-                    if !d.trim().is_empty() {
-                        ctx.push_str("\n## Ticket description\n\n");
-                        ctx.push_str(d);
-                        ctx.push('\n');
-                    }
-                }
-            } else {
-                ctx.push_str(&format!("# DevQA: {key}\n\n"));
-            }
-            ctx.push_str(&format!("\n## Pull request\n\n{pr_url}\n\nBranch: `{branch}`\nRepo: `{repo}`\n"));
-            if !self.pr_comments.is_empty() {
-                ctx.push_str("\n## PR comments\n\n");
-                for c in &self.pr_comments {
-                    ctx.push_str(&format!("**@{}** · {}\n\n{}\n\n---\n\n",
-                        c.author, c.created.split('T').next().unwrap_or(&c.created), c.body));
-                }
-            }
-            ctx.push_str(
-"\nYou are doing a DevQA pass on this pull request. The PR branch is already
-checked out in this directory — your job is to **test and verify the existing
-change**, not to implement the ticket or write a solution. Run / smoke-test the
-change as it stands, look for regressions, and report findings to me directly
-here. Do **not** modify code to 'fix' or 'finish' the ticket; only change files
-if I explicitly ask you to (e.g. to reproduce or probe a bug).
-
-## Rules for posting on the PR
-
-- **Never** post a pass / fail / approval comment to GitHub (`gh pr comment`,
-  `gh pr review --approve`, `gh pr review --request-changes`, etc.)
-  *without my explicit approval first*. Show me the proposed comment text
-  here and wait for me to say go.
-- When I do approve and you post the pass/fail comment, also add a 🚀
-  reaction to the **PR description itself** (the top-level body posted by
-  the author — not your own comment). One way:
-    ```
-    gh api -X POST -H \"Accept: application/vnd.github+json\" \\
-        repos/$REPO/issues/$PR_NUMBER/reactions -f content=rocket
-    ```
-  Substitute the actual repo (`",
-            );
-            ctx.push_str(&repo);
-            ctx.push_str("`) and PR number (`");
-            ctx.push_str(&pr_number.to_string());
-            ctx.push_str("`).\n");
+            let ctx = self
+                .build_devqa_context(
+                    key,
+                    Some(&repo),
+                    Some(&pr_url),
+                    Some(pr_number),
+                    Some(&branch),
+                )
+                .await;
 
             let ctx_path = std::env::temp_dir().join(format!("jui-devqa-{key}.md"));
             std::fs::write(&ctx_path, ctx)?;
-            format!(
-                "cd {pdisp} || exit 1\n{setup_prefix}cat {} | claude {}",
-                shell_escape(&ctx_path.display().to_string()),
-                session_arg,
-            )
+            let launch = code_assistant_launch_cmd(assistant, &session_arg, Some(&ctx_path), "");
+            format!("cd {pdisp} || exit 1\n{setup_prefix}{launch}")
         };
 
         // 5. Open the pane (split or new window per the existing rule).
@@ -3122,13 +3983,18 @@ if I explicitly ask you to (e.g. to reproduce or probe a bug).
             ));
         }
         let pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let send_cmd = format!(
-            "(sleep 4; tmux send-keys -t {pane} '/remote-control' Enter) >/dev/null 2>&1 &"
-        );
-        let _ = std::process::Command::new("sh").arg("-c").arg(&send_cmd).spawn();
+        if assistant == "claude" {
+            let send_cmd = format!(
+                "(sleep 4; tmux send-keys -t {pane} '/remote-control' Enter) >/dev/null 2>&1 &"
+            );
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&send_cmd)
+                .spawn();
+        }
 
         let mode = if is_resume { "resumed" } else { "new" };
-        self.status = format!("DevQA · claude {mode} @ {} · {pr_url}", path.display());
+        self.status = format!("DevQA · {assistant} {mode} @ {} · {pr_url}", path.display());
         Ok(())
     }
 
@@ -3137,61 +4003,45 @@ if I explicitly ask you to (e.g. to reproduce or probe a bug).
     /// starts a fresh one. Used when the ticket is already past "begin DevQA"
     /// and a worktree is present but the PR/session links are gone.
     async fn reopen_devqa_worktree(&mut self, key: &str, path: std::path::PathBuf) -> Result<()> {
+        let assistant = code_assistant_label(&self.code_assistant);
         if std::env::var("TMUX").is_err() {
             self.status = format!(
-                "DevQA worktree at {} — open tmux to launch claude",
+                "DevQA worktree at {} — open tmux to launch {assistant}",
                 path.display()
             );
             return Ok(());
         }
-        // Session id — resume the saved one if present, else mint + save a new one.
-        let mut s = ipc::connect().await?;
-        let existing = match ipc::send_request(
-            &mut s,
-            &Request::GetClaudeSession { ticket_key: key.to_string() },
-        )
-        .await?
-        {
-            Response::ClaudeSession { session_id } => session_id,
-            _ => None,
-        };
-        let (session_arg, is_resume) = if let Some(id) = existing {
-            (format!("--resume {}", shell_escape(&id)), true)
+        let (session_id, is_resume) = if assistant_uses_jui_session(assistant) {
+            self.get_or_create_assistant_session(key, assistant).await?
         } else {
-            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
-            let mut s = ipc::connect().await?;
-            let _ = ipc::send_request(
-                &mut s,
-                &Request::SaveClaudeSession { ticket_key: key.to_string(), session_id: new_id.clone() },
-            )
-            .await?;
-            (format!("--session-id {}", shell_escape(&new_id)), false)
+            (String::new(), false)
         };
+        let session_arg = code_assistant_session_arg(assistant, &session_id, is_resume);
         let setup_prefix = match worktree_setup_script(&path) {
             Some(s) => format!("echo '── applying worktree setup ──'\n{s}\n"),
             None => String::new(),
         };
         let pdisp = shell_escape(&path.display().to_string());
-        let cmd = if is_resume {
-            format!("cd {pdisp} || exit 1\n{setup_prefix}claude {session_arg}")
+        let pr_identity = self.current_pr_identity();
+        let (repo, pr_url, pr_number) = match &pr_identity {
+            Some((repo, url, number)) => (Some(repo.as_str()), Some(url.as_str()), Some(*number)),
+            None => (None, None, None),
+        };
+        let branch = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|s| s.to_string());
+        let cmd = if assistant == "claude" && is_resume {
+            let launch = code_assistant_launch_cmd(assistant, &session_arg, None, "");
+            format!("cd {pdisp} || exit 1\n{setup_prefix}{launch}")
         } else {
-            let ctx = format!(
-"# DevQA: {key}
-
-You are doing a DevQA pass: the PR branch is checked out in this worktree. Your
-job is to **test and verify the existing change**, not to implement the ticket
-or write a solution. Run / smoke-test it, look for regressions, and report
-findings here. Do **not** post pass/fail to GitHub or modify code unless I
-explicitly ask.
-");
+            let ctx = self
+                .build_devqa_context(key, repo, pr_url, pr_number, branch.as_deref())
+                .await;
             let ctx_path = std::env::temp_dir().join(format!("jui-devqa-{key}.md"));
             std::fs::write(&ctx_path, ctx)?;
-            format!(
-                "cd {pdisp} || exit 1\n{setup_prefix}cat {} | claude {session_arg}",
-                shell_escape(&ctx_path.display().to_string()),
-            )
+            let launch = code_assistant_launch_cmd(assistant, &session_arg, Some(&ctx_path), "");
+            format!("cd {pdisp} || exit 1\n{setup_prefix}{launch}")
         };
         let width = tmux_window_width().unwrap_or(0);
         let out = if width >= 400 {
@@ -3214,12 +4064,20 @@ explicitly ask.
             ));
         }
         let pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        let send_cmd = format!(
-            "(sleep 4; tmux send-keys -t {pane} '/remote-control' Enter) >/dev/null 2>&1 &"
-        );
-        let _ = std::process::Command::new("sh").arg("-c").arg(&send_cmd).spawn();
+        if assistant == "claude" {
+            let send_cmd = format!(
+                "(sleep 4; tmux send-keys -t {pane} '/remote-control' Enter) >/dev/null 2>&1 &"
+            );
+            let _ = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&send_cmd)
+                .spawn();
+        }
         let mode = if is_resume { "resumed" } else { "new" };
-        self.status = format!("DevQA · claude {mode} @ {} (existing worktree)", path.display());
+        self.status = format!(
+            "DevQA · {assistant} {mode} @ {} (existing worktree)",
+            path.display()
+        );
         Ok(())
     }
 
@@ -3227,14 +4085,20 @@ explicitly ask.
     /// with the chosen worktree/branch-in-repo mode. On error, keep the prompt
     /// open and show the message so the user can adjust (e.g. clean a dirty tree).
     pub async fn submit_devqa_prompt(&mut self) -> Result<()> {
-        let Mode::DevQaPrompt(form) = &self.mode else { return Ok(()) };
+        let Mode::DevQaPrompt(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.ticket_key.clone();
         let use_worktree = form.use_worktree;
         self.mode = Mode::Detail;
         if let Err(e) = self.begin_devqa_worktree(&key, use_worktree).await {
             self.mode = Mode::DevQaPrompt(DevQaPromptForm {
                 ticket_key: key,
-                pr_url: self.pr_comments.first().map(|c| c.pr_url.clone()).unwrap_or_default(),
+                pr_url: self
+                    .pr_comments
+                    .first()
+                    .map(|c| c.pr_url.clone())
+                    .unwrap_or_default(),
                 use_worktree,
                 error: Some(format!("{e:#}")),
             });
@@ -3246,13 +4110,22 @@ explicitly ask.
     /// then best-effort transition the ticket to a "Dev QA Complete"/"Passed"
     /// status. On the GitHub step failing, keep the confirm open with the error.
     pub async fn submit_devqa_resolve(&mut self) -> Result<()> {
-        let Mode::DevQaResolveConfirm(form) = &self.mode else { return Ok(()) };
+        let Mode::DevQaResolveConfirm(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.ticket_key.clone();
         let pr_url = form.pr_url.clone();
 
         // 1. GitHub side (comment + reaction) via the daemon.
         let mut s = ipc::connect().await?;
-        match ipc::send_request(&mut s, &Request::ResolveDevQaPr { ticket_key: key.clone() }).await? {
+        match ipc::send_request(
+            &mut s,
+            &Request::ResolveDevQaPr {
+                ticket_key: key.clone(),
+            },
+        )
+        .await?
+        {
             Response::Ok => {}
             Response::Err { message } => {
                 self.mode = Mode::DevQaResolveConfirm(DevQaResolveForm {
@@ -3281,7 +4154,13 @@ explicitly ask.
         if let Response::Transitions { items } =
             ipc::send_request(&mut s, &Request::ListTransitions { key: key.clone() }).await?
         {
-            let needles = ["dev qa complete", "dev qa passed", "qa complete", "qa passed", "qa done"];
+            let needles = [
+                "dev qa complete",
+                "dev qa passed",
+                "qa complete",
+                "qa passed",
+                "qa done",
+            ];
             let target = items.iter().find(|tr| {
                 let dest = tr.to_status.as_deref().unwrap_or("").to_ascii_lowercase();
                 let name = tr.name.to_ascii_lowercase();
@@ -3289,11 +4168,25 @@ explicitly ask.
             });
             if let Some(tr) = target {
                 let mut s = ipc::connect().await?;
-                let _ = ipc::send_request(
-                    &mut s,
-                    &Request::Transition { key: key.clone(), to: tr.name.clone() },
-                ).await;
-                parts.push(format!("→ {}", tr.to_status.clone().unwrap_or_else(|| tr.name.clone())));
+                let transitioned = matches!(
+                    ipc::send_request(
+                        &mut s,
+                        &Request::Transition {
+                            key: key.clone(),
+                            to: tr.name.clone(),
+                        },
+                    )
+                    .await,
+                    Ok(Response::Ok)
+                );
+                parts.push(format!(
+                    "→ {}",
+                    tr.to_status.clone().unwrap_or_else(|| tr.name.clone())
+                ));
+                if transitioned {
+                    self.status = format!("{key} · {}", parts.join(" · "));
+                    self.refresh_list_preserving_status().await?;
+                }
             } else {
                 parts.push("no DevQA-complete transition available".into());
             }
@@ -3306,11 +4199,18 @@ explicitly ask.
         let mut s = ipc::connect().await?;
         match ipc::send_request(
             &mut s,
-            &Request::CleanupDevQaWorktree { ticket_key: key.clone(), force: false },
+            &Request::CleanupDevQaWorktree {
+                ticket_key: key.clone(),
+                force: false,
+            },
         )
         .await
         {
-            Ok(Response::DevQaCleanup { removed, dirty, message }) => {
+            Ok(Response::DevQaCleanup {
+                removed,
+                dirty,
+                message,
+            }) => {
                 if dirty && !removed {
                     // Surface the resolve outcome now, then ask before discarding.
                     self.status = format!("{key} · {}", parts.join(" · "));
@@ -3331,24 +4231,34 @@ explicitly ask.
 
         self.status = format!("{key} · {}", parts.join(" · "));
         self.load_detail().await?;
+        self.refresh_list_preserving_status().await?;
         Ok(())
     }
 
     /// Confirmed worktree cleanup from `DevQaCleanupConfirm` — force-remove the
     /// dirty DevQA worktree. (Esc on the prompt keeps it; see the key handler.)
     pub async fn confirm_devqa_cleanup(&mut self) -> Result<()> {
-        let Mode::DevQaCleanupConfirm(form) = &self.mode else { return Ok(()) };
+        let Mode::DevQaCleanupConfirm(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.ticket_key.clone();
         self.mode = Mode::Detail;
         let mut s = ipc::connect().await?;
         match ipc::send_request(
             &mut s,
-            &Request::CleanupDevQaWorktree { ticket_key: key.clone(), force: true },
+            &Request::CleanupDevQaWorktree {
+                ticket_key: key.clone(),
+                force: true,
+            },
         )
         .await
         {
-            Ok(Response::DevQaCleanup { message, .. }) => self.status = format!("{key} · {message}"),
-            Ok(Response::Err { message }) => self.status = format!("{key} · worktree cleanup: {message}"),
+            Ok(Response::DevQaCleanup { message, .. }) => {
+                self.status = format!("{key} · {message}")
+            }
+            Ok(Response::Err { message }) => {
+                self.status = format!("{key} · worktree cleanup: {message}")
+            }
             _ => {}
         }
         self.load_detail().await?;
@@ -3356,7 +4266,9 @@ explicitly ask.
     }
 
     pub async fn launch_claude_in_tmux(&mut self) -> Result<()> {
-        let Mode::Implementation(form) = &self.mode else { return Ok(()) };
+        let Mode::Implementation(form) = &self.mode else {
+            return Ok(());
+        };
         if std::env::var("TMUX").is_err() {
             self.status = "must be running inside tmux to launch a new window".into();
             return Ok(());
@@ -3365,57 +4277,35 @@ explicitly ask.
             self.status = "no available project path to cd into".into();
             return Ok(());
         };
-        let Some(t) = self.detail.clone() else { return Ok(()) };
+        let Some(t) = self.detail.clone() else {
+            return Ok(());
+        };
         let key = t.key.clone();
         let project_paths = form.project_paths.clone();
         let markdown = form.markdown.clone();
 
-        // Reuse an existing claude session id for this ticket if we have one
-        // (e.g. a prior `s start`); otherwise generate one now and persist it via
-        // the daemon. This way a Claude launch from "outside" — including when the
-        // ticket was started in the browser — still gets a stable session id we can
-        // resume later.
-        let mut s = ipc::connect().await?;
-        let existing = match ipc::send_request(
-            &mut s,
-            &Request::GetClaudeSession { ticket_key: key.clone() },
-        )
-        .await?
-        {
-            Response::ClaudeSession { session_id } => session_id,
-            _ => None,
-        };
-        let (session_arg, is_resume, session_id) = if let Some(id) = existing {
-            (format!("--resume {}", shell_escape(&id)), true, id)
-        } else {
-            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
-            let mut s = ipc::connect().await?;
-            let _ = ipc::send_request(
-                &mut s,
-                &Request::SaveClaudeSession {
-                    ticket_key: key.clone(),
-                    session_id: new_id.clone(),
-                },
-            )
-            .await?;
-            (format!("--session-id {}", shell_escape(&new_id)), false, new_id)
-        };
+        let assistant = code_assistant_label(&self.code_assistant);
 
-        // On resume, claude already has prior context — skip piping. On new sessions,
-        // pipe the context file as the first message.
-        let cmd = if is_resume {
-            format!("claude {session_arg}")
+        // Reuse an existing session id for assistants with explicit resume
+        // support.
+        let (session_id, is_resume) = if assistant_uses_jui_session(assistant) {
+            self.get_or_create_assistant_session(&key, assistant)
+                .await?
+        } else {
+            (String::new(), false)
+        };
+        let session_arg = code_assistant_session_arg(assistant, &session_id, is_resume);
+
+        // On resume, prior context is already in the session. On new sessions,
+        // pass the context file as the first message.
+        let cmd = if assistant_uses_jui_session(assistant) && is_resume {
+            code_assistant_launch_cmd(assistant, &session_arg, None, "")
         } else {
             let tmp_dir = std::env::temp_dir();
             let ctx_path = tmp_dir.join(format!("jui-ctx-{}.md", key));
             let context = build_claude_context(&t, &project_paths, &markdown);
             std::fs::write(&ctx_path, context)?;
-            format!(
-                "cat {ctx} | claude {session_arg}",
-                ctx = shell_escape(&ctx_path.display().to_string())
-            )
+            code_assistant_launch_cmd(assistant, &session_arg, Some(&ctx_path), "")
         };
 
         let status = std::process::Command::new("tmux")
@@ -3429,13 +4319,17 @@ explicitly ask.
             return Ok(());
         }
         let mode = if is_resume { "resumed" } else { "new" };
-        self.status = format!(
-            "claude {mode} @ {} · session {}",
-            top.display(),
-            &session_id[..8.min(session_id.len())]
-        );
+        self.status = if assistant_uses_jui_session(assistant) {
+            format!(
+                "{assistant} {mode} @ {} · session {}",
+                top.display(),
+                &session_id[..8.min(session_id.len())]
+            )
+        } else {
+            format!("{assistant} {mode} @ {}", top.display())
+        };
         if let Mode::Implementation(form) = &mut self.mode {
-            form.status_line = format!("claude {mode} in new tmux window");
+            form.status_line = format!("{assistant} {mode} in new tmux window");
         }
         Ok(())
     }
@@ -3475,14 +4369,21 @@ explicitly ask.
     }
 
     pub async fn submit_priority(&mut self) -> Result<()> {
-        let Mode::EditPriority(form) = &self.mode else { return Ok(()) };
-        let Some(name) = form.options.get(form.selected) else { return Ok(()) };
+        let Mode::EditPriority(form) = &self.mode else {
+            return Ok(());
+        };
+        let Some(name) = form.options.get(form.selected) else {
+            return Ok(());
+        };
         let key = form.key.clone();
         let priority = name.clone();
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::EditPriority { key: key.clone(), priority: priority.clone() },
+            &Request::EditPriority {
+                key: key.clone(),
+                priority: priority.clone(),
+            },
         )
         .await?;
         match resp {
@@ -3507,13 +4408,16 @@ explicitly ask.
             error: None,
         });
         let mut s = ipc::connect().await?;
-        let resp = ipc::send_request(&mut s, &Request::ListTicketProjects { ticket_key: key }).await?;
+        let resp =
+            ipc::send_request(&mut s, &Request::ListTicketProjects { ticket_key: key }).await?;
         if let Mode::TicketProjects(form) = &mut self.mode {
             match resp {
                 Response::TicketProjects { items } => {
                     form.items = items;
                     if form.items.is_empty() {
-                        form.error = Some("no projects configured · open projects (p) and add some first".into());
+                        form.error = Some(
+                            "no projects configured · open projects (p) and add some first".into(),
+                        );
                     }
                 }
                 Response::Err { message } => form.error = Some(message),
@@ -3524,14 +4428,29 @@ explicitly ask.
     }
 
     pub async fn toggle_ticket_project(&mut self) -> Result<()> {
-        let Mode::TicketProjects(form) = &self.mode else { return Ok(()) };
-        let Some(item) = form.items.get(form.selected) else { return Ok(()) };
+        let Mode::TicketProjects(form) = &self.mode else {
+            return Ok(());
+        };
+        let Some(item) = form.items.get(form.selected) else {
+            return Ok(());
+        };
+        if item.state == "worktree" {
+            self.status =
+                "worktree row is detected from git; link the base repo separately if needed".into();
+            return Ok(());
+        }
         let ticket_key = form.ticket_key.clone();
         let path = item.project.path.clone();
         let req = if item.linked {
-            Request::UnlinkProject { ticket_key: ticket_key.clone(), project_path: path.clone() }
+            Request::UnlinkProject {
+                ticket_key: ticket_key.clone(),
+                project_path: path.clone(),
+            }
         } else {
-            Request::LinkProject { ticket_key: ticket_key.clone(), project_path: path.clone() }
+            Request::LinkProject {
+                ticket_key: ticket_key.clone(),
+                project_path: path.clone(),
+            }
         };
         let was_linked = item.linked;
         let mut s = ipc::connect().await?;
@@ -3555,7 +4474,9 @@ explicitly ask.
     }
 
     pub async fn open_assign_picker(&mut self, purpose: AssignPurpose) -> Result<()> {
-        let Some(t) = self.detail.as_ref() else { return Ok(()) };
+        let Some(t) = self.detail.as_ref() else {
+            return Ok(());
+        };
         self.mode = Mode::AssignPicker(AssignPickerForm {
             key: t.key.clone(),
             purpose,
@@ -3571,13 +4492,18 @@ explicitly ask.
     pub async fn refresh_assign_picker(&mut self) -> Result<()> {
         let q = if let Mode::AssignPicker(f) = &self.mode {
             f.query.clone()
-        } else { return Ok(()); };
+        } else {
+            return Ok(());
+        };
         let mut s = ipc::connect().await?;
         if let Ok(Response::Users { items, .. }) =
             ipc::send_request(&mut s, &Request::SearchUsers { query: q }).await
         {
             if let Mode::AssignPicker(f) = &mut self.mode {
-                f.results = items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+                f.results = items
+                    .into_iter()
+                    .map(|u| (u.display_name, u.account_id))
+                    .collect();
                 if f.selected >= f.results.len() {
                     f.selected = 0;
                 }
@@ -3587,7 +4513,9 @@ explicitly ask.
     }
 
     pub async fn submit_assign_picker(&mut self) -> Result<()> {
-        let Mode::AssignPicker(form) = &self.mode else { return Ok(()) };
+        let Mode::AssignPicker(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.key.clone();
         let purpose = form.purpose;
         let picked: Option<(String, String)> = form.results.get(form.selected).cloned();
@@ -3597,6 +4525,7 @@ explicitly ask.
         let (id, display): (String, String) = match (purpose, picked, query_blank) {
             (AssignPurpose::Assignee, Some((name, id)), _) => (id, name),
             (AssignPurpose::Reviewer, Some((name, id)), _) => (id, name),
+            (AssignPurpose::DevQa, Some((name, id)), _) => (id, name),
             (AssignPurpose::Assignee, None, true) => match self.my_account_id.clone() {
                 Some(id) => (id, "(me)".into()),
                 None => {
@@ -3612,6 +4541,12 @@ explicitly ask.
                 }
                 return Ok(());
             }
+            (AssignPurpose::DevQa, None, _) => {
+                if let Mode::AssignPicker(f) = &mut self.mode {
+                    f.error = Some("pick a user - DevQA has no default".into());
+                }
+                return Ok(());
+            }
             (AssignPurpose::Assignee, None, false) => {
                 if let Mode::AssignPicker(f) = &mut self.mode {
                     f.error = Some("no matches — refine the query or pick from the list".into());
@@ -3621,8 +4556,18 @@ explicitly ask.
         };
 
         let req = match purpose {
-            AssignPurpose::Assignee => Request::AssignTicket { key: key.clone(), assignee: id },
-            AssignPurpose::Reviewer => Request::SetReviewer { key: key.clone(), assignee_id: id },
+            AssignPurpose::Assignee => Request::AssignTicket {
+                key: key.clone(),
+                assignee: id,
+            },
+            AssignPurpose::Reviewer => Request::SetReviewer {
+                key: key.clone(),
+                assignee_id: id,
+            },
+            AssignPurpose::DevQa => Request::SetDevQa {
+                key: key.clone(),
+                assignee_id: id,
+            },
         };
         let mut s = ipc::connect().await?;
         match ipc::send_request(&mut s, &req).await? {
@@ -3630,6 +4575,7 @@ explicitly ask.
                 self.status = match purpose {
                     AssignPurpose::Assignee => format!("assigned {key} to {display}"),
                     AssignPurpose::Reviewer => format!("reviewer set on {key}: {display}"),
+                    AssignPurpose::DevQa => format!("DevQA set on {key}: {display}"),
                 };
                 self.mode = Mode::Detail;
                 self.load_detail().await?;
@@ -3649,19 +4595,22 @@ explicitly ask.
     }
 
     pub async fn open_pr_create(&mut self) -> Result<()> {
-        let Some(t) = self.detail.as_ref() else { return Ok(()) };
+        let Some(t) = self.detail.as_ref() else {
+            return Ok(());
+        };
         let key = t.key.clone();
         let title = format!("{}: {}", t.key, t.summary);
-        let body = String::from(
-            "## Summary\n\n- \n\n## Test plan\n\n- [ ] \n",
-        );
+        let body = String::from("## Summary\n\n- \n\n## Test plan\n\n- [ ] \n");
+        let route_hint = self.pr_route_hint(&key, None).await.unwrap_or_default();
         // Look for a persisted draft so a /review that was interrupted by a
         // restart / crash / closed tmux pane is recoverable.
         let draft = {
             let mut s = ipc::connect().await?;
             match ipc::send_request(
                 &mut s,
-                &Request::GetPrDraft { ticket_key: key.clone() },
+                &Request::GetPrDraft {
+                    ticket_key: key.clone(),
+                },
             )
             .await?
             {
@@ -3694,6 +4643,7 @@ explicitly ask.
             body_cursor,
             suggestion: None,
             remote_pick: None,
+            route_hint,
         };
         let mut restored_state: Option<&'static str> = None;
         if let Some(d) = draft {
@@ -3719,7 +4669,8 @@ explicitly ask.
         self.mode = Mode::PrCreate(form);
         if let Some(s) = restored_state {
             self.status = if s == "reviewing" {
-                "resumed PR draft · review previously started · y submit · f fix · R re-run review".into()
+                "resumed PR draft · review previously started · y submit · f fix · R re-run review"
+                    .into()
             } else {
                 "resumed PR draft · ^S to run /review".into()
             };
@@ -3727,10 +4678,82 @@ explicitly ask.
         Ok(())
     }
 
+    async fn pr_route_hint(&self, ticket_key: &str, push_remote: Option<&str>) -> Result<String> {
+        let path = {
+            let mut s = ipc::connect().await?;
+            match ipc::send_request(
+                &mut s,
+                &Request::GetTicketWorktree {
+                    ticket_key: ticket_key.to_string(),
+                },
+            )
+            .await?
+            {
+                Response::TicketWorktree { path } => path,
+                _ => None,
+            }
+        };
+        let branch = path
+            .as_ref()
+            .and_then(|p| {
+                std::process::Command::new("git")
+                    .args(["-C", p.to_str()?, "branch", "--show-current"])
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "<branch>".into());
+        let target_repo = path
+            .as_ref()
+            .and_then(|p| {
+                std::process::Command::new("gh")
+                    .args([
+                        "repo",
+                        "view",
+                        "--json",
+                        "nameWithOwner",
+                        "-q",
+                        ".nameWithOwner",
+                    ])
+                    .current_dir(p)
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            })
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "<target repo>".into());
+        let remote = match push_remote {
+            Some(r) => Some(r.to_string()),
+            None => {
+                let mut s = ipc::connect().await?;
+                match ipc::send_request(
+                    &mut s,
+                    &Request::GetPushRemote {
+                        ticket_key: ticket_key.to_string(),
+                    },
+                )
+                .await?
+                {
+                    Response::PushRemote { name } => name,
+                    _ => None,
+                }
+            }
+        }
+        .unwrap_or_else(|| "<pick remote>".into());
+        Ok(format!(
+            "push {remote}/{branch} -> PR {target_repo}:develop"
+        ))
+    }
+
     /// Persist the in-flight PR draft so a restart or dropped tmux pane
     /// doesn't lose the user's review-gated submit.
     pub async fn save_pr_draft(&mut self) -> Result<()> {
-        let Mode::PrCreate(f) = &self.mode else { return Ok(()) };
+        let Mode::PrCreate(f) = &self.mode else {
+            return Ok(());
+        };
         let draft = jui_core::cache::PrDraft {
             title: f.title.clone(),
             body: f.body.clone(),
@@ -3749,7 +4772,10 @@ explicitly ask.
         let mut s = ipc::connect().await?;
         let _ = ipc::send_request(
             &mut s,
-            &Request::SavePrDraft { ticket_key: key, draft },
+            &Request::SavePrDraft {
+                ticket_key: key,
+                draft,
+            },
         )
         .await?;
         Ok(())
@@ -3760,7 +4786,9 @@ explicitly ask.
         let mut s = ipc::connect().await?;
         let _ = ipc::send_request(
             &mut s,
-            &Request::DeletePrDraft { ticket_key: ticket_key.to_string() },
+            &Request::DeletePrDraft {
+                ticket_key: ticket_key.to_string(),
+            },
         )
         .await?;
         Ok(())
@@ -3768,15 +4796,23 @@ explicitly ask.
 
     pub async fn refresh_pr_picker(&mut self, target_reviewer: bool) -> Result<()> {
         let q = if let Mode::PrCreate(f) = &self.mode {
-            if target_reviewer { f.reviewer_query.clone() } else { f.devqa_query.clone() }
-        } else { return Ok(()); };
+            if target_reviewer {
+                f.reviewer_query.clone()
+            } else {
+                f.devqa_query.clone()
+            }
+        } else {
+            return Ok(());
+        };
         let mut s = ipc::connect().await?;
         if let Ok(Response::Users { items, .. }) =
             ipc::send_request(&mut s, &Request::SearchUsers { query: q }).await
         {
             if let Mode::PrCreate(f) = &mut self.mode {
-                let results: Vec<(String, String)> =
-                    items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+                let results: Vec<(String, String)> = items
+                    .into_iter()
+                    .map(|u| (u.display_name, u.account_id))
+                    .collect();
                 if target_reviewer {
                     f.reviewer_results = results;
                     f.reviewer_picker_selected = 0;
@@ -3848,7 +4884,9 @@ explicitly ask.
     /// a restart can still see it. Returns `true` when something changed.
     pub fn poll_pending_pr_review(&mut self) -> bool {
         use tokio::sync::oneshot::error::TryRecvError;
-        let Some(rx) = self.pending_pr_review.as_mut() else { return false };
+        let Some(rx) = self.pending_pr_review.as_mut() else {
+            return false;
+        };
         match rx.try_recv() {
             Ok(Ok(md)) => {
                 if let Mode::PrCreate(f) = &mut self.mode {
@@ -3862,13 +4900,18 @@ explicitly ask.
                 // block the UI thread on an IPC round-trip.
                 let snapshot = if let Mode::PrCreate(f) = &self.mode {
                     Some((f.key.clone(), self.snapshot_pr_draft()))
-                } else { None };
+                } else {
+                    None
+                };
                 if let Some((key, draft)) = snapshot {
                     tokio::spawn(async move {
                         if let Ok(mut s) = ipc::connect().await {
                             let _ = ipc::send_request(
                                 &mut s,
-                                &Request::SavePrDraft { ticket_key: key, draft },
+                                &Request::SavePrDraft {
+                                    ticket_key: key,
+                                    draft,
+                                },
                             )
                             .await;
                         }
@@ -3916,7 +4959,7 @@ explicitly ask.
         }
     }
 
-    /// Open a follow-up Claude pane on the same ticket (no `/review`), so the
+    /// Open a follow-up assistant pane on the same ticket (no `/review`), so the
     /// user can resolve issues the review surfaced. Stays in `Reviewing` so a
     /// subsequent `y` still submits the PR.
     pub async fn open_pr_fix_session(&mut self) -> Result<()> {
@@ -3946,7 +4989,9 @@ explicitly ask.
             let mut s = ipc::connect().await?;
             match ipc::send_request(
                 &mut s,
-                &Request::GetPushRemote { ticket_key: ticket_key.to_string() },
+                &Request::GetPushRemote {
+                    ticket_key: ticket_key.to_string(),
+                },
             )
             .await?
             {
@@ -3955,6 +5000,13 @@ explicitly ask.
             }
         };
         if let Some(name) = cached {
+            let hint = self
+                .pr_route_hint(ticket_key, Some(&name))
+                .await
+                .unwrap_or_default();
+            if let Mode::PrCreate(f) = &mut self.mode {
+                f.route_hint = hint;
+            }
             return Ok(PushRemoteOutcome::Use(name));
         }
         // 2. No cached value — list remotes.
@@ -3962,7 +5014,9 @@ explicitly ask.
             let mut s = ipc::connect().await?;
             match ipc::send_request(
                 &mut s,
-                &Request::ListWorktreeRemotes { ticket_key: ticket_key.to_string() },
+                &Request::ListWorktreeRemotes {
+                    ticket_key: ticket_key.to_string(),
+                },
             )
             .await?
             {
@@ -3990,16 +5044,20 @@ explicitly ask.
                     },
                 )
                 .await?;
+                let hint = self
+                    .pr_route_hint(ticket_key, Some(&name))
+                    .await
+                    .unwrap_or_default();
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.route_hint = hint;
+                }
                 Ok(PushRemoteOutcome::Use(name))
             }
             _ => {
                 // Multiple — pop the picker. Default selection prefers a
                 // non-"origin" remote (assumption: user's fork). Falls back to
                 // index 0 if every remote is named "origin" somehow.
-                let default = remotes
-                    .iter()
-                    .position(|(n, _)| n != "origin")
-                    .unwrap_or(0);
+                let default = remotes.iter().position(|(n, _)| n != "origin").unwrap_or(0);
                 if let Mode::PrCreate(f) = &mut self.mode {
                     f.remote_pick = Some(RemotePickerForm {
                         items: remotes,
@@ -4019,9 +5077,15 @@ explicitly ask.
     /// remote already cached.
     pub async fn commit_remote_pick(&mut self) -> Result<()> {
         let (ticket_key, remote_name) = {
-            let Mode::PrCreate(f) = &self.mode else { return Ok(()) };
-            let Some(picker) = f.remote_pick.as_ref() else { return Ok(()) };
-            let Some((name, _)) = picker.items.get(picker.selected) else { return Ok(()) };
+            let Mode::PrCreate(f) = &self.mode else {
+                return Ok(());
+            };
+            let Some(picker) = f.remote_pick.as_ref() else {
+                return Ok(());
+            };
+            let Some((name, _)) = picker.items.get(picker.selected) else {
+                return Ok(());
+            };
             (f.key.clone(), name.clone())
         };
         let mut s = ipc::connect().await?;
@@ -4035,6 +5099,13 @@ explicitly ask.
         .await?;
         if let Mode::PrCreate(f) = &mut self.mode {
             f.remote_pick = None;
+        }
+        let hint = self
+            .pr_route_hint(&ticket_key, Some(&remote_name))
+            .await
+            .unwrap_or_default();
+        if let Mode::PrCreate(f) = &mut self.mode {
+            f.route_hint = hint;
         }
         self.status = format!("push remote saved: {remote_name}");
         // Re-fire submit — cached value picks up the new choice.
@@ -4053,8 +5124,12 @@ explicitly ask.
                 form.reviewer.as_ref().map(|(_, id)| id.clone()),
                 form.devqa.as_ref().map(|(_, id)| id.clone()),
             ))
-        } else { None };
-        let Some((key, title, body, reviewer_id, devqa_id)) = snapshot else { return Ok(()) };
+        } else {
+            None
+        };
+        let Some((key, title, body, reviewer_id, devqa_id)) = snapshot else {
+            return Ok(());
+        };
         if title.trim().is_empty() {
             if let Mode::PrCreate(f) = &mut self.mode {
                 f.error = Some("title is required".into());
@@ -4090,6 +5165,7 @@ explicitly ask.
                 self.status = format!("PR #{number} opened: {url}");
                 self.mode = Mode::Detail;
                 self.load_detail().await?;
+                self.refresh_list_preserving_status().await?;
             }
             Ok(Response::Err { message }) => {
                 // Detect "no GitHub handle mapped" and offer to set it inline.
@@ -4097,10 +5173,16 @@ explicitly ask.
                 if needs_handle {
                     // Re-borrow the form to pick the right user.
                     let target = if let Mode::PrCreate(f) = &self.mode {
-                        if message.contains("reviewer") { f.reviewer.clone() }
-                        else if message.contains("DevQA") { f.devqa.clone() }
-                        else { None }
-                    } else { None };
+                        if message.contains("reviewer") {
+                            f.reviewer.clone()
+                        } else if message.contains("DevQA") {
+                            f.devqa.clone()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    };
                     if let Some((display, id)) = target {
                         if let Mode::PrCreate(f) = &mut self.mode {
                             f.pending_handle = Some(PendingHandle {
@@ -4140,7 +5222,9 @@ explicitly ask.
     pub async fn submit_pending_handle(&mut self) -> Result<()> {
         let pending = if let Mode::PrCreate(f) = &self.mode {
             f.pending_handle.clone()
-        } else { return Ok(()); };
+        } else {
+            return Ok(());
+        };
         let Some(p) = pending else { return Ok(()) };
         if p.handle.trim().is_empty() {
             if let Mode::PrCreate(f) = &mut self.mode {
@@ -4159,7 +5243,9 @@ explicitly ask.
         .await?
         {
             Response::Ok => {
-                if let Mode::PrCreate(f) = &mut self.mode { f.pending_handle = None; }
+                if let Mode::PrCreate(f) = &mut self.mode {
+                    f.pending_handle = None;
+                }
                 self.submit_pr_create().await?;
             }
             Response::Err { message } => {
@@ -4185,8 +5271,7 @@ explicitly ask.
 
         // Build the role map first so we can tag leaves once we have the data.
         // Assigned wins over Reviewer wins over Mentioned (duplicates dropped).
-        let assigned: HashSet<String> =
-            self.tickets.iter().map(|t| t.key.clone()).collect();
+        let assigned: HashSet<String> = self.tickets.iter().map(|t| t.key.clone()).collect();
         // Drop completed PRs entirely when the K-toggle says so. Otherwise
         // keep them — the children sort below sinks them to the bottom.
         let drop_completed = !self.show_completed_prs;
@@ -4214,11 +5299,17 @@ explicitly ask.
             .filter(|k| !assigned.contains(k) && !reviewer.contains(k) && !github.contains(k))
             .collect();
         let role_for = |k: &str| -> Option<MentionRole> {
-            if assigned.contains(k) { Some(MentionRole::Assigned) }
-            else if reviewer.contains(k) { Some(MentionRole::Reviewer) }
-            else if github.contains(k) { Some(MentionRole::Github) }
-            else if mentioned.contains(k) { Some(MentionRole::Mentioned) }
-            else { None }
+            if assigned.contains(k) {
+                Some(MentionRole::Assigned)
+            } else if reviewer.contains(k) {
+                Some(MentionRole::Reviewer)
+            } else if github.contains(k) {
+                Some(MentionRole::Github)
+            } else if mentioned.contains(k) {
+                Some(MentionRole::Mentioned)
+            } else {
+                None
+            }
         };
         // Union seed: every ticket from any of the four sources.
         let mut seed: Vec<String> = Vec::new();
@@ -4247,7 +5338,10 @@ explicitly ask.
                 self.status = format!("tree err: {message}");
                 return Ok(());
             }
-            _ => { self.status = "tree: unexpected response".into(); return Ok(()); }
+            _ => {
+                self.status = "tree: unexpected response".into();
+                return Ok(());
+            }
         };
 
         let mut by_key: HashMap<String, TreeNode> = HashMap::new();
@@ -4303,9 +5397,11 @@ explicitly ask.
         let mut keys: Vec<String> = by_key.keys().cloned().collect();
         keys.sort();
         let key_to_idx: HashMap<String, usize> = keys
-            .iter().enumerate().map(|(i, k)| (k.clone(), i)).collect();
-        let mut nodes: Vec<TreeNode> = keys
-            .iter().map(|k| by_key.remove(k).unwrap()).collect();
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), i))
+            .collect();
+        let mut nodes: Vec<TreeNode> = keys.iter().map(|k| by_key.remove(k).unwrap()).collect();
 
         // Wire parent → children, identify roots. Skip self-parent (would loop).
         let mut roots: Vec<usize> = Vec::new();
@@ -4343,9 +5439,8 @@ explicitly ask.
         //   4. Issue-type weight (Story < Task < Sub-task).
         //   5. Ticket key (stable visual order).
         let states_snap = self.pr_user_states.clone();
-        let is_done = |k: &str| -> bool {
-            states_snap.get(k).copied() == Some(PrUserState::Completed)
-        };
+        let is_done =
+            |k: &str| -> bool { states_snap.get(k).copied() == Some(PrUserState::Completed) };
         for i in 0..nodes.len() {
             let mut ch = std::mem::take(&mut nodes[i].children);
             ch.sort_by(|&a, &b| {
@@ -4419,7 +5514,8 @@ explicitly ask.
         }
         if c.comment_id.is_empty() {
             self.status =
-                "comment id missing (cached before migration) — wait for next refresh and retry".into();
+                "comment id missing (cached before migration) — wait for next refresh and retry"
+                    .into();
             return Ok(());
         }
         self.status = "resolving thread…".into();
@@ -4504,7 +5600,12 @@ explicitly ask.
             if f.body.trim().is_empty() {
                 None
             } else {
-                Some((f.ticket_key.clone(), f.parent_kind.clone(), f.parent_id.clone(), f.body.clone()))
+                Some((
+                    f.ticket_key.clone(),
+                    f.parent_kind.clone(),
+                    f.parent_id.clone(),
+                    f.body.clone(),
+                ))
             }
         } else {
             None
@@ -4522,7 +5623,12 @@ explicitly ask.
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::ReplyToPrComment { ticket_key: ticket_key.clone(), parent_kind, parent_id, body },
+            &Request::ReplyToPrComment {
+                ticket_key: ticket_key.clone(),
+                parent_kind,
+                parent_id,
+                body,
+            },
         )
         .await;
         match resp {
@@ -4567,7 +5673,7 @@ explicitly ask.
         Ok(())
     }
 
-    /// Open a Claude session about the currently-selected PR comment. Resumes
+    /// Open an assistant session about the currently-selected PR comment. Resumes
     /// the ticket's stored session id (or starts fresh) and seeds the pane
     /// with `Copilot suggested this in code review: "<body>". What are your
     /// thoughts?` so the conversation begins in context.
@@ -4593,17 +5699,23 @@ explicitly ask.
                 return Ok(());
             }
         };
-        let author = if comment.author.is_empty() { "Reviewer".to_string() } else { comment.author.clone() };
+        let author = if comment.author.is_empty() {
+            "Reviewer".to_string()
+        } else {
+            comment.author.clone()
+        };
         let prompt = format!(
             "{author} suggested this in code review:\n\n\"\"\"\n{body}\n\"\"\"\n\nWhat are your thoughts?",
             body = comment.body.trim(),
         );
-        self.spawn_claude_pane(&ticket, &worktree, Some(&prompt)).await?;
-        self.status = format!("claude opened on PR comment by {author}");
+        let assistant = code_assistant_label(&self.code_assistant).to_string();
+        self.spawn_claude_pane(&ticket, &worktree, Some(&prompt))
+            .await?;
+        self.status = format!("{assistant} opened on PR comment by {author}");
         Ok(())
     }
 
-    /// Spawn (or resume) Claude Code in a tmux pane rooted at `worktree`,
+    /// Spawn (or resume) the configured code assistant in a tmux pane rooted at `worktree`,
     /// reusing the ticket's stored session id. When `initial_input` is set,
     /// a detached subshell sleeps 4s and `tmux send-keys` it as the first
     /// line so commands like `/review` or a question fire automatically.
@@ -4615,46 +5727,37 @@ explicitly ask.
         initial_input: Option<&str>,
     ) -> Result<String> {
         if std::env::var("TMUX").is_err() {
+            let assistant = code_assistant_label(&self.code_assistant);
             self.status = format!(
-                "not in tmux — run: cd {} && claude --resume",
-                worktree.display()
+                "not in tmux — run: cd {} && {}",
+                worktree.display(),
+                code_assistant_cmd(assistant, None),
             );
             return Ok(String::new());
         }
+        let assistant = code_assistant_label(&self.code_assistant);
         // Get or create the session id so future pane spawns share context.
-        let existing = {
-            let mut s = ipc::connect().await?;
-            match ipc::send_request(
-                &mut s,
-                &Request::GetClaudeSession { ticket_key: ticket_key.to_string() },
-            )
-            .await?
-            {
-                Response::ClaudeSession { session_id } => session_id,
-                _ => None,
-            }
-        };
-        let session_arg = if let Some(id) = existing.clone() {
-            format!("--resume {}", id)
-        } else {
-            let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
-            let mut s = ipc::connect().await?;
-            let _ = ipc::send_request(
-                &mut s,
-                &Request::SaveClaudeSession {
-                    ticket_key: ticket_key.to_string(),
-                    session_id: new_id.clone(),
-                },
-            )
+        let (session_id, is_resume) = self
+            .get_or_create_assistant_session(ticket_key, assistant)
             .await?;
-            format!("--session-id {new_id}")
+        let session_arg = code_assistant_session_arg(assistant, &session_id, is_resume);
+        let initial_input_path = if assistant == "opencode" {
+            if let Some(input) = initial_input {
+                let path = std::env::temp_dir().join(format!("jui-opencode-{ticket_key}.md"));
+                std::fs::write(&path, input)?;
+                Some(path)
+            } else {
+                None
+            }
+        } else {
+            None
         };
+        let launch =
+            code_assistant_launch_cmd(assistant, &session_arg, initial_input_path.as_deref(), "");
         let cmd = format!(
-            "cd {} && claude {}",
+            "cd {} && {}",
             shell_escape(&worktree.display().to_string()),
-            session_arg,
+            launch,
         );
         let width = tmux_window_width().unwrap_or(0);
         let pane = if width >= 400 {
@@ -4688,24 +5791,34 @@ explicitly ask.
             String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         // Detached send-keys after a settle delay so Claude has the REPL up.
-        if let Some(input) = initial_input {
-            let send_cmd = format!(
-                "(sleep 4; tmux send-keys -t {pane} {escaped} Enter) >/dev/null 2>&1 &",
-                pane = pane,
-                escaped = shell_escape(input),
-            );
-            let _ = std::process::Command::new("sh").arg("-c").arg(&send_cmd).spawn();
+        if assistant != "opencode" {
+            if let Some(input) = initial_input {
+                let send_cmd = format!(
+                    "(sleep 4; tmux send-keys -t {pane} {escaped} Enter) >/dev/null 2>&1 &",
+                    pane = pane,
+                    escaped = shell_escape(input),
+                );
+                let _ = std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(&send_cmd)
+                    .spawn();
+            }
         }
         Ok(pane)
     }
 
     /// Ask the daemon for the on-disk worktree path tied to a ticket. Falls
     /// back to `None` when no linked project or the worktree dir is missing.
-    pub async fn ticket_worktree(&mut self, ticket_key: &str) -> Result<Option<std::path::PathBuf>> {
+    pub async fn ticket_worktree(
+        &mut self,
+        ticket_key: &str,
+    ) -> Result<Option<std::path::PathBuf>> {
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::GetTicketWorktree { ticket_key: ticket_key.to_string() },
+            &Request::GetTicketWorktree {
+                ticket_key: ticket_key.to_string(),
+            },
         )
         .await?;
         Ok(match resp {
@@ -4767,7 +5880,12 @@ explicitly ask.
             NavFrame::Archive => self.mode = Mode::Archive,
             NavFrame::Kanban => self.mode = Mode::Kanban,
             NavFrame::Tree(form) => self.mode = Mode::Tree(*form),
-            NavFrame::Detail { ticket_key, focus, subtask_selected, comment_selected } => {
+            NavFrame::Detail {
+                ticket_key,
+                focus,
+                subtask_selected,
+                comment_selected,
+            } => {
                 if !ticket_key.is_empty() {
                     self.open_ticket_by_key(ticket_key).await?;
                 }
@@ -4928,7 +6046,9 @@ explicitly ask.
     /// Called after every add/delete/toggle so the user doesn't have to
     /// remember a save key, mirroring the active-statuses editor.
     pub fn save_rules(&mut self) -> Result<()> {
-        let Mode::Rules(form) = &self.mode else { return Ok(()) };
+        let Mode::Rules(form) = &self.mode else {
+            return Ok(());
+        };
         let items = form.items.clone();
         let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
         cfg.rules = items;
@@ -4969,6 +6089,7 @@ explicitly ask.
             default_create_status: self.default_create_status.clone(),
             all_mine_exclude_status: self.all_mine_exclude_status.clone(),
             pr_submit_status: self.pr_submit_status.clone(),
+            code_assistant: self.code_assistant.clone(),
             claude_permission_mode: self.claude_permission_mode.clone(),
             picker: None,
         });
@@ -4984,21 +6105,24 @@ explicitly ask.
                 0 => form.default_create_status.clone(),
                 1 => form.all_mine_exclude_status.clone(),
                 2 => form.pr_submit_status.clone(),
-                3 => form.claude_permission_mode.clone(),
+                3 => form.code_assistant.clone(),
+                4 => form.claude_permission_mode.clone(),
                 _ => String::new(),
             };
             (form.selected, cur)
         } else {
             return Ok(());
         };
-        // Row 3 (Claude permission mode) picks from a fixed list — no daemon
+        // Rows 3–4 pick from fixed lists — no daemon
         // round-trip, the options are baked into the binary.
-        if row == 3 {
+        if row == 3 || row == 4 {
             if let Mode::Settings(form) = &mut self.mode {
-                let all: Vec<String> = jui_core::config::CLAUDE_PERMISSION_MODES
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect();
+                let source = if row == 3 {
+                    jui_core::config::CODE_ASSISTANTS
+                } else {
+                    jui_core::config::CLAUDE_PERMISSION_MODES
+                };
+                let all: Vec<String> = source.iter().map(|s| s.to_string()).collect();
                 let selected = all
                     .iter()
                     .position(|m| m.eq_ignore_ascii_case(&current))
@@ -5031,19 +6155,17 @@ explicitly ask.
             ipc::send_request(&mut s, &Request::ListStatuses).await?
         };
         if let Mode::Settings(form) = &mut self.mode {
-            let Some(p) = form.picker.as_mut() else { return Ok(()) };
+            let Some(p) = form.picker.as_mut() else {
+                return Ok(());
+            };
             p.loading = false;
             match resp {
                 Response::Statuses { items } => {
-                    if let Some(pos) = items
-                        .iter()
-                        .position(|s| s.eq_ignore_ascii_case(&current))
-                    {
+                    if let Some(pos) = items.iter().position(|s| s.eq_ignore_ascii_case(&current)) {
                         p.selected = pos;
                     }
                     p.all = items;
-                    self.status =
-                        "type: filter · j/k: move · enter: pick · esc: cancel".into();
+                    self.status = "type: filter · j/k: move · enter: pick · esc: cancel".into();
                 }
                 Response::Err { message } => {
                     p.error = Some(message.clone());
@@ -5061,25 +6183,29 @@ explicitly ask.
     /// Persist the current settings form back to `GlobalConfig.workflow` and
     /// refresh the cached fields on `App`.
     pub fn save_settings(&mut self) -> Result<()> {
-        let (create, exclude, pr_submit, perm_mode) = if let Mode::Settings(form) = &self.mode {
-            (
-                form.default_create_status.clone(),
-                form.all_mine_exclude_status.clone(),
-                form.pr_submit_status.clone(),
-                form.claude_permission_mode.clone(),
-            )
-        } else {
-            return Ok(());
-        };
+        let (create, exclude, pr_submit, assistant, perm_mode) =
+            if let Mode::Settings(form) = &self.mode {
+                (
+                    form.default_create_status.clone(),
+                    form.all_mine_exclude_status.clone(),
+                    form.pr_submit_status.clone(),
+                    form.code_assistant.clone(),
+                    form.claude_permission_mode.clone(),
+                )
+            } else {
+                return Ok(());
+            };
         let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
         cfg.workflow.default_create_status = create.clone();
         cfg.workflow.all_mine_exclude_status = exclude.clone();
         cfg.workflow.pr_submit_status = pr_submit.clone();
+        cfg.workflow.code_assistant = code_assistant_label(&assistant).to_string();
         cfg.workflow.claude_permission_mode = perm_mode.clone();
         cfg.save()?;
         self.default_create_status = create;
         self.all_mine_exclude_status = exclude;
         self.pr_submit_status = pr_submit;
+        self.code_assistant = code_assistant_label(&assistant).to_string();
         self.claude_permission_mode = perm_mode;
         Ok(())
     }
@@ -5088,7 +6214,9 @@ explicitly ask.
     /// refresh the app's in-memory copy. Called after every add/delete so the
     /// user doesn't have to remember a "save" key.
     pub fn save_active_statuses(&mut self) -> Result<()> {
-        let Mode::ActiveStatusConfig(form) = &self.mode else { return Ok(()) };
+        let Mode::ActiveStatusConfig(form) = &self.mode else {
+            return Ok(());
+        };
         let items = form.items.clone();
         let mut cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
         cfg.workflow.active_statuses = items.clone();
@@ -5108,7 +6236,11 @@ explicitly ask.
             }
             _ => vec![],
         };
-        self.mode = Mode::Projects(ProjectsForm { items, selected: 0, pending_remove: None });
+        self.mode = Mode::Projects(ProjectsForm {
+            items,
+            selected: 0,
+            pending_remove: None,
+        });
         Ok(())
     }
 
@@ -5123,7 +6255,10 @@ explicitly ask.
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::ScanRepos { root: PathBuf::new(), max_depth: 6 },
+            &Request::ScanRepos {
+                root: PathBuf::new(),
+                max_depth: 6,
+            },
         )
         .await?;
         if let Mode::ProjectsAdd(form) = &mut self.mode {
@@ -5144,15 +6279,24 @@ explicitly ask.
     }
 
     pub async fn submit_add_project(&mut self) -> Result<()> {
-        let Mode::ProjectsAdd(form) = &self.mode else { return Ok(()) };
+        let Mode::ProjectsAdd(form) = &self.mode else {
+            return Ok(());
+        };
         let filtered = form.filtered();
-        let Some(idx) = filtered.get(form.selected) else { return Ok(()) };
-        let Some(repo) = form.repos.get(*idx) else { return Ok(()) };
+        let Some(idx) = filtered.get(form.selected) else {
+            return Ok(());
+        };
+        let Some(repo) = form.repos.get(*idx) else {
+            return Ok(());
+        };
         let path = repo.path.clone();
         let mut s = ipc::connect().await?;
         let resp = ipc::send_request(
             &mut s,
-            &Request::AddProject { path: path.clone(), nickname: None },
+            &Request::AddProject {
+                path: path.clone(),
+                nickname: None,
+            },
         )
         .await?;
         match resp {
@@ -5167,11 +6311,16 @@ explicitly ask.
     }
 
     pub async fn remove_selected_project(&mut self) -> Result<()> {
-        let Mode::Projects(form) = &self.mode else { return Ok(()) };
-        let Some(p) = form.items.get(form.selected) else { return Ok(()) };
+        let Mode::Projects(form) = &self.mode else {
+            return Ok(());
+        };
+        let Some(p) = form.items.get(form.selected) else {
+            return Ok(());
+        };
         let path = p.path.clone();
         let mut s = ipc::connect().await?;
-        let resp = ipc::send_request(&mut s, &Request::RemoveProject { path: path.clone() }).await?;
+        let resp =
+            ipc::send_request(&mut s, &Request::RemoveProject { path: path.clone() }).await?;
         match resp {
             Response::Ok => {
                 self.status = format!("removed {}", path.display());
@@ -5184,7 +6333,9 @@ explicitly ask.
     }
 
     pub async fn submit_edit_time(&mut self) -> Result<()> {
-        let Mode::EditTime(form) = &self.mode else { return Ok(()) };
+        let Mode::EditTime(form) = &self.mode else {
+            return Ok(());
+        };
         let key = form.key.clone();
         let original = trim_to_opt(&form.original_estimate);
         let log = trim_to_opt(&form.log_work);
@@ -5244,20 +6395,56 @@ explicitly ask.
     }
 
     pub async fn submit_transition(&mut self) -> Result<()> {
-        let Mode::Transition(form) = &self.mode else { return Ok(()) };
-        let Some(opt) = form.options.get(form.selected) else { return Ok(()) };
+        let Mode::Transition(form) = &self.mode else {
+            return Ok(());
+        };
+        let Some(opt) = form.options.get(form.selected) else {
+            return Ok(());
+        };
         let key = form.key.clone();
-        // jira-cli's `issue move` matches against the *transition name* (e.g. "Start Code
-        // Review"), not the destination status (e.g. "Code Rvw"). They're often the same
-        // string, but not always.
-        let target = opt.name.clone();
-        let req = Request::Transition { key: key.clone(), to: target.clone() };
+        // When multiple transitions land on the same destination status,
+        // Jira workflows commonly expose a generic one (literally named
+        // "Next") alongside a specific one (e.g. "Start Progress" landing
+        // on "In Progress"). The generic transition is often wired up to
+        // server-side post-functions / Automation rules (WIP-limit mirrors,
+        // assignee bumps, etc.) that the specific one is not. The Jira web
+        // UI's status button always fires the *specific* transition; the
+        // picker modal exposes both, so a user selecting "Next" silently
+        // gets the side-effects.
+        //
+        // Prefer the specific sibling when the user picks a generic one
+        // (currently: "Next") that has a same-destination peer. The peer
+        // is chosen by: (1) name == destination status (case-insensitive),
+        // (2) name != "Next" otherwise. Logs which substitution was made
+        // so /tmp/jui.log shows the rewrite.
+        let preferred = pick_preferred_transition(&form.options, opt);
+        let chosen = preferred.unwrap_or(opt);
+        if !std::ptr::eq(chosen, opt) {
+            tracing::info!(
+                key = %key,
+                from = %opt.name,
+                from_dest = ?opt.to_status,
+                to = %chosen.name,
+                to_dest = ?chosen.to_status,
+                "transition picker: rewrote generic 'Next' to specific peer to avoid post-function side-effects"
+            );
+        }
+        // jira-cli's `issue move` matches against the *transition name* (e.g.
+        // "Start Code Review"), not the destination status (e.g. "Code Rvw").
+        let target = chosen.name.clone();
+        let to_status = chosen.to_status.clone();
+        let req = Request::Transition {
+            key: key.clone(),
+            to: target.clone(),
+        };
         let mut s = ipc::connect().await?;
         match ipc::send_request(&mut s, &req).await? {
             Response::Ok => {
-                self.status = format!("{} → {}", key, target);
+                let label = to_status.unwrap_or_else(|| target.clone());
+                self.status = format!("{} → {}", key, label);
                 self.mode = Mode::Detail;
                 self.load_detail().await?;
+                self.refresh_list_preserving_status().await?;
             }
             Response::Err { message } => self.status = format!("err: {message}"),
             _ => self.status = "unexpected response".into(),
@@ -5272,15 +6459,16 @@ explicitly ask.
             loading: true,
             error: None,
         });
-        let result: Result<Vec<_>> = match try_ipc_for_confluence(&ipc::Request::ConfluenceListSpaces).await {
-            Some(ConfluenceData::Spaces(s)) => Ok(s),
-            Some(_) | None => {
-                match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
-                    Ok(api) => api.list_spaces().await,
-                    Err(e) => Err(e),
+        let result: Result<Vec<_>> =
+            match try_ipc_for_confluence(&ipc::Request::ConfluenceListSpaces).await {
+                Some(ConfluenceData::Spaces(s)) => Ok(s),
+                Some(_) | None => {
+                    match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+                        Ok(api) => api.list_spaces().await,
+                        Err(e) => Err(e),
+                    }
                 }
-            }
-        };
+            };
         if let Mode::ConfluenceSpaces(form) = &mut self.mode {
             form.loading = false;
             match result {
@@ -5291,7 +6479,11 @@ explicitly ask.
         Ok(())
     }
 
-    pub async fn open_confluence_pages(&mut self, space_key: String, space_name: String) -> Result<()> {
+    pub async fn open_confluence_pages(
+        &mut self,
+        space_key: String,
+        space_name: String,
+    ) -> Result<()> {
         self.mode = Mode::ConfluencePages(ConfluencePagesForm {
             space_key: space_key.clone(),
             space_name,
@@ -5308,15 +6500,16 @@ explicitly ask.
             search_error: None,
             search_submitted: false,
         });
-        let req = ipc::Request::ConfluenceListPages { space_key: space_key.clone(), parent_id: None };
+        let req = ipc::Request::ConfluenceListPages {
+            space_key: space_key.clone(),
+            parent_id: None,
+        };
         let result: Result<Vec<_>> = match try_ipc_for_confluence(&req).await {
             Some(ConfluenceData::Pages(p)) => Ok(p),
-            Some(_) | None => {
-                match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
-                    Ok(api) => api.list_pages(&space_key).await,
-                    Err(e) => Err(e),
-                }
-            }
+            Some(_) | None => match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+                Ok(api) => api.list_pages(&space_key).await,
+                Err(e) => Err(e),
+            },
         };
         if let Mode::ConfluencePages(form) = &mut self.mode {
             form.loading = false;
@@ -5330,7 +6523,9 @@ explicitly ask.
 
     pub async fn open_page_view(&mut self) -> Result<()> {
         let (page_id, space_key, prev_pages) = {
-            let Mode::ConfluencePages(form) = &self.mode else { return Ok(()) };
+            let Mode::ConfluencePages(form) = &self.mode else {
+                return Ok(());
+            };
             let page = if form.search_active {
                 form.search_results.get(form.search_selected)
             } else {
@@ -5358,14 +6553,21 @@ explicitly ask.
         self.status = "fetching…".into();
         let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
             Ok(a) => a,
-            Err(e) => { self.status = format!("config error: {e:#}"); return Ok(()); }
+            Err(e) => {
+                self.status = format!("config error: {e:#}");
+                return Ok(());
+            }
         };
         let (title, html) = match api.get_page_html(&page_id).await {
             Ok(r) => r,
-            Err(e) => { self.status = format!("fetch error: {e:#}"); return Ok(()); }
+            Err(e) => {
+                self.status = format!("fetch error: {e:#}");
+                return Ok(());
+            }
         };
         let token = jui_core::confluence_api::ConfluenceApi::api_token().unwrap_or_default();
-        let html = download_confluence_images(&html, &api.server, &api.login, &token, &page_id).await;
+        let html =
+            download_confluence_images(&html, &api.server, &api.login, &token, &page_id).await;
         let markdown = html_to_markdown(&html);
         let term_cols = crossterm::terminal::size().map(|(w, _)| w).unwrap_or(120);
         let img_cols = term_cols.saturating_sub(4).max(40);
@@ -5411,7 +6613,9 @@ explicitly ask.
     }
 
     pub async fn page_view_open_editor(&mut self) -> Result<()> {
-        let Mode::PageView(form) = &self.mode else { return Ok(()) };
+        let Mode::PageView(form) = &self.mode else {
+            return Ok(());
+        };
         if std::env::var("TMUX").is_err() {
             self.status = "not in tmux — start jui inside a tmux session".into();
             return Ok(());
@@ -5425,7 +6629,11 @@ explicitly ask.
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
         let cmd = format!("{} {}", editor, shell_escape(&path));
         let st = std::process::Command::new("tmux")
-            .args(["split-window", "-h", &format!("sh -lc {}", shell_escape(&cmd))])
+            .args([
+                "split-window",
+                "-h",
+                &format!("sh -lc {}", shell_escape(&cmd)),
+            ])
             .status()?;
         if st.success() {
             self.status = format!("'{}' open in pane — S to sync back", form.title);
@@ -5437,7 +6645,9 @@ explicitly ask.
 
     pub async fn page_view_sync(&mut self) -> Result<()> {
         let (page_id, title) = {
-            let Mode::PageView(form) = &self.mode else { return Ok(()) };
+            let Mode::PageView(form) = &self.mode else {
+                return Ok(());
+            };
             (form.page_id.clone(), form.title.clone())
         };
         let path = format!("/tmp/confluence-{}.md", page_id);
@@ -5447,11 +6657,24 @@ explicitly ask.
         }
         let api = match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
             Ok(a) => a,
-            Err(e) => { self.status = format!("config error: {e:#}"); return Ok(()); }
+            Err(e) => {
+                self.status = format!("config error: {e:#}");
+                return Ok(());
+            }
         };
         let token = jui_core::confluence_api::ConfluenceApi::api_token().unwrap_or_default();
         let out = std::process::Command::new("mark")
-            .args(["-u", &api.login, "-p", &token, "-b", &api.server, "-f", &path, "--minor-edit"])
+            .args([
+                "-u",
+                &api.login,
+                "-p",
+                &token,
+                "-b",
+                &api.server,
+                "-f",
+                &path,
+                "--minor-edit",
+            ])
             .output()?;
         if out.status.success() {
             self.status = format!("synced '{}' to Confluence", title);
@@ -5464,8 +6687,12 @@ explicitly ask.
 
     pub async fn confluence_drill_down(&mut self) -> Result<()> {
         let (page_id, space_key) = {
-            let Mode::ConfluencePages(form) = &mut self.mode else { return Ok(()) };
-            let Some(page) = form.pages.get(form.selected) else { return Ok(()) };
+            let Mode::ConfluencePages(form) = &mut self.mode else {
+                return Ok(());
+            };
+            let Some(page) = form.pages.get(form.selected) else {
+                return Ok(());
+            };
             let id = page.id.clone();
             let title = page.title.clone();
             form.breadcrumb.push((id.clone(), title));
@@ -5473,15 +6700,16 @@ explicitly ask.
             form.error = None;
             (id, form.space_key.clone())
         };
-        let req = ipc::Request::ConfluenceListPages { space_key, parent_id: Some(page_id.clone()) };
+        let req = ipc::Request::ConfluenceListPages {
+            space_key,
+            parent_id: Some(page_id.clone()),
+        };
         let result: Result<Vec<_>> = match try_ipc_for_confluence(&req).await {
             Some(ConfluenceData::Pages(p)) => Ok(p),
-            Some(_) | None => {
-                match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
-                    Ok(api) => api.get_children(&page_id).await,
-                    Err(e) => Err(e),
-                }
-            }
+            Some(_) | None => match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+                Ok(api) => api.get_children(&page_id).await,
+                Err(e) => Err(e),
+            },
         };
         if let Mode::ConfluencePages(form) = &mut self.mode {
             form.loading = false;
@@ -5499,25 +6727,28 @@ explicitly ask.
 
     pub async fn confluence_go_back(&mut self) -> Result<()> {
         let (space_key, parent_id) = {
-            let Mode::ConfluencePages(form) = &mut self.mode else { return Ok(()) };
+            let Mode::ConfluencePages(form) = &mut self.mode else {
+                return Ok(());
+            };
             form.breadcrumb.pop();
             let parent_id = form.breadcrumb.last().map(|(id, _)| id.clone());
             form.loading = true;
             form.error = None;
             (form.space_key.clone(), parent_id)
         };
-        let req = ipc::Request::ConfluenceListPages { space_key: space_key.clone(), parent_id: parent_id.clone() };
+        let req = ipc::Request::ConfluenceListPages {
+            space_key: space_key.clone(),
+            parent_id: parent_id.clone(),
+        };
         let result: Result<Vec<_>> = match try_ipc_for_confluence(&req).await {
             Some(ConfluenceData::Pages(p)) => Ok(p),
-            Some(_) | None => {
-                match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
-                    Ok(api) => match parent_id {
-                        Some(ref id) => api.get_children(id).await,
-                        None => api.list_pages(&space_key).await,
-                    },
-                    Err(e) => Err(e),
-                }
-            }
+            Some(_) | None => match jui_core::confluence_api::ConfluenceApi::from_jira_config() {
+                Ok(api) => match parent_id {
+                    Some(ref id) => api.get_children(id).await,
+                    None => api.list_pages(&space_key).await,
+                },
+                Err(e) => Err(e),
+            },
         };
         if let Mode::ConfluencePages(form) = &mut self.mode {
             form.loading = false;
@@ -5536,7 +6767,9 @@ explicitly ask.
 
     pub async fn confluence_search(&mut self) -> Result<()> {
         let (space_key, ancestor_id, query) = {
-            let Mode::ConfluencePages(form) = &mut self.mode else { return Ok(()) };
+            let Mode::ConfluencePages(form) = &mut self.mode else {
+                return Ok(());
+            };
             if form.search_query.trim().is_empty() {
                 return Ok(());
             }
@@ -5555,7 +6788,9 @@ explicitly ask.
                 return Ok(());
             }
         };
-        let result = api.search_pages(&space_key, ancestor_id.as_deref(), &query).await;
+        let result = api
+            .search_pages(&space_key, ancestor_id.as_deref(), &query)
+            .await;
         if let Mode::ConfluencePages(form) = &mut self.mode {
             form.search_loading = false;
             form.search_selected = 0;
@@ -5572,7 +6807,9 @@ explicitly ask.
 
     pub async fn confluence_sync(&mut self) -> Result<()> {
         let page_id = {
-            let Mode::ConfluencePages(form) = &self.mode else { return Ok(()) };
+            let Mode::ConfluencePages(form) = &self.mode else {
+                return Ok(());
+            };
             let page = if form.search_active {
                 form.search_results.get(form.search_selected)
             } else {
@@ -5599,10 +6836,14 @@ explicitly ask.
         self.status = "syncing…".into();
         let result = tokio::process::Command::new("mark")
             .args([
-                "-u", &api.login,
-                "-p", &token,
-                "-b", &api.server,
-                "-f", &path,
+                "-u",
+                &api.login,
+                "-p",
+                &token,
+                "-b",
+                &api.server,
+                "-f",
+                &path,
                 "--minor-edit",
             ])
             .stdout(std::process::Stdio::null())
@@ -5634,9 +6875,15 @@ fn md_style(
 ) -> ratatui::style::Style {
     use ratatui::style::{Color, Modifier};
     let mut s = base;
-    if bold  { s = s.add_modifier(Modifier::BOLD); }
-    if italic { s = s.add_modifier(Modifier::ITALIC); }
-    if link  { s = s.fg(Color::Blue).add_modifier(Modifier::UNDERLINED); }
+    if bold {
+        s = s.add_modifier(Modifier::BOLD);
+    }
+    if italic {
+        s = s.add_modifier(Modifier::ITALIC);
+    }
+    if link {
+        s = s.fg(Color::Blue).add_modifier(Modifier::UNDERLINED);
+    }
     s
 }
 
@@ -5644,11 +6891,19 @@ fn md_style(
 /// assignee picker. Errors are swallowed — picker stays as-is on transport problems.
 async fn refresh_assignee_picker(app: &mut App, query: &str) -> Result<()> {
     let mut s = ipc::connect().await?;
-    if let Ok(Response::Users { items, .. }) =
-        ipc::send_request(&mut s, &Request::SearchUsers { query: query.to_string() }).await
+    if let Ok(Response::Users { items, .. }) = ipc::send_request(
+        &mut s,
+        &Request::SearchUsers {
+            query: query.to_string(),
+        },
+    )
+    .await
     {
         if let Mode::Create(f) = &mut app.mode {
-            f.assignee_results = items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+            f.assignee_results = items
+                .into_iter()
+                .map(|u| (u.display_name, u.account_id))
+                .collect();
             if f.assignee_picker_selected >= f.assignee_results.len() {
                 f.assignee_picker_selected = 0;
             }
@@ -5658,7 +6913,7 @@ async fn refresh_assignee_picker(app: &mut App, query: &str) -> Result<()> {
 }
 
 /// "Started" if the ticket is in an active workflow status OR a worktree exists for it
-/// at the conventional `<repo>/../<repo-name>-worktrees/<slug>` path.
+/// at the conventional `<repo>/worktrees/<slug>` path.
 /// Best-effort: does the current Detail ticket already have a GitHub PR
 /// associated with it? Used to suppress the `P` (open PR) keybind so the user
 /// doesn't re-open a PR for a ticket where one already exists.
@@ -5666,16 +6921,8 @@ async fn refresh_assignee_picker(app: &mut App, query: &str) -> Result<()> {
 /// Heuristics:
 ///   1. Cached PR comments are non-empty (daemon's github mentions refresh
 ///      populates these when the ticket's branch matches a known PR).
-///   2. Any Jira comment body contains a `github.com/.../pull/<n>` URL — we
-///      post this ourselves whenever the user opens a PR via `P`.
 pub fn ticket_has_pr(app: &App) -> bool {
-    if !app.pr_comments.is_empty() || app.detail_pr_link.is_some() {
-        return true;
-    }
-    app.comments.iter().any(|c| {
-        let b = &c.body;
-        b.contains("github.com/") && b.contains("/pull/")
-    })
+    !app.pr_comments.is_empty() || app.detail_pr_link.is_some()
 }
 
 /// True when the currently-open ticket's Jira status indicates DevQA has been
@@ -5689,6 +6936,66 @@ pub fn ticket_devqa_in_progress(app: &App) -> bool {
         .unwrap_or(false)
 }
 
+pub fn detail_ticket_assigned_to_me(app: &App) -> bool {
+    let Some(t) = app.detail.as_ref() else {
+        return false;
+    };
+    if let Some(me) = app.my_display_name.as_deref() {
+        if t.assignee.as_deref() == Some(me) {
+            return true;
+        }
+    }
+    app.tickets.iter().any(|mine| mine.key == t.key)
+}
+
+/// When the user selects a transition from the picker modal, prefer a
+/// more-specific same-destination sibling over a generic "Next" pick.
+///
+/// Returns `Some(better)` if a better candidate exists, else `None`
+/// (caller should keep the user's original pick).
+///
+/// Rationale: Jira workflows expose generic transitions (often literally
+/// named "Next") that move between adjacent states. They're frequently
+/// the carrier for project-level Automation rules / post-functions
+/// (WIP-limit mirrors, assignee bumps, ticket re-status side-effects)
+/// while the same destination's named transition (e.g. "Start Progress"
+/// landing on "In Progress") is the clean one the web UI uses. Picking
+/// "Next" from the modal therefore appears to "just work" but silently
+/// triggers cross-ticket side-effects.
+///
+/// Selection rules (only triggers when `opt.name` is the generic "Next"):
+///   1. A peer landing on the same `to_status` whose `name` equals its
+///      own `to_status` (case-insensitive) — the most "natural" pairing.
+///   2. Any peer landing on the same `to_status` whose `name` is not
+///      "Next" — at least more specific than the generic.
+fn pick_preferred_transition<'a>(
+    options: &'a [TransitionOption],
+    opt: &'a TransitionOption,
+) -> Option<&'a TransitionOption> {
+    if !opt.name.eq_ignore_ascii_case("Next") {
+        return None;
+    }
+    let dest = opt.to_status.as_deref()?;
+    let same_dest = |tr: &&TransitionOption| -> bool {
+        tr.to_status
+            .as_deref()
+            .map(|s| s.eq_ignore_ascii_case(dest))
+            .unwrap_or(false)
+            && !std::ptr::eq(*tr, opt)
+    };
+    if let Some(tr) = options
+        .iter()
+        .filter(same_dest)
+        .find(|tr| tr.name.eq_ignore_ascii_case(dest))
+    {
+        return Some(tr);
+    }
+    options
+        .iter()
+        .filter(same_dest)
+        .find(|tr| !tr.name.eq_ignore_ascii_case("Next"))
+}
+
 /// True when `t.status` matches one of the user-configured active workflow
 /// states (case-insensitive). Configured via `Mode::ActiveStatusConfig` →
 /// `GlobalConfig.workflow.active_statuses`.
@@ -5700,7 +7007,10 @@ pub fn ticket_status_active(status: &str, active_statuses: &[String]) -> bool {
 }
 
 fn is_epic(n: &TreeNode) -> bool {
-    n.issue_type.as_deref().map(|t| t.eq_ignore_ascii_case("epic")).unwrap_or(false)
+    n.issue_type
+        .as_deref()
+        .map(|t| t.eq_ignore_ascii_case("epic"))
+        .unwrap_or(false)
 }
 
 /// Lower number = sorted earlier (closer to top of children list).
@@ -5719,10 +7029,14 @@ fn walk_depth(nodes: &mut [TreeNode], root: usize, root_depth: u16) {
     let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut stack: Vec<(usize, u16)> = vec![(root, root_depth)];
     while let Some((idx, depth)) = stack.pop() {
-        if !visited.insert(idx) { continue; }
+        if !visited.insert(idx) {
+            continue;
+        }
         nodes[idx].depth = depth;
         for &c in &nodes[idx].children.clone() {
-            if !visited.contains(&c) { stack.push((c, depth + 1)); }
+            if !visited.contains(&c) {
+                stack.push((c, depth + 1));
+            }
         }
     }
 }
@@ -5732,7 +7046,9 @@ pub fn recompute_tree_visible(form: &mut TreeForm) {
     let mut out = Vec::new();
     let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let roots = form.roots.clone();
-    for r in roots { push_visible(&form.nodes, r, &mut out, &mut visited); }
+    for r in roots {
+        push_visible(&form.nodes, r, &mut out, &mut visited);
+    }
     if form.selected >= out.len() && !out.is_empty() {
         form.selected = out.len() - 1;
     }
@@ -5745,10 +7061,14 @@ fn push_visible(
     out: &mut Vec<usize>,
     visited: &mut std::collections::HashSet<usize>,
 ) {
-    if !visited.insert(idx) { return; }
+    if !visited.insert(idx) {
+        return;
+    }
     out.push(idx);
     if nodes[idx].expanded {
-        for &c in &nodes[idx].children { push_visible(nodes, c, out, visited); }
+        for &c in &nodes[idx].children {
+            push_visible(nodes, c, out, visited);
+        }
     }
 }
 
@@ -5783,9 +7103,15 @@ pub fn markdown_to_page_lines(
             Event::Start(Tag::Heading { level, .. }) => {
                 md_flush(&mut result, &mut current);
                 base_style = match level {
-                    HeadingLevel::H1 => Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
-                    HeadingLevel::H2 => Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD),
-                    HeadingLevel::H3 => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+                    HeadingLevel::H1 => Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    HeadingLevel::H2 => Style::default()
+                        .fg(Color::LightBlue)
+                        .add_modifier(Modifier::BOLD),
+                    HeadingLevel::H3 => Style::default()
+                        .fg(Color::Blue)
+                        .add_modifier(Modifier::BOLD),
                     _ => Style::default().add_modifier(Modifier::BOLD),
                 };
                 let hashes = "#".repeat(level as usize) + " ";
@@ -5826,7 +7152,9 @@ pub fn markdown_to_page_lines(
                 base_style = Style::default();
                 result.push(PageLine::Blank);
             }
-            Event::Start(Tag::BlockQuote(_)) => { in_blockquote = true; }
+            Event::Start(Tag::BlockQuote(_)) => {
+                in_blockquote = true;
+            }
             Event::End(TagEnd::BlockQuote(_)) => {
                 md_flush(&mut result, &mut current);
                 in_blockquote = false;
@@ -5837,35 +7165,62 @@ pub fn markdown_to_page_lines(
             }
             Event::End(TagEnd::List(_)) => {
                 list_stack.pop();
-                if list_stack.is_empty() { result.push(PageLine::Blank); }
+                if list_stack.is_empty() {
+                    result.push(PageLine::Blank);
+                }
             }
             Event::Start(Tag::Item) => {
                 md_flush(&mut result, &mut current);
                 let depth = list_stack.len().saturating_sub(1);
                 let indent = "  ".repeat(depth);
-                if in_blockquote { current.push(Span::styled("│ ".to_string(), Style::default().fg(Color::DarkGray))); }
+                if in_blockquote {
+                    current.push(Span::styled(
+                        "│ ".to_string(),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
                 if let Some(counter) = list_stack.last_mut() {
                     match counter {
                         Some(n) => {
                             *n += 1;
                             let num = *n;
                             current.push(Span::raw(indent));
-                            current.push(Span::styled(format!("{}. ", num), Style::default().fg(Color::Yellow)));
+                            current.push(Span::styled(
+                                format!("{}. ", num),
+                                Style::default().fg(Color::Yellow),
+                            ));
                         }
                         None => {
                             current.push(Span::raw(indent));
-                            current.push(Span::styled("• ".to_string(), Style::default().fg(Color::Yellow)));
+                            current.push(Span::styled(
+                                "• ".to_string(),
+                                Style::default().fg(Color::Yellow),
+                            ));
                         }
                     }
                 }
             }
-            Event::End(TagEnd::Item) => { md_flush(&mut result, &mut current); }
-            Event::Start(Tag::Strong) => { bold = true; }
-            Event::End(TagEnd::Strong) => { bold = false; }
-            Event::Start(Tag::Emphasis) => { italic = true; }
-            Event::End(TagEnd::Emphasis) => { italic = false; }
-            Event::Start(Tag::Link { .. }) => { in_link = true; }
-            Event::End(TagEnd::Link) => { in_link = false; }
+            Event::End(TagEnd::Item) => {
+                md_flush(&mut result, &mut current);
+            }
+            Event::Start(Tag::Strong) => {
+                bold = true;
+            }
+            Event::End(TagEnd::Strong) => {
+                bold = false;
+            }
+            Event::Start(Tag::Emphasis) => {
+                italic = true;
+            }
+            Event::End(TagEnd::Emphasis) => {
+                italic = false;
+            }
+            Event::Start(Tag::Link { .. }) => {
+                in_link = true;
+            }
+            Event::End(TagEnd::Link) => {
+                in_link = false;
+            }
             Event::Start(Tag::Image { dest_url, .. }) => {
                 in_image = true;
                 image_url = dest_url.to_string();
@@ -5908,24 +7263,38 @@ pub fn markdown_to_page_lines(
                 ));
             }
             Event::Text(text) => {
-                if in_image { continue; }
+                if in_image {
+                    continue;
+                }
                 if in_code_block {
                     for (i, line) in text.split('\n').enumerate() {
-                        if i > 0 { md_flush(&mut result, &mut current); }
+                        if i > 0 {
+                            md_flush(&mut result, &mut current);
+                        }
                         current.push(Span::styled("  ".to_string(), Style::default()));
                         current.push(Span::styled(line.to_string(), base_style));
                     }
                 } else {
                     if in_blockquote && current.is_empty() {
-                        current.push(Span::styled("│ ".to_string(), Style::default().fg(Color::DarkGray)));
+                        current.push(Span::styled(
+                            "│ ".to_string(),
+                            Style::default().fg(Color::DarkGray),
+                        ));
                     }
-                    current.push(Span::styled(text.to_string(), md_style(base_style, bold, italic, in_link)));
+                    current.push(Span::styled(
+                        text.to_string(),
+                        md_style(base_style, bold, italic, in_link),
+                    ));
                 }
             }
             Event::SoftBreak => {
-                if !in_code_block { current.push(Span::raw(" ")); }
+                if !in_code_block {
+                    current.push(Span::raw(" "));
+                }
             }
-            Event::HardBreak => { md_flush(&mut result, &mut current); }
+            Event::HardBreak => {
+                md_flush(&mut result, &mut current);
+            }
             Event::Rule => {
                 md_flush(&mut result, &mut current);
                 result.push(PageLine::Spans(vec![Span::styled(
@@ -5950,9 +7319,13 @@ pub fn page_line_plain_text(line: &PageLine) -> String {
 }
 
 pub fn find_page_search_matches(lines: &[PageLine], query: &str) -> Vec<usize> {
-    if query.is_empty() { return vec![]; }
+    if query.is_empty() {
+        return vec![];
+    }
     let q = query.to_ascii_lowercase();
-    lines.iter().enumerate()
+    lines
+        .iter()
+        .enumerate()
         .filter(|(_, l)| page_line_plain_text(l).to_ascii_lowercase().contains(&q))
         .map(|(i, _)| i)
         .collect()
@@ -5989,20 +7362,36 @@ async fn download_confluence_images(
     let mut pos = 0;
 
     while pos < lower.len() {
-        let Some(rel) = lower[pos..].find("<img") else { break };
+        let Some(rel) = lower[pos..].find("<img") else {
+            break;
+        };
         let abs = pos + rel;
         let after = abs + 4;
-        let tag_end = lower[after..].find('>').map(|e| after + e + 1).unwrap_or(lower.len());
+        let tag_end = lower[after..]
+            .find('>')
+            .map(|e| after + e + 1)
+            .unwrap_or(lower.len());
         let tag = &html[abs..tag_end];
 
-        if let Some(src) = extract_attr(tag.trim_start_matches('<').trim_start_matches("img").trim_start_matches("IMG"), "src") {
+        if let Some(src) = extract_attr(
+            tag.trim_start_matches('<')
+                .trim_start_matches("img")
+                .trim_start_matches("IMG"),
+            "src",
+        ) {
             let is_relative = src.starts_with("/wiki/") || src.starts_with("/download/");
-            let is_absolute = src.starts_with(server) && (
-                src[server.len()..].starts_with("/wiki/") || src[server.len()..].starts_with("/download/")
-            );
+            let is_absolute = src.starts_with(server)
+                && (src[server.len()..].starts_with("/wiki/")
+                    || src[server.len()..].starts_with("/download/"));
             if (is_relative || is_absolute) && !replacements.iter().any(|(o, _)| o == &src) {
-                let full_url = if is_absolute { src.clone() } else { format!("{}{}", server, src) };
-                let filename = src.split('/').last()
+                let full_url = if is_absolute {
+                    src.clone()
+                } else {
+                    format!("{}{}", server, src)
+                };
+                let filename = src
+                    .split('/')
+                    .last()
                     .and_then(|f| f.split('?').next())
                     .filter(|f| !f.is_empty())
                     .unwrap_or("image.png");
@@ -6010,9 +7399,13 @@ async fn download_confluence_images(
 
                 let ok = tokio::process::Command::new("curl")
                     .args([
-                        "-sS", "-L", "--fail-with-body",
-                        "-u", &format!("{}:{}", login, token),
-                        "-o", &local_path,
+                        "-sS",
+                        "-L",
+                        "--fail-with-body",
+                        "-u",
+                        &format!("{}:{}", login, token),
+                        "-o",
+                        &local_path,
                         &full_url,
                     ])
                     .output()
@@ -6056,7 +7449,10 @@ fn html_to_markdown(html: &str) -> String {
     }
     // Try python3 html2text (third-party package).
     if let Ok(mut child) = std::process::Command::new("python3")
-        .args(["-c", "import sys,html2text; print(html2text.html2text(sys.stdin.read()))"])
+        .args([
+            "-c",
+            "import sys,html2text; print(html2text.html2text(sys.stdin.read()))",
+        ])
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -6436,7 +7832,9 @@ async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Resu
         // after dropping it (save_settings re-borrows app).
         let mut commit: Option<(usize, String)> = None;
         if let Mode::Settings(form) = &mut app.mode {
-            let Some(p) = form.picker.as_mut() else { return Ok(()) };
+            let Some(p) = form.picker.as_mut() else {
+                return Ok(());
+            };
             match code {
                 KeyCode::Esc => {
                     form.picker = None;
@@ -6445,7 +7843,9 @@ async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Resu
                 }
                 KeyCode::Down => {
                     let n = p.filtered().len();
-                    if n > 0 { p.selected = (p.selected + 1).min(n - 1); }
+                    if n > 0 {
+                        p.selected = (p.selected + 1).min(n - 1);
+                    }
                     return Ok(());
                 }
                 KeyCode::Up => {
@@ -6477,10 +7877,26 @@ async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Resu
             if let Mode::Settings(form) = &mut app.mode {
                 form.picker = None;
                 let label = match row {
-                    0 => { form.default_create_status = val.clone(); "default-create" }
-                    1 => { form.all_mine_exclude_status = val.clone(); "all-mine-exclude" }
-                    2 => { form.pr_submit_status = val.clone(); "pr-submit" }
-                    3 => { form.claude_permission_mode = val.clone(); "claude-permission-mode" }
+                    0 => {
+                        form.default_create_status = val.clone();
+                        "default-create"
+                    }
+                    1 => {
+                        form.all_mine_exclude_status = val.clone();
+                        "all-mine-exclude"
+                    }
+                    2 => {
+                        form.pr_submit_status = val.clone();
+                        "pr-submit"
+                    }
+                    3 => {
+                        form.code_assistant = val.clone();
+                        "code-assistant"
+                    }
+                    4 => {
+                        form.claude_permission_mode = val.clone();
+                        "claude-permission-mode"
+                    }
                     _ => "",
                 };
                 let l = label.to_string();
@@ -6511,7 +7927,9 @@ async fn settings_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Resu
             KeyCode::Char('k') | KeyCode::Up => {
                 form.selected = form.selected.saturating_sub(1);
             }
-            KeyCode::Char('i') | KeyCode::Enter => { open_picker = true; }
+            KeyCode::Char('i') | KeyCode::Enter => {
+                open_picker = true;
+            }
             _ => {}
         }
     }
@@ -6610,7 +8028,8 @@ async fn rules_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result
             picker: None,
             var_picker: None,
         });
-        app.status = "new rule — j/k move · enter edit · a add cond/act · ctrl-s save · esc cancel".into();
+        app.status =
+            "new rule — j/k move · enter edit · a add cond/act · ctrl-s save · esc cancel".into();
     } else if let Some(idx) = open_edit_idx {
         let snapshot = if let Mode::Rules(form) = &app.mode {
             form.items.get(idx).cloned()
@@ -6814,7 +8233,10 @@ pub fn cycle_trigger(t: &jui_core::rules::Trigger, forward: bool) -> jui_core::r
         T::PrCreated,
         T::StartWork,
         T::StopWork,
-        T::TicketStatusChanged { from: None, to: None },
+        T::TicketStatusChanged {
+            from: None,
+            to: None,
+        },
         T::TicketAssigned { to_me: None },
     ];
     let i = match t {
@@ -6825,26 +8247,38 @@ pub fn cycle_trigger(t: &jui_core::rules::Trigger, forward: bool) -> jui_core::r
         T::TicketAssigned { .. } => 4,
     };
     let n = variants.len();
-    let next = if forward { (i + 1) % n } else { (i + n - 1) % n };
+    let next = if forward {
+        (i + 1) % n
+    } else {
+        (i + n - 1) % n
+    };
     variants[next].clone()
 }
 
 fn cycle_condition(c: &jui_core::rules::Condition) -> jui_core::rules::Condition {
     use jui_core::rules::Condition as C;
     match c {
-        C::ProjectKeyEquals { .. } => C::StatusEquals { value: String::new() },
+        C::ProjectKeyEquals { .. } => C::StatusEquals {
+            value: String::new(),
+        },
         C::StatusEquals { .. } => C::IssueTypeIn { values: vec![] },
         C::IssueTypeIn { .. } => C::HasLinkedRepo,
         C::HasLinkedRepo => C::ActorIsMe,
-        C::ActorIsMe => C::ProjectKeyEquals { value: String::new() },
+        C::ActorIsMe => C::ProjectKeyEquals {
+            value: String::new(),
+        },
     }
 }
 
 fn cycle_action(a: &jui_core::rules::Action) -> jui_core::rules::Action {
     use jui_core::rules::Action as A;
     match a {
-        A::JiraTransition { .. } => A::JiraComment { body: String::new() },
-        A::JiraComment { .. } => A::GithubPrComment { body: String::new() },
+        A::JiraTransition { .. } => A::JiraComment {
+            body: String::new(),
+        },
+        A::JiraComment { .. } => A::GithubPrComment {
+            body: String::new(),
+        },
         A::GithubPrComment { .. } => A::SetTicketDevQa,
         A::SetTicketDevQa => A::JiraTransition { to: String::new() },
     }
@@ -6951,7 +8385,10 @@ async fn rule_edit_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Res
                 KeyCode::Char('{') => {
                     let anchor = buf.len();
                     buf.push('{');
-                    form.var_picker = Some(VarPicker { anchor, selected: 0 });
+                    form.var_picker = Some(VarPicker {
+                        anchor,
+                        selected: 0,
+                    });
                 }
                 KeyCode::Char(c) => {
                     buf.push(c);
@@ -7026,9 +8463,15 @@ async fn rule_edit_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Res
                     }
                     Some(RuleRow::Cond(i)) => {
                         let cur = match form.rule.conditions.get(i) {
-                            Some(jui_core::rules::Condition::ProjectKeyEquals { value }) => value.clone(),
-                            Some(jui_core::rules::Condition::StatusEquals { value }) => value.clone(),
-                            Some(jui_core::rules::Condition::IssueTypeIn { values }) => values.join(","),
+                            Some(jui_core::rules::Condition::ProjectKeyEquals { value }) => {
+                                value.clone()
+                            }
+                            Some(jui_core::rules::Condition::StatusEquals { value }) => {
+                                value.clone()
+                            }
+                            Some(jui_core::rules::Condition::IssueTypeIn { values }) => {
+                                values.join(",")
+                            }
                             _ => String::new(),
                         };
                         form.edit_buffer = Some(cur);
@@ -7056,12 +8499,16 @@ async fn rule_edit_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Res
                         }
                     }
                     Some(RuleRow::AddCondition) => {
-                        form.rule.conditions.push(jui_core::rules::Condition::HasLinkedRepo);
+                        form.rule
+                            .conditions
+                            .push(jui_core::rules::Condition::HasLinkedRepo);
                     }
                     Some(RuleRow::AddAction) => {
-                        form.rule.actions.push(jui_core::rules::Action::JiraComment {
-                            body: String::new(),
-                        });
+                        form.rule
+                            .actions
+                            .push(jui_core::rules::Action::JiraComment {
+                                body: String::new(),
+                            });
                     }
                     _ => {}
                 }
@@ -7073,45 +8520,47 @@ async fn rule_edit_keys(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Res
                     Some(RuleRow::ConditionsHeader)
                     | Some(RuleRow::AddCondition)
                     | Some(RuleRow::Cond(_)) => {
-                        form.rule.conditions.push(jui_core::rules::Condition::HasLinkedRepo);
+                        form.rule
+                            .conditions
+                            .push(jui_core::rules::Condition::HasLinkedRepo);
                     }
                     Some(RuleRow::ActionsHeader)
                     | Some(RuleRow::AddAction)
                     | Some(RuleRow::Act(_)) => {
-                        form.rule.actions.push(jui_core::rules::Action::JiraComment {
-                            body: String::new(),
-                        });
+                        form.rule
+                            .actions
+                            .push(jui_core::rules::Action::JiraComment {
+                                body: String::new(),
+                            });
                     }
                     _ => {}
                 }
             }
-            KeyCode::Char('d') => {
-                match rows.get(form.selected_row).copied() {
-                    Some(RuleRow::Cond(i)) => {
-                        if form.pending_remove_condition == Some(i) {
-                            if i < form.rule.conditions.len() {
-                                form.rule.conditions.remove(i);
-                            }
-                            form.pending_remove_condition = None;
-                        } else {
-                            form.pending_remove_condition = Some(i);
-                            app.status = "press d again to delete condition".into();
+            KeyCode::Char('d') => match rows.get(form.selected_row).copied() {
+                Some(RuleRow::Cond(i)) => {
+                    if form.pending_remove_condition == Some(i) {
+                        if i < form.rule.conditions.len() {
+                            form.rule.conditions.remove(i);
                         }
+                        form.pending_remove_condition = None;
+                    } else {
+                        form.pending_remove_condition = Some(i);
+                        app.status = "press d again to delete condition".into();
                     }
-                    Some(RuleRow::Act(i)) => {
-                        if form.pending_remove_action == Some(i) {
-                            if i < form.rule.actions.len() {
-                                form.rule.actions.remove(i);
-                            }
-                            form.pending_remove_action = None;
-                        } else {
-                            form.pending_remove_action = Some(i);
-                            app.status = "press d again to delete action".into();
-                        }
-                    }
-                    _ => {}
                 }
-            }
+                Some(RuleRow::Act(i)) => {
+                    if form.pending_remove_action == Some(i) {
+                        if i < form.rule.actions.len() {
+                            form.rule.actions.remove(i);
+                        }
+                        form.pending_remove_action = None;
+                    } else {
+                        form.pending_remove_action = Some(i);
+                        app.status = "press d again to delete action".into();
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -7163,14 +8612,13 @@ impl App {
             ipc::send_request(&mut s, &Request::ListStatuses).await?
         };
         if let Mode::RuleEdit(f) = &mut self.mode {
-            let Some(p) = f.picker.as_mut() else { return Ok(()) };
+            let Some(p) = f.picker.as_mut() else {
+                return Ok(());
+            };
             p.loading = false;
             match resp {
                 Response::Statuses { items } => {
-                    if let Some(pos) = items
-                        .iter()
-                        .position(|s| s.eq_ignore_ascii_case(&current))
-                    {
+                    if let Some(pos) = items.iter().position(|s| s.eq_ignore_ascii_case(&current)) {
                         p.selected = pos;
                     }
                     p.all = items;
@@ -7193,7 +8641,9 @@ impl App {
 async fn rule_edit_picker_keys(app: &mut App, code: KeyCode) -> Result<()> {
     let mut commit: Option<(RulePickerTarget, String)> = None;
     if let Mode::RuleEdit(form) = &mut app.mode {
-        let Some(p) = form.picker.as_mut() else { return Ok(()) };
+        let Some(p) = form.picker.as_mut() else {
+            return Ok(());
+        };
         match code {
             KeyCode::Esc => {
                 form.picker = None;
@@ -7259,7 +8709,11 @@ fn apply_edit(rule: &mut jui_core::rules::Rule, target: Option<RuleEditTarget>, 
         }
         RuleEditTarget::TriggerFilter => match &mut rule.trigger {
             Trigger::TicketStatusChanged { to, .. } => {
-                *to = if value.trim().is_empty() { None } else { Some(value.trim().to_string()) };
+                *to = if value.trim().is_empty() {
+                    None
+                } else {
+                    Some(value.trim().to_string())
+                };
             }
             Trigger::TicketAssigned { to_me } => {
                 let v = value.trim().to_ascii_lowercase();
@@ -7336,18 +8790,22 @@ async fn detail_comments_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers)
             }
         }
         KeyCode::Char('d') => {
-            let Some(c) = app.comments.get(app.comment_selected) else { return Ok(()) };
+            let Some(c) = app.comments.get(app.comment_selected) else {
+                return Ok(());
+            };
             if !app.comment_is_mine(c) {
                 app.status = "can't delete: not your comment".into();
                 app.pending_delete = None;
             } else if let Some(id) = c.id.clone() {
-                let confirm = matches!(&app.pending_delete, Some(PendingDelete::Comment(p)) if *p == id);
+                let confirm =
+                    matches!(&app.pending_delete, Some(PendingDelete::Comment(p)) if *p == id);
                 if confirm {
                     app.pending_delete = None;
                     app.delete_selected_comment().await?;
                 } else {
                     app.pending_delete = Some(PendingDelete::Comment(id));
-                    app.status = "press 'd' again to delete this comment, or any other key to cancel".into();
+                    app.status =
+                        "press 'd' again to delete this comment, or any other key to cancel".into();
                 }
             }
         }
@@ -7359,13 +8817,26 @@ async fn detail_comments_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers)
 /// Indices into `app.detail.subtasks` that are currently visible (after the
 /// "hide archived" filter). Returned in the original order.
 pub fn visible_subtask_indices(app: &App) -> Vec<usize> {
-    let Some(t) = &app.detail else { return Vec::new() };
+    let Some(t) = &app.detail else {
+        return Vec::new();
+    };
     if app.show_archived_subtasks {
         return (0..t.subtasks.len()).collect();
     }
-    let archived = ["resolved", "done", "closed", "archive", "archived",
-        "won't do", "wont do", "cancelled", "canceled"];
-    t.subtasks.iter().enumerate()
+    let archived = [
+        "resolved",
+        "done",
+        "closed",
+        "archive",
+        "archived",
+        "won't do",
+        "wont do",
+        "cancelled",
+        "canceled",
+    ];
+    t.subtasks
+        .iter()
+        .enumerate()
         .filter(|(_, s)| {
             let st = s.status.as_deref().unwrap_or("").to_ascii_lowercase();
             !archived.iter().any(|a| *a == st)
@@ -7393,8 +8864,11 @@ async fn detail_subtasks_keys(app: &mut App, code: KeyCode) -> Result<()> {
             app.show_archived_subtasks = !app.show_archived_subtasks;
             // Clamp the selection so it stays inside the (possibly smaller) visible range.
             let visible = visible_subtasks_for(app);
-            if visible == 0 { app.subtask_selected = 0; }
-            else if app.subtask_selected >= visible { app.subtask_selected = visible - 1; }
+            if visible == 0 {
+                app.subtask_selected = 0;
+            } else if app.subtask_selected >= visible {
+                app.subtask_selected = visible - 1;
+            }
             app.status = if app.show_archived_subtasks {
                 "subtasks: showing archived".into()
             } else {
@@ -7413,26 +8887,37 @@ async fn detail_subtasks_keys(app: &mut App, code: KeyCode) -> Result<()> {
                     time_estimate: String::new(),
                     priority: String::new(),
                     field: 2,
-                    assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: Some(t.key.clone()),
+                    assignee: String::new(),
+                    assignee_id: None,
+                    assignee_results: vec![],
+                    assignee_picker_selected: 0,
+                    parent: Some(t.key.clone()),
                     error: None,
                 });
             }
         }
         KeyCode::Char('D') => {
-            let real_idx = visible_subtask_indices(app).get(app.subtask_selected).copied();
-            let sub = real_idx.and_then(|i| app.detail.as_ref().and_then(|t| t.subtasks.get(i))).cloned();
+            let real_idx = visible_subtask_indices(app)
+                .get(app.subtask_selected)
+                .copied();
+            let sub = real_idx
+                .and_then(|i| app.detail.as_ref().and_then(|t| t.subtasks.get(i)))
+                .cloned();
             if let Some(s) = sub {
                 app.mode = Mode::ArchiveConfirm(ArchiveConfirmForm {
                     key: s.key,
                     summary: s.summary,
-                    origin: DeleteOrigin::Subtasks, error: None,
+                    origin: DeleteOrigin::Subtasks,
+                    error: None,
                 });
             }
         }
         KeyCode::Enter => {
             // Drill into the selected subtask. Push the current ticket onto the
             // back-stack so Esc returns to the parent rather than all the way to List.
-            let real_idx = visible_subtask_indices(app).get(app.subtask_selected).copied();
+            let real_idx = visible_subtask_indices(app)
+                .get(app.subtask_selected)
+                .copied();
             let key = real_idx
                 .and_then(|i| app.detail.as_ref().and_then(|t| t.subtasks.get(i)))
                 .map(|s| s.key.clone());
@@ -7465,12 +8950,20 @@ async fn detail_projects_keys(app: &mut App, code: KeyCode) -> Result<()> {
         KeyCode::Char('k') | KeyCode::Up => {
             app.linked_project_selected = app.linked_project_selected.saturating_sub(1);
         }
-        KeyCode::Char('a') | KeyCode::Char('+') => { app.open_ticket_projects().await?; }
+        KeyCode::Char('a') | KeyCode::Char('+') => {
+            app.open_ticket_projects().await?;
+        }
         KeyCode::Char('y') => {
             // Approve a suggested project.
-            let Some(p) = app.detail_linked_projects.get(app.linked_project_selected) else { return Ok(()) };
+            let Some(p) = app.detail_linked_projects.get(app.linked_project_selected) else {
+                return Ok(());
+            };
             if p.state == "no_match" {
                 app.status = "nothing to approve — claude couldn't find a match".into();
+                return Ok(());
+            }
+            if p.state == "worktree" {
+                app.status = "worktree is already available for start".into();
                 return Ok(());
             }
             if p.state != "suggested" {
@@ -7493,7 +8986,9 @@ async fn detail_projects_keys(app: &mut App, code: KeyCode) -> Result<()> {
             }
         }
         KeyCode::Char('d') => {
-            let Some(p) = app.detail_linked_projects.get(app.linked_project_selected) else { return Ok(()) };
+            let Some(p) = app.detail_linked_projects.get(app.linked_project_selected) else {
+                return Ok(());
+            };
             // Synthetic "no_match" row → dismiss (writes 'rejected' on the synthetic
             // path so it stops surfacing, but the original ticket is still considered
             // "already evaluated" and won't be re-suggested).
@@ -7512,6 +9007,11 @@ async fn detail_projects_keys(app: &mut App, code: KeyCode) -> Result<()> {
                     Response::Err { message } => app.status = format!("err: {message}"),
                     _ => app.status = "unexpected response".into(),
                 }
+                return Ok(());
+            }
+            if p.state == "worktree" {
+                app.status =
+                    "worktree row is detected from git; remove it with git worktree remove".into();
                 return Ok(());
             }
             // Suggested → single-press dismiss (no confirm; we're not destroying user data).
@@ -7534,7 +9034,8 @@ async fn detail_projects_keys(app: &mut App, code: KeyCode) -> Result<()> {
             }
             // Confirmed → two-press unlink.
             let path = p.project.path.clone();
-            let confirm = matches!(&app.pending_delete, Some(PendingDelete::Link(pp)) if *pp == path);
+            let confirm =
+                matches!(&app.pending_delete, Some(PendingDelete::Link(pp)) if *pp == path);
             if confirm {
                 app.pending_delete = None;
                 if let Some(t) = &app.detail {
@@ -7542,7 +9043,10 @@ async fn detail_projects_keys(app: &mut App, code: KeyCode) -> Result<()> {
                     let mut s = ipc::connect().await?;
                     let resp = ipc::send_request(
                         &mut s,
-                        &Request::UnlinkProject { ticket_key: key, project_path: path.clone() },
+                        &Request::UnlinkProject {
+                            ticket_key: key,
+                            project_path: path.clone(),
+                        },
                     )
                     .await?;
                     match resp {
@@ -7676,6 +9180,28 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
     match &mut app.mode {
         Mode::List => match code {
             // `q` handled by the unified Q dispatch above.
+            KeyCode::Char('/') if app.list_focus == ListFocus::Active => {
+                app.ticket_search_active = true;
+                app.ticket_search_query.clear();
+                app.list_selected = 0;
+                app.status = "ticket search: type key/title, Esc clears".into();
+            }
+            KeyCode::Esc if app.ticket_search_active || !app.ticket_search_query.is_empty() => {
+                app.ticket_search_active = false;
+                app.ticket_search_query.clear();
+                app.list_selected = 0;
+                app.status = "ticket search cleared".into();
+            }
+            KeyCode::Backspace if app.ticket_search_active => {
+                app.ticket_search_query.pop();
+                app.clamp_list_search_selection();
+            }
+            KeyCode::Char(c)
+                if app.ticket_search_active && !mods.contains(KeyModifiers::CONTROL) =>
+            {
+                app.ticket_search_query.push(c);
+                app.clamp_list_search_selection();
+            }
             KeyCode::BackTab => {
                 // Shift-Tab cycles focus between the Active list and the
                 // Mentioned list at the bottom.
@@ -7698,8 +9224,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             KeyCode::Char('j') | KeyCode::Down => match app.list_focus {
                 ListFocus::Active => {
-                    if !app.active_idxs.is_empty() {
-                        app.list_selected = (app.list_selected + 1).min(app.active_idxs.len() - 1);
+                    let n = app.active_search_rows().len();
+                    if n > 0 {
+                        app.list_selected = (app.list_selected + 1).min(n - 1);
                     }
                 }
                 ListFocus::Mentioned => {
@@ -7719,13 +9246,17 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.mentioned_selected = app.mentioned_selected.saturating_sub(1);
                 }
             },
-            KeyCode::Char('r') => { app.refresh().await?; }
+            KeyCode::Char('r') => {
+                app.refresh().await?;
+            }
             KeyCode::Char('o') => {
                 app.sort_mode = app.sort_mode.next();
                 app.recompute_indexes();
                 app.status = format!("sort: {}", app.sort_mode.label());
             }
-            KeyCode::Char('s') => { app.start_work().await?; }
+            KeyCode::Char('s') => {
+                app.start_work().await?;
+            }
             KeyCode::Char('M') => {
                 app.show_all_mine = !app.show_all_mine;
                 app.status = if app.show_all_mine {
@@ -7737,8 +9268,11 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             KeyCode::Tab => {
                 // Tab expands subtasks in the Active section; no-op in Mentioned.
-                if app.list_focus != ListFocus::Active { return Ok(()); }
-                if let Some(&t_idx) = app.active_idxs.get(app.list_selected) {
+                if app.list_focus != ListFocus::Active {
+                    return Ok(());
+                }
+                let rows = app.active_search_rows();
+                if let Some((_, t_idx)) = rows.get(app.list_selected).copied() {
                     let key = app.tickets[t_idx].key.clone();
                     let has_children = app.parent_child_counts.get(&key).copied().unwrap_or(0) > 0;
                     if app.expanded_parents.contains(&key) {
@@ -7756,6 +9290,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     {
                         app.list_selected = new_pos;
                     }
+                    app.clamp_list_search_selection();
                 }
             }
             KeyCode::Char('n') => {
@@ -7767,7 +9302,11 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     time_estimate: String::new(),
                     priority: String::new(),
                     field: 0,
-                    assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: None,
+                    assignee: String::new(),
+                    assignee_id: None,
+                    assignee_results: vec![],
+                    assignee_picker_selected: 0,
+                    parent: None,
                     error: None,
                 });
             }
@@ -7793,7 +9332,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             KeyCode::Char('k') | KeyCode::Up => {
                 app.archive_selected = app.archive_selected.saturating_sub(1);
             }
-            KeyCode::Char('r') => { app.refresh().await?; }
+            KeyCode::Char('r') => {
+                app.refresh().await?;
+            }
             KeyCode::Char('o') => {
                 app.sort_mode = app.sort_mode.next();
                 app.recompute_indexes();
@@ -7811,15 +9352,38 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         },
         Mode::Kanban => {
             let cols = app.kanban_columns();
+            if cols.is_empty() {
+                app.kanban_col = 0;
+                app.kanban_expanded_col = None;
+                app.kanban_card_per_col.clear();
+                app.kanban_minimized.clear();
+            } else {
+                app.kanban_col = app.kanban_col.min(cols.len() - 1);
+                if app
+                    .kanban_expanded_col
+                    .map(|ci| ci >= cols.len())
+                    .unwrap_or(false)
+                {
+                    app.kanban_expanded_col = None;
+                }
+                app.kanban_minimized.retain(|ci| *ci < cols.len());
+            }
             if app.kanban_card_per_col.len() != cols.len() {
                 app.kanban_card_per_col.resize(cols.len(), 0);
+            }
+            for (ci, (_, idxs)) in cols.iter().enumerate() {
+                if !idxs.is_empty() {
+                    app.kanban_card_per_col[ci] = app.kanban_card_per_col[ci].min(idxs.len() - 1);
+                }
             }
             match code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => {
                     app.kanban_expanded_col = None;
                     app.mode = Mode::List;
                 }
-                KeyCode::Char('r') => { app.refresh().await?; }
+                KeyCode::Char('r') => {
+                    app.refresh().await?;
+                }
                 // Shift+←/→ (or Shift+H/L) reorder the selected column and persist.
                 KeyCode::Left if mods.contains(KeyModifiers::SHIFT) => {
                     app.move_kanban_column(false);
@@ -7827,8 +9391,12 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 KeyCode::Right if mods.contains(KeyModifiers::SHIFT) => {
                     app.move_kanban_column(true);
                 }
-                KeyCode::Char('H') => { app.move_kanban_column(false); }
-                KeyCode::Char('L') => { app.move_kanban_column(true); }
+                KeyCode::Char('H') => {
+                    app.move_kanban_column(false);
+                }
+                KeyCode::Char('L') => {
+                    app.move_kanban_column(true);
+                }
                 KeyCode::Char('h') | KeyCode::Left => {
                     app.kanban_col = app.kanban_col.saturating_sub(1);
                     app.kanban_expanded_col = None;
@@ -7857,10 +9425,18 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 KeyCode::Char('u') => {
                     let mut form = KanbanFilterForm::new();
                     let mut s = ipc::connect().await?;
-                    if let Ok(ipc::Response::Users { items, from_cache }) =
-                        ipc::send_request(&mut s, &ipc::Request::SearchUsers { query: String::new() }).await
+                    if let Ok(ipc::Response::Users { items, from_cache }) = ipc::send_request(
+                        &mut s,
+                        &ipc::Request::SearchUsers {
+                            query: String::new(),
+                        },
+                    )
+                    .await
                     {
-                        form.results = items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+                        form.results = items
+                            .into_iter()
+                            .map(|u| (u.display_name, u.account_id))
+                            .collect();
                         form.from_cache = from_cache;
                     }
                     let mut s2 = ipc::connect().await?;
@@ -7924,15 +9500,24 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         let (save_name, members) = if let Mode::KanbanFilter(ref form) = app.mode {
                             (
                                 form.save_name.clone().unwrap_or_default(),
-                                app.kanban_assignee_filter.iter().cloned().collect::<Vec<_>>(),
+                                app.kanban_assignee_filter
+                                    .iter()
+                                    .cloned()
+                                    .collect::<Vec<_>>(),
                             )
-                        } else { (String::new(), vec![]) };
+                        } else {
+                            (String::new(), vec![])
+                        };
                         if !save_name.trim().is_empty() && !members.is_empty() {
                             let mut s = ipc::connect().await?;
-                            let _ = ipc::send_request(&mut s, &ipc::Request::SaveTeam {
-                                name: save_name.trim().to_string(),
-                                members,
-                            }).await;
+                            let _ = ipc::send_request(
+                                &mut s,
+                                &ipc::Request::SaveTeam {
+                                    name: save_name.trim().to_string(),
+                                    members,
+                                },
+                            )
+                            .await;
                             // Refresh teams list.
                             let mut s2 = ipc::connect().await?;
                             if let Ok(ipc::Response::Teams { items }) =
@@ -7974,7 +9559,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.kanban_extra.clear();
                     app.mode = Mode::Kanban;
                 }
-                KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) && !app.kanban_assignee_filter.is_empty() => {
+                KeyCode::Char('s')
+                    if mods.contains(KeyModifiers::CONTROL)
+                        && !app.kanban_assignee_filter.is_empty() =>
+                {
                     if let Mode::KanbanFilter(ref mut form) = app.mode {
                         form.save_name = Some(String::new());
                     }
@@ -7984,17 +9572,21 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     if selected < n_teams {
                         let team_name = if let Mode::KanbanFilter(ref form) = app.mode {
                             form.teams.get(form.selected).map(|t| t.name.clone())
-                        } else { None };
+                        } else {
+                            None
+                        };
                         if let Some(name) = team_name {
                             let mut s = ipc::connect().await?;
-                            let _ = ipc::send_request(&mut s, &ipc::Request::DeleteTeam { name }).await;
+                            let _ =
+                                ipc::send_request(&mut s, &ipc::Request::DeleteTeam { name }).await;
                             let mut s2 = ipc::connect().await?;
                             if let Ok(ipc::Response::Teams { items }) =
                                 ipc::send_request(&mut s2, &ipc::Request::ListTeams).await
                             {
                                 if let Mode::KanbanFilter(ref mut form) = app.mode {
                                     form.teams = items;
-                                    form.selected = form.selected.min(form.total_rows().saturating_sub(1));
+                                    form.selected =
+                                        form.selected.min(form.total_rows().saturating_sub(1));
                                 }
                             }
                         }
@@ -8005,7 +9597,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         // Apply team — replace filter with team members.
                         let members = if let Mode::KanbanFilter(ref form) = app.mode {
                             form.teams.get(form.selected).map(|t| t.members.clone())
-                        } else { None };
+                        } else {
+                            None
+                        };
                         if let Some(members) = members {
                             app.kanban_assignee_filter = members.into_iter().collect();
                         }
@@ -8014,7 +9608,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         let user_idx = selected - n_teams;
                         let name = if let Mode::KanbanFilter(ref form) = app.mode {
                             form.results.get(user_idx).map(|(n, _)| n.clone())
-                        } else { None };
+                        } else {
+                            None
+                        };
                         if let Some(name) = name {
                             if app.kanban_assignee_filter.contains(&name) {
                                 app.kanban_assignee_filter.remove(&name);
@@ -8048,7 +9644,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         if let Ok(ipc::Response::Users { items, from_cache }) =
                             ipc::send_request(&mut s, &ipc::Request::SearchUsers { query: q }).await
                         {
-                            form.results = items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+                            form.results = items
+                                .into_iter()
+                                .map(|u| (u.display_name, u.account_id))
+                                .collect();
                             form.from_cache = from_cache;
                         }
                     }
@@ -8061,7 +9660,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         if let Ok(ipc::Response::Users { items, from_cache }) =
                             ipc::send_request(&mut s, &ipc::Request::SearchUsers { query: q }).await
                         {
-                            form.results = items.into_iter().map(|u| (u.display_name, u.account_id)).collect();
+                            form.results = items
+                                .into_iter()
+                                .map(|u| (u.display_name, u.account_id))
+                                .collect();
                             form.from_cache = from_cache;
                         }
                     }
@@ -8080,20 +9682,30 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             // hidden when there are no GitHub PR comments cached for this
             // ticket.
             if matches!(code, KeyCode::Tab | KeyCode::BackTab) {
-                let is_subtask = app.detail.as_ref()
+                let is_subtask = app
+                    .detail
+                    .as_ref()
                     .and_then(|t| t.issue_type.as_deref())
-                    .map(|x| x.eq_ignore_ascii_case("sub-task") || x.eq_ignore_ascii_case("subtask"))
+                    .map(|x| {
+                        x.eq_ignore_ascii_case("sub-task") || x.eq_ignore_ascii_case("subtask")
+                    })
                     .unwrap_or(false);
                 let pr_visible = !app.pr_comments.is_empty();
                 let backwards = matches!(code, KeyCode::BackTab);
                 for _ in 0..6 {
-                    app.detail_focus = if backwards { app.detail_focus.prev() } else { app.detail_focus.next() };
+                    app.detail_focus = if backwards {
+                        app.detail_focus.prev()
+                    } else {
+                        app.detail_focus.next()
+                    };
                     let ok = match app.detail_focus {
                         DetailFocus::Subtasks if is_subtask => false,
                         DetailFocus::PrComments if !pr_visible => false,
                         _ => true,
                     };
-                    if ok { break; }
+                    if ok {
+                        break;
+                    }
                 }
                 return Ok(());
             }
@@ -8106,7 +9718,12 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         NavFrame::Tree(form) => {
                             app.mode = Mode::Tree(*form);
                         }
-                        NavFrame::Detail { ticket_key, focus, subtask_selected, comment_selected } => {
+                        NavFrame::Detail {
+                            ticket_key,
+                            focus,
+                            subtask_selected,
+                            comment_selected,
+                        } => {
                             app.open_ticket_by_key(ticket_key).await?;
                             // Restore the pane focus + cursor positions the user had
                             // before drilling into the subtask.
@@ -8195,6 +9812,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.open_priority_picker().await?;
                     return Ok(());
                 }
+                KeyCode::Char('O') => {
+                    app.open_ticket_options().await?;
+                    return Ok(());
+                }
                 KeyCode::Char('L') => {
                     app.open_ticket_projects().await?;
                     return Ok(());
@@ -8206,7 +9827,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 KeyCode::Char('T') => {
                     if let Some(t) = &app.detail {
                         let pt = t.issue_type.as_deref().unwrap_or("");
-                        if pt.eq_ignore_ascii_case("sub-task") || pt.eq_ignore_ascii_case("subtask") {
+                        if pt.eq_ignore_ascii_case("sub-task") || pt.eq_ignore_ascii_case("subtask")
+                        {
                             app.status = "can't add a child under a sub-task".into();
                             return Ok(());
                         }
@@ -8219,7 +9841,11 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                             time_estimate: String::new(),
                             priority: String::new(),
                             field: 2,
-                            assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: Some(t.key.clone()),
+                            assignee: String::new(),
+                            assignee_id: None,
+                            assignee_results: vec![],
+                            assignee_picker_selected: 0,
+                            parent: Some(t.key.clone()),
                             error: None,
                         });
                     }
@@ -8234,7 +9860,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     //   • DevQA started + has PR → resolve DevQA (pass).
                     //   • no PR yet            → open a PR.
                     if ticket_devqa_in_progress(app) && ticket_has_pr(app) {
-                        let key = match &app.detail { Some(t) => t.key.clone(), None => return Ok(()) };
+                        let key = match &app.detail {
+                            Some(t) => t.key.clone(),
+                            None => return Ok(()),
+                        };
                         if let Some(pr_url) = app.current_pr_url() {
                             app.mode = Mode::DevQaResolveConfirm(DevQaResolveForm {
                                 ticket_key: key,
@@ -8256,22 +9885,24 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 KeyCode::Char('K') => {
                     // Cycle the user-managed PR review state. Awaiting →
                     // Reviewing → Completed → Awaiting (lets the user un-mark).
-                    if !ticket_has_pr(app) {
-                        app.status = "no PR to mark".into();
-                        return Ok(());
-                    }
-                    let key = match &app.detail { Some(t) => t.key.clone(), None => return Ok(()) };
+                    let key = match &app.detail {
+                        Some(t) => t.key.clone(),
+                        None => return Ok(()),
+                    };
                     let next = match app.pr_state(&key) {
                         PrUserState::Awaiting => PrUserState::Reviewing,
                         PrUserState::Reviewing => PrUserState::Completed,
                         PrUserState::Completed => PrUserState::Awaiting,
                     };
                     app.set_pr_state(&key, next).await?;
-                    app.status = format!("{key} review state: {}", match next {
-                        PrUserState::Awaiting => "Awaiting Your Review",
-                        PrUserState::Reviewing => "Reviewing",
-                        PrUserState::Completed => "Completed",
-                    });
+                    app.status = format!(
+                        "{key} review marker: {}",
+                        match next {
+                            PrUserState::Awaiting => "To Review",
+                            PrUserState::Reviewing => "Reviewing",
+                            PrUserState::Completed => "Done",
+                        }
+                    );
                     return Ok(());
                 }
                 KeyCode::Char('Q') => {
@@ -8281,13 +9912,14 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     // QA In Progress") and the transition itself may just be
                     // called "Next", so matching on the destination is more
                     // reliable than the transition name.
-                    let key = match &app.detail { Some(t) => t.key.clone(), None => return Ok(()) };
+                    let key = match &app.detail {
+                        Some(t) => t.key.clone(),
+                        None => return Ok(()),
+                    };
                     let mut s = ipc::connect().await?;
-                    let resp = ipc::send_request(
-                        &mut s,
-                        &Request::ListTransitions { key: key.clone() },
-                    )
-                    .await?;
+                    let resp =
+                        ipc::send_request(&mut s, &Request::ListTransitions { key: key.clone() })
+                            .await?;
                     let target = if let Response::Transitions { items } = resp {
                         let needle = "dev qa in progress";
                         items
@@ -8314,7 +9946,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         let mut s = ipc::connect().await?;
                         let existing_wt = match ipc::send_request(
                             &mut s,
-                            &Request::FindDevQaWorktree { ticket_key: key.clone() },
+                            &Request::FindDevQaWorktree {
+                                ticket_key: key.clone(),
+                            },
                         )
                         .await?
                         {
@@ -8344,7 +9978,10 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     let mut s = ipc::connect().await?;
                     let resp = ipc::send_request(
                         &mut s,
-                        &Request::Transition { key: key.clone(), to: tr.name.clone() },
+                        &Request::Transition {
+                            key: key.clone(),
+                            to: tr.name.clone(),
+                        },
                     )
                     .await?;
                     if let Response::Err { message } = resp {
@@ -8377,12 +10014,17 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.open_assign_picker(AssignPurpose::Reviewer).await?;
                     return Ok(());
                 }
+                KeyCode::Char('Y') => {
+                    app.open_assign_picker(AssignPurpose::DevQa).await?;
+                    return Ok(());
+                }
                 KeyCode::Char('D') => {
                     if let Some(t) = &app.detail {
                         app.mode = Mode::ArchiveConfirm(ArchiveConfirmForm {
                             key: t.key.clone(),
                             summary: t.summary.clone(),
-                            origin: DeleteOrigin::DetailInfo, error: None,
+                            origin: DeleteOrigin::DetailInfo,
+                            error: None,
                         });
                     }
                     return Ok(());
@@ -8449,81 +10091,95 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             // Info-pane / global keys (the actions on the ticket itself).
             match code {
-            KeyCode::Char('e') => {
-                if let Some(t) = &app.detail {
-                    let desc = t.description.clone().unwrap_or_default();
-                    let s_cur = t.summary.len();
-                    let d_cur = desc.len();
-                    app.mode = Mode::Edit(EditForm {
-                        key: t.key.clone(),
-                        summary: t.summary.clone(),
-                        description: desc.clone(),
-                        original_summary: t.summary.clone(),
-                        original_description: desc,
-                        field: 0,
-                        suggestion: None,
-                        summary_cursor: s_cur,
-                        description_cursor: d_cur,
-                    });
+                KeyCode::Char('e') => {
+                    if let Some(t) = &app.detail {
+                        let desc = t.description.clone().unwrap_or_default();
+                        let s_cur = t.summary.len();
+                        let d_cur = desc.len();
+                        app.mode = Mode::Edit(EditForm {
+                            key: t.key.clone(),
+                            summary: t.summary.clone(),
+                            description: desc.clone(),
+                            original_summary: t.summary.clone(),
+                            original_description: desc,
+                            field: 0,
+                            suggestion: None,
+                            summary_cursor: s_cur,
+                            description_cursor: d_cur,
+                        });
+                    }
                 }
-            }
-            KeyCode::Char('t') => {
-                if let Some(t) = &app.detail {
-                    let key = t.key.clone();
-                    app.open_transition(key).await?;
+                KeyCode::Char('t') => {
+                    if let Some(t) = &app.detail {
+                        let key = t.key.clone();
+                        app.open_transition(key).await?;
+                    }
                 }
-            }
-            KeyCode::Char('s') => { app.start_work().await?; }
-            KeyCode::Char('w') => {
-                if let Some(t) = &app.detail {
-                    app.mode = Mode::EditTime(EditTimeForm {
-                        key: t.key.clone(),
-                        original_estimate: String::new(),
-                        log_work: String::new(),
-                        field: 0,
-                    });
+                KeyCode::Char('s') => {
+                    app.start_work().await?;
                 }
-            }
-            KeyCode::Char('L') => { app.open_ticket_projects().await?; }
-            KeyCode::Char('i') => { app.open_priority_picker().await?; }
-            KeyCode::Char('C') => { app.open_implementation().await?; }
-            KeyCode::Char('T') => {
-                if let Some(t) = &app.detail {
-                    let project_key = t.key.split('-').next().unwrap_or("").to_string();
-                    app.mode = Mode::Create(CreateForm {
-                        project: project_key,
-                        issue_type: default_child_type(t).into(),
-                        summary: String::new(),
-                        description: String::new(),
-                        time_estimate: String::new(),
-                        priority: String::new(),
-                        // Project + type are prefilled; jump straight to the summary field.
-                        field: 2,
-                        assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: Some(t.key.clone()),
-                        error: None,
-                    });
+                KeyCode::Char('w') => {
+                    if let Some(t) = &app.detail {
+                        app.mode = Mode::EditTime(EditTimeForm {
+                            key: t.key.clone(),
+                            original_estimate: String::new(),
+                            log_work: String::new(),
+                            field: 0,
+                        });
+                    }
                 }
-            }
-            KeyCode::Char('c') => {
-                if let Some(t) = &app.detail {
-                    app.mode = Mode::Comment(CommentForm {
-                        key: t.key.clone(),
-                        body: String::new(),
-                        reply_to: None,
-                        from_stop_work: false,
-                    });
+                KeyCode::Char('L') => {
+                    app.open_ticket_projects().await?;
                 }
+                KeyCode::Char('i') => {
+                    app.open_priority_picker().await?;
+                }
+                KeyCode::Char('C') => {
+                    app.open_implementation().await?;
+                }
+                KeyCode::Char('T') => {
+                    if let Some(t) = &app.detail {
+                        let project_key = t.key.split('-').next().unwrap_or("").to_string();
+                        app.mode = Mode::Create(CreateForm {
+                            project: project_key,
+                            issue_type: default_child_type(t).into(),
+                            summary: String::new(),
+                            description: String::new(),
+                            time_estimate: String::new(),
+                            priority: String::new(),
+                            // Project + type are prefilled; jump straight to the summary field.
+                            field: 2,
+                            assignee: String::new(),
+                            assignee_id: None,
+                            assignee_results: vec![],
+                            assignee_picker_selected: 0,
+                            parent: Some(t.key.clone()),
+                            error: None,
+                        });
+                    }
+                }
+                KeyCode::Char('c') => {
+                    if let Some(t) = &app.detail {
+                        app.mode = Mode::Comment(CommentForm {
+                            key: t.key.clone(),
+                            body: String::new(),
+                            reply_to: None,
+                            from_stop_work: false,
+                        });
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-            }
-        },
+        }
         Mode::Create(form) => {
             const ASSIGNEE_FIELD: u8 = CreateForm::FIELD_COUNT - 1;
             match code {
                 KeyCode::Esc => app.mode = Mode::List,
                 KeyCode::Tab => {
                     form.field = (form.field + 1) % CreateForm::FIELD_COUNT;
-                    if let Mode::Create(f) = &mut app.mode { f.assignee_picker_selected = 0; }
+                    if let Mode::Create(f) = &mut app.mode {
+                        f.assignee_picker_selected = 0;
+                    }
                 }
                 KeyCode::BackTab => {
                     form.field = if form.field == 0 {
@@ -8531,10 +10187,16 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     } else {
                         form.field - 1
                     };
-                    if let Mode::Create(f) = &mut app.mode { f.assignee_picker_selected = 0; }
+                    if let Mode::Create(f) = &mut app.mode {
+                        f.assignee_picker_selected = 0;
+                    }
                 }
-                KeyCode::F(5) => { app.submit_create().await?; }
-                KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                KeyCode::F(5) => {
+                    app.submit_create().await?;
+                }
+                KeyCode::Char(c)
+                    if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) =>
+                {
                     app.submit_create().await?;
                 }
                 KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
@@ -8546,12 +10208,18 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 KeyCode::Down if form.field == ASSIGNEE_FIELD => {
                     if !form.assignee_results.is_empty() {
-                        form.assignee_picker_selected =
-                            (form.assignee_picker_selected + 1).min(form.assignee_results.len() - 1);
+                        form.assignee_picker_selected = (form.assignee_picker_selected + 1)
+                            .min(form.assignee_results.len() - 1);
                     }
                 }
-                KeyCode::Enter if form.field == ASSIGNEE_FIELD && !form.assignee_results.is_empty() => {
-                    if let Some((name, id)) = form.assignee_results.get(form.assignee_picker_selected).cloned() {
+                KeyCode::Enter
+                    if form.field == ASSIGNEE_FIELD && !form.assignee_results.is_empty() =>
+                {
+                    if let Some((name, id)) = form
+                        .assignee_results
+                        .get(form.assignee_picker_selected)
+                        .cloned()
+                    {
                         form.assignee = name;
                         form.assignee_id = Some(id);
                         form.assignee_results.clear();
@@ -8586,7 +10254,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 _ => {}
             }
-        },
+        }
         Mode::Edit(form) => {
             // When a Claude suggestion is pending, intercept y/n first.
             if form.suggestion.is_some() {
@@ -8620,13 +10288,20 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             };
             // Clamp the cursor in case the buffer shrank under us (paranoia
             // — accepted-suggestion path already resets, but cheap).
-            if *cursor > cur.len() { *cursor = cur.len(); }
+            if *cursor > cur.len() {
+                *cursor = cur.len();
+            }
             match code {
                 KeyCode::Esc => app.mode = Mode::Detail,
                 KeyCode::Tab | KeyCode::BackTab => {
                     form.field = if form.field == 0 { 1 } else { 0 };
                 }
-                KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => app.submit_edit().await?,
+                KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
+                    app.submit_edit().await?
+                }
+                KeyCode::Char('e') if mods.contains(KeyModifiers::CONTROL) => {
+                    app.edit_ticket_in_editor().await?
+                }
                 KeyCode::F(5) => app.submit_edit().await?,
                 KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => app.submit_edit().await?,
                 // Ctrl+R or F6: ask Claude to tighten the description (works
@@ -8639,16 +10314,28 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.improve_edit_description().await?;
                 }
                 // Cursor navigation.
-                KeyCode::Left => { *cursor = edit_left(cur, *cursor); }
-                KeyCode::Right => { *cursor = edit_right(cur, *cursor); }
+                KeyCode::Left => {
+                    *cursor = edit_left(cur, *cursor);
+                }
+                KeyCode::Right => {
+                    *cursor = edit_right(cur, *cursor);
+                }
                 KeyCode::Up => {
-                    if is_desc { *cursor = edit_up(cur, *cursor); }
+                    if is_desc {
+                        *cursor = edit_up(cur, *cursor);
+                    }
                 }
                 KeyCode::Down => {
-                    if is_desc { *cursor = edit_down(cur, *cursor); }
+                    if is_desc {
+                        *cursor = edit_down(cur, *cursor);
+                    }
                 }
-                KeyCode::Home => { *cursor = edit_line_start(cur, *cursor); }
-                KeyCode::End => { *cursor = edit_line_end(cur, *cursor); }
+                KeyCode::Home => {
+                    *cursor = edit_line_start(cur, *cursor);
+                }
+                KeyCode::End => {
+                    *cursor = edit_line_end(cur, *cursor);
+                }
                 // Enter in summary submits (single-line); in description inserts newline.
                 KeyCode::Enter => {
                     if !is_desc {
@@ -8689,9 +10376,13 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.mode = Mode::Detail;
                 }
             }
-            KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => app.submit_comment().await?,
+            KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
+                app.submit_comment().await?
+            }
             KeyCode::Enter => form.body.push('\n'),
-            KeyCode::Backspace => { form.body.pop(); }
+            KeyCode::Backspace => {
+                form.body.pop();
+            }
             KeyCode::Char(c) => form.body.push(c),
             _ => {}
         },
@@ -8725,8 +10416,12 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 KeyCode::Char('k') | KeyCode::Up => {
                     form.selected = form.selected.saturating_sub(1);
                 }
-                KeyCode::Char('a') => { app.open_projects_add().await?; }
-                KeyCode::Char('r') => { app.open_projects().await?; }
+                KeyCode::Char('a') => {
+                    app.open_projects_add().await?;
+                }
+                KeyCode::Char('r') => {
+                    app.open_projects().await?;
+                }
                 KeyCode::Char('d') => {
                     if let Some(p) = form.items.get(form.selected) {
                         let path = p.path.clone();
@@ -8743,7 +10438,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
         }
         Mode::ProjectsAdd(form) => match code {
-            KeyCode::Esc => { app.open_projects().await?; }
+            KeyCode::Esc => {
+                app.open_projects().await?;
+            }
             KeyCode::Char('j') | KeyCode::Down => {
                 let n = form.filtered().len();
                 if n > 0 {
@@ -8769,77 +10466,183 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 app.mode = Mode::Detail;
                 app.load_detail().await?;
             }
-            KeyCode::Char('j') | KeyCode::Down => { form.scroll = form.scroll.saturating_add(1); }
-            KeyCode::Char('k') | KeyCode::Up => { form.scroll = form.scroll.saturating_sub(1); }
-            KeyCode::PageDown => { form.scroll = form.scroll.saturating_add(10); }
-            KeyCode::PageUp => { form.scroll = form.scroll.saturating_sub(10); }
-            KeyCode::Char('g') => { form.scroll = 0; }
-            KeyCode::Char('s') => { app.save_implementation_to_file().await?; }
-            KeyCode::Char('o') => { app.launch_claude_in_tmux().await?; }
-            KeyCode::Char('r') => { app.reload_implementation().await?; }
-            KeyCode::Char('R') => { app.regenerate_implementation().await?; }
+            KeyCode::Char('j') | KeyCode::Down => {
+                form.scroll = form.scroll.saturating_add(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                form.scroll = form.scroll.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                form.scroll = form.scroll.saturating_add(10);
+            }
+            KeyCode::PageUp => {
+                form.scroll = form.scroll.saturating_sub(10);
+            }
+            KeyCode::Char('g') => {
+                form.scroll = 0;
+            }
+            KeyCode::Char('s') => {
+                app.save_implementation_to_file().await?;
+            }
+            KeyCode::Char('o') => {
+                app.launch_claude_in_tmux().await?;
+            }
+            KeyCode::Char('r') => {
+                app.reload_implementation().await?;
+            }
+            KeyCode::Char('R') => {
+                app.regenerate_implementation().await?;
+            }
             _ => {}
         },
         Mode::StartWorkPrompt(form) => {
-            // Cycle order: 0 (location) → 1 (time, if needed) → 2 (priority, if
-            // needed) → 3 (plan-mode toggle) → 4 (extra-shell toggle) → 0
+            // Cycle order: 0 (location) → 1 (branch) → 2 (time, if needed) →
+            // 3 (priority, if needed) → 4 (plan-mode toggle) → 5 (extra-shell
+            // toggle) → 0
             let visible: Vec<u8> = {
-                let mut v = vec![0u8];
-                if form.need_time { v.push(1); }
-                if form.need_priority { v.push(2); }
-                v.push(3);
+                let mut v = vec![0u8, 1u8];
+                if form.need_time {
+                    v.push(2);
+                }
+                if form.need_priority {
+                    v.push(3);
+                }
                 v.push(4);
+                v.push(5);
                 v
             };
             let cycle = |cur: u8, forward: bool| -> u8 {
                 let i = visible.iter().position(|&f| f == cur).unwrap_or(0);
                 let n = visible.len();
-                let next = if forward { (i + 1) % n } else { (i + n - 1) % n };
+                let next = if forward {
+                    (i + 1) % n
+                } else {
+                    (i + n - 1) % n
+                };
                 visible[next]
             };
             match code {
                 KeyCode::Esc => app.mode = Mode::Detail,
-                KeyCode::Tab => { form.field = cycle(form.field, true); }
-                KeyCode::BackTab => { form.field = cycle(form.field, false); }
-                KeyCode::F(5) => { app.submit_start_work_prompt().await?; }
-                KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Tab => {
+                    form.field = cycle(form.field, true);
+                }
+                KeyCode::BackTab => {
+                    form.field = cycle(form.field, false);
+                }
+                KeyCode::F(5) => {
                     app.submit_start_work_prompt().await?;
                 }
-                KeyCode::Enter => { app.submit_start_work_prompt().await?; }
+                KeyCode::Char(c)
+                    if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) =>
+                {
+                    app.submit_start_work_prompt().await?;
+                }
+                KeyCode::Enter => {
+                    app.submit_start_work_prompt().await?;
+                }
                 // Location field — arrows or space toggle worktree ↔ branch-in-repo.
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 0 => {
                     form.location = match form.location {
-                        jui_core::scm::WorkLocation::Worktree => jui_core::scm::WorkLocation::BranchInRepo,
-                        jui_core::scm::WorkLocation::BranchInRepo => jui_core::scm::WorkLocation::Worktree,
+                        jui_core::scm::WorkLocation::Worktree => {
+                            jui_core::scm::WorkLocation::BranchInRepo
+                        }
+                        jui_core::scm::WorkLocation::BranchInRepo => {
+                            jui_core::scm::WorkLocation::Worktree
+                        }
                     };
                 }
+                KeyCode::Left if form.field == 1 => {
+                    form.branch_cursor = edit_left(&form.branch_slug, form.branch_cursor);
+                }
+                KeyCode::Right if form.field == 1 => {
+                    form.branch_cursor = edit_right(&form.branch_slug, form.branch_cursor);
+                }
+                KeyCode::Home if form.field == 1 => {
+                    form.branch_cursor = 0;
+                }
+                KeyCode::End if form.field == 1 => {
+                    form.branch_cursor = form.branch_slug.len();
+                }
+                KeyCode::Delete if form.field == 1 => {
+                    let start = form.branch_cursor.min(form.branch_slug.len());
+                    let end = edit_right(&form.branch_slug, start);
+                    if end > start {
+                        form.branch_slug.replace_range(start..end, "");
+                    }
+                }
                 // Plan-mode field — arrows or space toggle plan on/off.
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 3 => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 4 => {
                     form.plan_mode = !form.plan_mode;
                 }
                 // Extra-shell field — arrows or space toggle the worktree shell pane.
-                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 4 => {
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.field == 5 => {
                     form.open_shell_pane = !form.open_shell_pane;
                 }
-                KeyCode::Backspace if form.field == 1 || form.field == 2 => {
-                    let target = if form.field == 1 { &mut form.time_estimate } else { &mut form.priority };
+                KeyCode::Backspace if matches!(form.field, 1 | 2 | 3) => {
+                    if form.field == 1 {
+                        let end = form.branch_cursor.min(form.branch_slug.len());
+                        let start = edit_left(&form.branch_slug, end);
+                        if end > start {
+                            form.branch_slug.replace_range(start..end, "");
+                            form.branch_cursor = start;
+                        }
+                        return Ok(());
+                    }
+                    let target = if form.field == 1 {
+                        &mut form.branch_slug
+                    } else if form.field == 2 {
+                        &mut form.time_estimate
+                    } else {
+                        &mut form.priority
+                    };
                     target.pop();
                 }
-                KeyCode::Char(c) if form.field == 1 || form.field == 2 => {
-                    let target = if form.field == 1 { &mut form.time_estimate } else { &mut form.priority };
+                KeyCode::Char(c) if matches!(form.field, 1 | 2 | 3) => {
+                    if form.field == 1 {
+                        let at = form.branch_cursor.min(form.branch_slug.len());
+                        form.branch_slug.insert(at, c);
+                        form.branch_cursor = edit_right(&form.branch_slug, at);
+                        return Ok(());
+                    }
+                    let target = if form.field == 1 {
+                        &mut form.branch_slug
+                    } else if form.field == 2 {
+                        &mut form.time_estimate
+                    } else {
+                        &mut form.priority
+                    };
                     target.push(c);
                 }
                 _ => {}
             }
         }
+        Mode::TicketOptions(form) => match code {
+            KeyCode::Esc | KeyCode::Char('q') => app.mode = Mode::Detail,
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !form.actions.is_empty() {
+                    form.selected = (form.selected + 1).min(form.actions.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+            }
+            KeyCode::Enter => app.submit_ticket_option().await?,
+            _ => {}
+        },
         Mode::DevQaPrompt(form) => match code {
             // Esc cancels the launch; the ticket stays transitioned to Dev QA.
             KeyCode::Esc => app.mode = Mode::Detail,
             // Single toggle field — arrows/space/tab flip worktree ↔ branch-in-repo.
-            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') | KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Char(' ')
+            | KeyCode::Tab
+            | KeyCode::BackTab => {
                 form.use_worktree = !form.use_worktree;
             }
-            KeyCode::Enter | KeyCode::F(5) => { app.submit_devqa_prompt().await?; }
+            KeyCode::Enter | KeyCode::F(5) => {
+                app.submit_devqa_prompt().await?;
+            }
             KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
                 app.submit_devqa_prompt().await?;
             }
@@ -8847,7 +10650,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         },
         Mode::DevQaResolveConfirm(_) => match code {
             KeyCode::Esc | KeyCode::Char('n') => app.mode = Mode::Detail,
-            KeyCode::Enter | KeyCode::Char('y') => { app.submit_devqa_resolve().await?; }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                app.submit_devqa_resolve().await?;
+            }
             _ => {}
         },
         Mode::DevQaCleanupConfirm(_) => match code {
@@ -8856,7 +10661,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 app.mode = Mode::Detail;
                 app.status = "DevQA worktree kept (uncommitted changes)".into();
             }
-            KeyCode::Enter | KeyCode::Char('y') => { app.confirm_devqa_cleanup().await?; }
+            KeyCode::Enter | KeyCode::Char('y') => {
+                app.confirm_devqa_cleanup().await?;
+            }
             _ => {}
         },
         Mode::EditPriority(form) => match code {
@@ -8877,11 +10684,19 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             KeyCode::Tab => form.field ^= 1,
             KeyCode::Enter => app.submit_edit_time().await?,
             KeyCode::Backspace => {
-                let target = if form.field == 0 { &mut form.original_estimate } else { &mut form.log_work };
+                let target = if form.field == 0 {
+                    &mut form.original_estimate
+                } else {
+                    &mut form.log_work
+                };
                 target.pop();
             }
             KeyCode::Char(c) => {
-                let target = if form.field == 0 { &mut form.original_estimate } else { &mut form.log_work };
+                let target = if form.field == 0 {
+                    &mut form.original_estimate
+                } else {
+                    &mut form.log_work
+                };
                 target.push(c);
             }
             _ => {}
@@ -8909,10 +10724,14 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             KeyCode::Char('k') | KeyCode::Up => {
                 form.selected = form.selected.saturating_sub(1);
             }
-            KeyCode::Char('r') => { app.open_confluence_spaces().await?; }
+            KeyCode::Char('r') => {
+                app.open_confluence_spaces().await?;
+            }
             KeyCode::Enter => {
                 let (key, name) = {
-                    let Some(space) = form.spaces.get(form.selected) else { return Ok(()) };
+                    let Some(space) = form.spaces.get(form.selected) else {
+                        return Ok(());
+                    };
                     (space.key.clone(), space.name.clone())
                 };
                 app.open_confluence_pages(key, name).await?;
@@ -8942,7 +10761,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     }
                     KeyCode::Char('j') | KeyCode::Down => {
                         let n = form.search_results.len();
-                        if n > 0 { form.search_selected = (form.search_selected + 1).min(n - 1); }
+                        if n > 0 {
+                            form.search_selected = (form.search_selected + 1).min(n - 1);
+                        }
                     }
                     KeyCode::Char('k') | KeyCode::Up => {
                         form.search_selected = form.search_selected.saturating_sub(1);
@@ -8957,75 +10778,94 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             // Normal (non-search) navigation.
             match code {
-            KeyCode::Esc | KeyCode::Char('q') => {
-                let has_crumb = !form.breadcrumb.is_empty();
-                if has_crumb {
-                    app.confluence_go_back().await?;
-                } else {
-                    app.open_confluence_spaces().await?;
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    let has_crumb = !form.breadcrumb.is_empty();
+                    if has_crumb {
+                        app.confluence_go_back().await?;
+                    } else {
+                        app.open_confluence_spaces().await?;
+                    }
                 }
-            }
-            KeyCode::Char('h') | KeyCode::Left => {
-                let has_crumb = !form.breadcrumb.is_empty();
-                if has_crumb {
-                    app.confluence_go_back().await?;
-                } else {
-                    app.open_confluence_spaces().await?;
+                KeyCode::Char('h') | KeyCode::Left => {
+                    let has_crumb = !form.breadcrumb.is_empty();
+                    if has_crumb {
+                        app.confluence_go_back().await?;
+                    } else {
+                        app.open_confluence_spaces().await?;
+                    }
                 }
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !form.pages.is_empty() {
-                    form.selected = (form.selected + 1).min(form.pages.len() - 1);
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !form.pages.is_empty() {
+                        form.selected = (form.selected + 1).min(form.pages.len() - 1);
+                    }
                 }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                form.selected = form.selected.saturating_sub(1);
-            }
-            KeyCode::Char('l') | KeyCode::Right => {
-                app.confluence_drill_down().await?;
-            }
-            KeyCode::Char('/') => {
-                if let Mode::ConfluencePages(f) = &mut app.mode {
-                    f.search_active = true;
-                    f.search_query = String::new();
-                    f.search_results = vec![];
-                    f.search_error = None;
-                    f.search_submitted = false;
+                KeyCode::Char('k') | KeyCode::Up => {
+                    form.selected = form.selected.saturating_sub(1);
                 }
+                KeyCode::Char('l') | KeyCode::Right => {
+                    app.confluence_drill_down().await?;
+                }
+                KeyCode::Char('/') => {
+                    if let Mode::ConfluencePages(f) = &mut app.mode {
+                        f.search_active = true;
+                        f.search_query = String::new();
+                        f.search_results = vec![];
+                        f.search_error = None;
+                        f.search_submitted = false;
+                    }
+                }
+                KeyCode::Enter => {
+                    app.open_page_view().await?;
+                }
+                KeyCode::Char('S') => {
+                    app.confluence_sync().await?;
+                }
+                _ => {}
             }
-            KeyCode::Enter => { app.open_page_view().await?; }
-            KeyCode::Char('S') => { app.confluence_sync().await?; }
-            _ => {}
-            }
-        },
+        }
 
         Mode::PageView(form) => {
             if form.search_active {
                 match code {
                     KeyCode::Esc => {
-                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        let form = match &mut app.mode {
+                            Mode::PageView(f) => f,
+                            _ => return Ok(()),
+                        };
                         form.search_active = false;
                         form.search_query.clear();
                         form.search_matches.clear();
                     }
                     KeyCode::Backspace => {
-                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        let form = match &mut app.mode {
+                            Mode::PageView(f) => f,
+                            _ => return Ok(()),
+                        };
                         form.search_query.pop();
-                        form.search_matches = find_page_search_matches(&form.lines, &form.search_query);
+                        form.search_matches =
+                            find_page_search_matches(&form.lines, &form.search_query);
                         form.search_cursor = 0;
                     }
                     KeyCode::Enter | KeyCode::Char('n') => {
-                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        let form = match &mut app.mode {
+                            Mode::PageView(f) => f,
+                            _ => return Ok(()),
+                        };
                         if !form.search_matches.is_empty() {
-                            form.search_cursor = (form.search_cursor + 1) % form.search_matches.len();
+                            form.search_cursor =
+                                (form.search_cursor + 1) % form.search_matches.len();
                             let target = form.search_matches[form.search_cursor];
                             form.scroll = target.saturating_sub(form.viewport_height / 2);
                         }
                     }
                     KeyCode::Char('N') => {
-                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        let form = match &mut app.mode {
+                            Mode::PageView(f) => f,
+                            _ => return Ok(()),
+                        };
                         if !form.search_matches.is_empty() {
-                            form.search_cursor = form.search_cursor
+                            form.search_cursor = form
+                                .search_cursor
                                 .checked_sub(1)
                                 .unwrap_or(form.search_matches.len() - 1);
                             let target = form.search_matches[form.search_cursor];
@@ -9033,9 +10873,13 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         }
                     }
                     KeyCode::Char(c) => {
-                        let form = match &mut app.mode { Mode::PageView(f) => f, _ => return Ok(()) };
+                        let form = match &mut app.mode {
+                            Mode::PageView(f) => f,
+                            _ => return Ok(()),
+                        };
                         form.search_query.push(c);
-                        form.search_matches = find_page_search_matches(&form.lines, &form.search_query);
+                        form.search_matches =
+                            find_page_search_matches(&form.lines, &form.search_query);
                         form.search_cursor = 0;
                         if let Some(&first) = form.search_matches.first() {
                             form.scroll = first.saturating_sub(form.viewport_height / 2);
@@ -9046,7 +10890,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 return Ok(());
             }
             // Normal page-view navigation.
-            let max_scroll = |form: &PageViewForm| form.lines.len().saturating_sub(form.viewport_height);
+            let max_scroll =
+                |form: &PageViewForm| form.lines.len().saturating_sub(form.viewport_height);
             match code {
                 KeyCode::Char('q') | KeyCode::Esc => {
                     // Restore previous ConfluencePages mode.
@@ -9063,7 +10908,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     }
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
-                    if let Mode::PageView(f) = &mut app.mode { f.scroll = f.scroll.saturating_sub(1); }
+                    if let Mode::PageView(f) = &mut app.mode {
+                        f.scroll = f.scroll.saturating_sub(1);
+                    }
                 }
                 KeyCode::Char('d') | KeyCode::PageDown => {
                     if let Mode::PageView(f) = &mut app.mode {
@@ -9079,7 +10926,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     }
                 }
                 KeyCode::Char('g') | KeyCode::Home => {
-                    if let Mode::PageView(f) = &mut app.mode { f.scroll = 0; }
+                    if let Mode::PageView(f) = &mut app.mode {
+                        f.scroll = 0;
+                    }
                 }
                 KeyCode::Char('G') | KeyCode::End => {
                     if let Mode::PageView(f) = &mut app.mode {
@@ -9107,7 +10956,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 KeyCode::Char('N') => {
                     if let Mode::PageView(f) = &mut app.mode {
                         if !f.search_matches.is_empty() {
-                            f.search_cursor = f.search_cursor
+                            f.search_cursor = f
+                                .search_cursor
                                 .checked_sub(1)
                                 .unwrap_or(f.search_matches.len() - 1);
                             let t = f.search_matches[f.search_cursor];
@@ -9116,13 +10966,59 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         }
                     }
                 }
-                KeyCode::Char('e') => { app.page_view_open_editor().await?; }
-                KeyCode::Char('S') => { app.page_view_sync().await?; }
+                KeyCode::Char('e') => {
+                    app.page_view_open_editor().await?;
+                }
+                KeyCode::Char('S') => {
+                    app.page_view_sync().await?;
+                }
                 _ => {}
             }
-        },
+        }
         Mode::Tree(_) => match code {
-            KeyCode::Esc | KeyCode::Char('q') => { app.mode = Mode::List; }
+            KeyCode::Char('/') => {
+                app.ticket_search_active = true;
+                app.ticket_search_query.clear();
+                if let Mode::Tree(f) = &mut app.mode {
+                    f.selected = 0;
+                }
+                app.status = "tree search: type key/title, Esc clears".into();
+            }
+            KeyCode::Esc if app.ticket_search_active || !app.ticket_search_query.is_empty() => {
+                app.ticket_search_active = false;
+                app.ticket_search_query.clear();
+                if let Mode::Tree(f) = &mut app.mode {
+                    f.selected = 0;
+                }
+                app.status = "tree search cleared".into();
+            }
+            KeyCode::Backspace if app.ticket_search_active => {
+                app.ticket_search_query.pop();
+                let n = if let Mode::Tree(f) = &app.mode {
+                    app.tree_search_visible(f).len()
+                } else {
+                    0
+                };
+                if let Mode::Tree(f) = &mut app.mode {
+                    f.selected = f.selected.min(n.saturating_sub(1));
+                }
+            }
+            KeyCode::Char(ch)
+                if app.ticket_search_active && !mods.contains(KeyModifiers::CONTROL) =>
+            {
+                app.ticket_search_query.push(ch);
+                let n = if let Mode::Tree(f) = &app.mode {
+                    app.tree_search_visible(f).len()
+                } else {
+                    0
+                };
+                if let Mode::Tree(f) = &mut app.mode {
+                    f.selected = f.selected.min(n.saturating_sub(1));
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.mode = Mode::List;
+            }
             KeyCode::Char('K') => {
                 // Same toggle semantics as List view, plus a tree rebuild so
                 // the filter+sort actually applies (the K handler at the top
@@ -9136,9 +11032,14 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 app.open_tree().await?;
             }
             KeyCode::Char('j') | KeyCode::Down => {
+                let n = if let Mode::Tree(f) = &app.mode {
+                    app.tree_search_visible(f).len()
+                } else {
+                    0
+                };
                 if let Mode::Tree(f) = &mut app.mode {
-                    if !f.visible.is_empty() {
-                        f.selected = (f.selected + 1).min(f.visible.len() - 1);
+                    if n > 0 {
+                        f.selected = (f.selected + 1).min(n - 1);
                     }
                 }
             }
@@ -9148,16 +11049,30 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
             }
             KeyCode::Char('g') => {
-                if let Mode::Tree(f) = &mut app.mode { f.selected = 0; }
+                if let Mode::Tree(f) = &mut app.mode {
+                    f.selected = 0;
+                }
             }
             KeyCode::Char('G') => {
+                let n = if let Mode::Tree(f) = &app.mode {
+                    app.tree_search_visible(f).len()
+                } else {
+                    0
+                };
                 if let Mode::Tree(f) = &mut app.mode {
-                    if !f.visible.is_empty() { f.selected = f.visible.len() - 1; }
+                    if n > 0 {
+                        f.selected = n - 1;
+                    }
                 }
             }
             KeyCode::Char('o') | KeyCode::Tab => {
+                let idx = if let Mode::Tree(f) = &app.mode {
+                    app.tree_search_visible(f).get(f.selected).copied()
+                } else {
+                    None
+                };
                 if let Mode::Tree(f) = &mut app.mode {
-                    if let Some(&idx) = f.visible.get(f.selected) {
+                    if let Some(idx) = idx {
                         f.nodes[idx].expanded = !f.nodes[idx].expanded;
                         recompute_tree_visible(f);
                     }
@@ -9165,25 +11080,34 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             KeyCode::Char('O') => {
                 if let Mode::Tree(f) = &mut app.mode {
-                    for n in &mut f.nodes { n.expanded = true; }
+                    for n in &mut f.nodes {
+                        n.expanded = true;
+                    }
                     recompute_tree_visible(f);
                 }
             }
             KeyCode::Char('C') => {
                 if let Mode::Tree(f) = &mut app.mode {
-                    for n in &mut f.nodes { n.expanded = false; }
+                    for n in &mut f.nodes {
+                        n.expanded = false;
+                    }
                     recompute_tree_visible(f);
                 }
             }
             KeyCode::Char('v') => {
-                if let Mode::Tree(f) = &mut app.mode { f.two_column = !f.two_column; }
+                if let Mode::Tree(f) = &mut app.mode {
+                    f.two_column = !f.two_column;
+                }
             }
             KeyCode::Char('c') => {
                 let info = if let Mode::Tree(f) = &app.mode {
-                    f.visible.get(f.selected).map(|&i| {
-                        (f.nodes[i].key.clone(), f.nodes[i].issue_type.clone())
-                    })
-                } else { None };
+                    app.tree_search_visible(f)
+                        .get(f.selected)
+                        .copied()
+                        .map(|i| (f.nodes[i].key.clone(), f.nodes[i].issue_type.clone()))
+                } else {
+                    None
+                };
                 if let Some((parent_key, parent_type)) = info {
                     let pt = parent_type.as_deref().unwrap_or("");
                     if pt.eq_ignore_ascii_case("sub-task") || pt.eq_ignore_ascii_case("subtask") {
@@ -9191,7 +11115,12 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         return Ok(());
                     }
                     let project_key = parent_key.split('-').next().unwrap_or("").to_string();
-                    let issue_type = if pt.eq_ignore_ascii_case("epic") { "Story" } else { "Sub-task" }.to_string();
+                    let issue_type = if pt.eq_ignore_ascii_case("epic") {
+                        "Story"
+                    } else {
+                        "Sub-task"
+                    }
+                    .to_string();
                     app.mode = Mode::Create(CreateForm {
                         project: project_key,
                         issue_type,
@@ -9200,18 +11129,30 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         time_estimate: String::new(),
                         priority: String::new(),
                         field: 2, // jump to summary
-                        assignee: String::new(), assignee_id: None, assignee_results: vec![], assignee_picker_selected: 0, parent: Some(parent_key),
+                        assignee: String::new(),
+                        assignee_id: None,
+                        assignee_results: vec![],
+                        assignee_picker_selected: 0,
+                        parent: Some(parent_key),
                         error: None,
                     });
                 }
             }
             KeyCode::Enter => {
                 let key_opt = if let Mode::Tree(f) = &app.mode {
-                    f.visible.get(f.selected).map(|&i| f.nodes[i].key.clone())
-                } else { None };
+                    app.tree_search_visible(f)
+                        .get(f.selected)
+                        .map(|&i| f.nodes[i].key.clone())
+                } else {
+                    None
+                };
                 if let Some(key) = key_opt {
                     app.detail_origin = DetailOrigin::List;
-                    if let Some(pos) = app.active_idxs.iter().position(|&i| app.tickets[i].key == key) {
+                    if let Some(pos) = app
+                        .active_idxs
+                        .iter()
+                        .position(|&i| app.tickets[i].key == key)
+                    {
                         app.list_selected = pos;
                     }
                     // Push the TreeForm onto the back-stack so Esc returns here.
@@ -9241,9 +11182,13 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 let key = if let Mode::ArchiveConfirm(f) = &app.mode {
                     f.key.clone()
-                } else { return Ok(()); };
+                } else {
+                    return Ok(());
+                };
                 let mut s = ipc::connect().await?;
-                match ipc::send_request(&mut s, &Request::ArchiveTicket { key: key.clone() }).await? {
+                match ipc::send_request(&mut s, &Request::ArchiveTicket { key: key.clone() })
+                    .await?
+                {
                     Response::Ok => {
                         app.status = format!("archived {key}");
                         app.tickets.retain(|t| t.key != key);
@@ -9283,12 +11228,18 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     }
                 }
             }
-            KeyCode::Enter => { app.submit_assign_picker().await?; }
+            KeyCode::Enter => {
+                app.submit_assign_picker().await?;
+            }
             KeyCode::Backspace => {
                 if let Mode::AssignPicker(f) = &mut app.mode {
                     f.query.pop();
                 }
-                let q = if let Mode::AssignPicker(f) = &app.mode { f.query.clone() } else { String::new() };
+                let q = if let Mode::AssignPicker(f) = &app.mode {
+                    f.query.clone()
+                } else {
+                    String::new()
+                };
                 if q.len() >= 2 {
                     app.refresh_assign_picker().await?;
                 } else if let Mode::AssignPicker(f) = &mut app.mode {
@@ -9301,7 +11252,11 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     f.query.push(c);
                     f.error = None;
                 }
-                let q = if let Mode::AssignPicker(f) = &app.mode { f.query.clone() } else { String::new() };
+                let q = if let Mode::AssignPicker(f) = &app.mode {
+                    f.query.clone()
+                } else {
+                    String::new()
+                };
                 if q.len() >= 2 {
                     app.refresh_assign_picker().await?;
                 }
@@ -9335,7 +11290,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                             }
                         }
                     }
-                    KeyCode::Enter => { app.commit_remote_pick().await?; }
+                    KeyCode::Enter => {
+                        app.commit_remote_pick().await?;
+                    }
                     _ => {}
                 }
                 return Ok(());
@@ -9348,12 +11305,16 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     KeyCode::Enter => app.submit_pending_handle().await?,
                     KeyCode::Backspace => {
                         if let Mode::PrCreate(f) = &mut app.mode {
-                            if let Some(p) = &mut f.pending_handle { p.handle.pop(); }
+                            if let Some(p) = &mut f.pending_handle {
+                                p.handle.pop();
+                            }
                         }
                     }
                     KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
                         if let Mode::PrCreate(f) = &mut app.mode {
-                            if let Some(p) = &mut f.pending_handle { p.handle.push(c); }
+                            if let Some(p) = &mut f.pending_handle {
+                                p.handle.push(c);
+                            }
                         }
                     }
                     _ => {}
@@ -9387,7 +11348,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         app.submit_pr_create().await?;
                     }
-                    KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                    KeyCode::Char(c)
+                        if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) =>
+                    {
                         app.submit_pr_create().await?;
                     }
                     KeyCode::F(5) => app.submit_pr_create().await?,
@@ -9432,11 +11395,17 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 KeyCode::BackTab => {
                     if let Mode::PrCreate(f) = &mut app.mode {
-                        f.field = if f.field == 0 { PrCreateForm::FIELD_COUNT - 1 } else { f.field - 1 };
+                        f.field = if f.field == 0 {
+                            PrCreateForm::FIELD_COUNT - 1
+                        } else {
+                            f.field - 1
+                        };
                     }
                 }
                 KeyCode::F(5) => app.pr_submit_pressed().await?,
-                KeyCode::Char(c) if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) => {
+                KeyCode::Char(c)
+                    if matches!(c, 's' | 'S') && mods.contains(KeyModifiers::CONTROL) =>
+                {
                     app.pr_submit_pressed().await?;
                 }
                 KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
@@ -9444,7 +11413,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 }
                 // Suggestion accept/reject preempts everything else when a
                 // Claude rewrite is on screen.
-                KeyCode::Char('y') | KeyCode::Char('Y') if matches!(&app.mode, Mode::PrCreate(f) if f.suggestion.is_some()) => {
+                KeyCode::Char('y') | KeyCode::Char('Y') if matches!(&app.mode, Mode::PrCreate(f) if f.suggestion.is_some()) =>
+                {
                     if let Mode::PrCreate(f) = &mut app.mode {
                         if let Some(s) = f.suggestion.take() {
                             f.body = s;
@@ -9455,7 +11425,8 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     }
                     return Ok(());
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') if matches!(&app.mode, Mode::PrCreate(f) if f.suggestion.is_some()) => {
+                KeyCode::Char('n') | KeyCode::Char('N') if matches!(&app.mode, Mode::PrCreate(f) if f.suggestion.is_some()) =>
+                {
                     if let Mode::PrCreate(f) = &mut app.mode {
                         f.suggestion = None;
                     }
@@ -9478,8 +11449,13 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     if let Mode::PrCreate(f) = &mut app.mode {
                         match f.field {
                             1 => f.body_cursor = edit_up(&f.body, f.body_cursor),
-                            2 => f.reviewer_picker_selected = f.reviewer_picker_selected.saturating_sub(1),
-                            3 => f.devqa_picker_selected = f.devqa_picker_selected.saturating_sub(1),
+                            2 => {
+                                f.reviewer_picker_selected =
+                                    f.reviewer_picker_selected.saturating_sub(1)
+                            }
+                            3 => {
+                                f.devqa_picker_selected = f.devqa_picker_selected.saturating_sub(1)
+                            }
                             _ => {}
                         }
                     }
@@ -9490,14 +11466,14 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                             1 => f.body_cursor = edit_down(&f.body, f.body_cursor),
                             2 => {
                                 if !f.reviewer_results.is_empty() {
-                                    f.reviewer_picker_selected =
-                                        (f.reviewer_picker_selected + 1).min(f.reviewer_results.len() - 1);
+                                    f.reviewer_picker_selected = (f.reviewer_picker_selected + 1)
+                                        .min(f.reviewer_results.len() - 1);
                                 }
                             }
                             3 => {
                                 if !f.devqa_results.is_empty() {
-                                    f.devqa_picker_selected =
-                                        (f.devqa_picker_selected + 1).min(f.devqa_results.len() - 1);
+                                    f.devqa_picker_selected = (f.devqa_picker_selected + 1)
+                                        .min(f.devqa_results.len() - 1);
                                 }
                             }
                             _ => {}
@@ -9548,7 +11524,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     if let Mode::PrCreate(f) = &mut app.mode {
                         match f.field {
                             2 => {
-                                if let Some((name, id)) = f.reviewer_results.get(f.reviewer_picker_selected).cloned() {
+                                if let Some((name, id)) =
+                                    f.reviewer_results.get(f.reviewer_picker_selected).cloned()
+                                {
                                     f.reviewer = Some((name, id));
                                     f.reviewer_query.clear();
                                     f.reviewer_results.clear();
@@ -9556,7 +11534,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                                 }
                             }
                             3 => {
-                                if let Some((name, id)) = f.devqa_results.get(f.devqa_picker_selected).cloned() {
+                                if let Some((name, id)) =
+                                    f.devqa_results.get(f.devqa_picker_selected).cloned()
+                                {
                                     f.devqa = Some((name, id));
                                     f.devqa_query.clear();
                                     f.devqa_results.clear();
@@ -9595,8 +11575,12 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                                     f.body_cursor = prev;
                                 }
                             }
-                            2 => { f.reviewer_query.pop(); }
-                            3 => { f.devqa_query.pop(); }
+                            2 => {
+                                f.reviewer_query.pop();
+                            }
+                            3 => {
+                                f.devqa_query.pop();
+                            }
                             _ => {}
                         }
                     }
@@ -9606,9 +11590,13 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                             3 => Some((false, f.reviewer_query.clone())),
                             _ => None,
                         }
-                    } else { None };
+                    } else {
+                        None
+                    };
                     if let Some((rev, query)) = q {
-                        if query.len() >= 2 { app.refresh_pr_picker(rev).await?; }
+                        if query.len() >= 2 {
+                            app.refresh_pr_picker(rev).await?;
+                        }
                     }
                 }
                 KeyCode::Delete => {
@@ -9652,8 +11640,12 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                             3 if f.devqa_query.len() >= 2 => Some(false),
                             _ => None,
                         }
-                    } else { None };
-                    if let Some(rev) = trigger { app.refresh_pr_picker(rev).await?; }
+                    } else {
+                        None
+                    };
+                    if let Some(rev) = trigger {
+                        app.refresh_pr_picker(rev).await?;
+                    }
                 }
                 _ => {}
             }
@@ -9682,11 +11674,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         let val = buf.trim().to_string();
                         if val.is_empty() {
                             form.adding = None;
-                        } else if form
-                            .items
-                            .iter()
-                            .any(|s| s.eq_ignore_ascii_case(&val))
-                        {
+                        } else if form.items.iter().any(|s| s.eq_ignore_ascii_case(&val)) {
                             app.status = format!("\"{val}\" already in list");
                             form.adding = None;
                         } else {
@@ -9700,7 +11688,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                             }
                         }
                     }
-                    KeyCode::Backspace => { buf.pop(); }
+                    KeyCode::Backspace => {
+                        buf.pop();
+                    }
                     KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => buf.push(c),
                     _ => {}
                 }
@@ -9721,7 +11711,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                     app.status = "type new status · enter: add · esc: cancel".into();
                 }
                 KeyCode::Char('d') => {
-                    if form.items.is_empty() { return Ok(()); }
+                    if form.items.is_empty() {
+                        return Ok(());
+                    }
                     let idx = form.selected.min(form.items.len() - 1);
                     if form.pending_remove == Some(idx) {
                         let removed = form.items.remove(idx);
@@ -9746,78 +11738,76 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             // Handled out-of-band so we can drop the outer borrow on `app.mode`
             // before invoking async picker fetches.
         }
-        Mode::PrCommentReply(_) => {
-            match code {
-                KeyCode::Esc => app.mode = Mode::Detail,
-                KeyCode::F(5) => app.submit_pr_comment_reply().await?,
-                KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
-                    app.submit_pr_comment_reply().await?;
-                }
-                KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
-                    app.submit_pr_comment_reply().await?;
-                }
-                KeyCode::Enter => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        f.body.insert(f.body_cursor, '\n');
-                        f.body_cursor += 1;
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        if f.body_cursor > 0 {
-                            let prev = edit_left(&f.body, f.body_cursor);
-                            f.body.replace_range(prev..f.body_cursor, "");
-                            f.body_cursor = prev;
-                        }
-                    }
-                }
-                KeyCode::Delete => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        if f.body_cursor < f.body.len() {
-                            let nxt = edit_right(&f.body, f.body_cursor);
-                            f.body.replace_range(f.body_cursor..nxt, "");
-                        }
-                    }
-                }
-                KeyCode::Left => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        f.body_cursor = edit_left(&f.body, f.body_cursor);
-                    }
-                }
-                KeyCode::Right => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        f.body_cursor = edit_right(&f.body, f.body_cursor);
-                    }
-                }
-                KeyCode::Up => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        f.body_cursor = edit_up(&f.body, f.body_cursor);
-                    }
-                }
-                KeyCode::Down => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        f.body_cursor = edit_down(&f.body, f.body_cursor);
-                    }
-                }
-                KeyCode::Home => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        f.body_cursor = edit_line_start(&f.body, f.body_cursor);
-                    }
-                }
-                KeyCode::End => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        f.body_cursor = edit_line_end(&f.body, f.body_cursor);
-                    }
-                }
-                KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
-                    if let Mode::PrCommentReply(f) = &mut app.mode {
-                        f.body.insert(f.body_cursor, c);
-                        f.body_cursor += c.len_utf8();
-                    }
-                }
-                _ => {}
+        Mode::PrCommentReply(_) => match code {
+            KeyCode::Esc => app.mode = Mode::Detail,
+            KeyCode::F(5) => app.submit_pr_comment_reply().await?,
+            KeyCode::Char('s') if mods.contains(KeyModifiers::CONTROL) => {
+                app.submit_pr_comment_reply().await?;
             }
-        }
+            KeyCode::Enter if mods.contains(KeyModifiers::CONTROL) => {
+                app.submit_pr_comment_reply().await?;
+            }
+            KeyCode::Enter => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    f.body.insert(f.body_cursor, '\n');
+                    f.body_cursor += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    if f.body_cursor > 0 {
+                        let prev = edit_left(&f.body, f.body_cursor);
+                        f.body.replace_range(prev..f.body_cursor, "");
+                        f.body_cursor = prev;
+                    }
+                }
+            }
+            KeyCode::Delete => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    if f.body_cursor < f.body.len() {
+                        let nxt = edit_right(&f.body, f.body_cursor);
+                        f.body.replace_range(f.body_cursor..nxt, "");
+                    }
+                }
+            }
+            KeyCode::Left => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    f.body_cursor = edit_left(&f.body, f.body_cursor);
+                }
+            }
+            KeyCode::Right => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    f.body_cursor = edit_right(&f.body, f.body_cursor);
+                }
+            }
+            KeyCode::Up => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    f.body_cursor = edit_up(&f.body, f.body_cursor);
+                }
+            }
+            KeyCode::Down => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    f.body_cursor = edit_down(&f.body, f.body_cursor);
+                }
+            }
+            KeyCode::Home => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    f.body_cursor = edit_line_start(&f.body, f.body_cursor);
+                }
+            }
+            KeyCode::End => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    f.body_cursor = edit_line_end(&f.body, f.body_cursor);
+                }
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                if let Mode::PrCommentReply(f) = &mut app.mode {
+                    f.body.insert(f.body_cursor, c);
+                    f.body_cursor += c.len_utf8();
+                }
+            }
+            _ => {}
+        },
         // Rules + RuleEdit + RuleLog + Home are routed via their own dispatch
         // (see handle_key top); these arms only exist for match exhaustiveness.
         Mode::Rules(_) | Mode::RuleEdit(_) | Mode::RuleLog(_) | Mode::Home(_) => {}

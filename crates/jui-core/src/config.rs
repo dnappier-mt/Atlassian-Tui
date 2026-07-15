@@ -90,11 +90,17 @@ pub struct NotificationConfig {
 
 impl Default for NotificationConfig {
     fn default() -> Self {
-        Self { on_mention: true, on_assignment: true, tmux_status: false }
+        Self {
+            on_mention: true,
+            on_assignment: true,
+            tmux_status: false,
+        }
     }
 }
 
-fn yes() -> bool { true }
+fn yes() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PollConfig {
@@ -103,10 +109,14 @@ pub struct PollConfig {
 }
 
 impl Default for PollConfig {
-    fn default() -> Self { Self { interval_secs: 120 } }
+    fn default() -> Self {
+        Self { interval_secs: 120 }
+    }
 }
 
-fn default_interval() -> u64 { 120 }
+fn default_interval() -> u64 {
+    120
+}
 
 /// Jira workflow states the user considers "in flight". Drives the start/stop
 /// hint label and the start_work shortcut. User-editable from the TUI via
@@ -132,6 +142,10 @@ pub struct WorkflowConfig {
     /// without a custom status).
     #[serde(default = "default_pr_submit_status")]
     pub pr_submit_status: String,
+    /// Interactive coding assistant launched from start-work / implementation /
+    /// DevQA panes. One of [`CODE_ASSISTANTS`].
+    #[serde(default = "default_code_assistant")]
+    pub code_assistant: String,
     /// Default `--permission-mode` passed to Claude Code when starting work on
     /// a ticket. One of the values in [`CLAUDE_PERMISSION_MODES`]; an empty
     /// string omits the flag entirely (Claude's built-in default). Editable
@@ -153,6 +167,9 @@ pub struct WorkflowConfig {
 pub const CLAUDE_PERMISSION_MODES: &[&str] =
     &["default", "acceptEdits", "plan", "bypassPermissions"];
 
+/// Interactive coding assistants supported by the TUI launch paths.
+pub const CODE_ASSISTANTS: &[&str] = &["claude", "opencode"];
+
 impl Default for WorkflowConfig {
     fn default() -> Self {
         Self {
@@ -160,10 +177,15 @@ impl Default for WorkflowConfig {
             default_create_status: default_create_status(),
             all_mine_exclude_status: default_all_mine_exclude_status(),
             pr_submit_status: default_pr_submit_status(),
+            code_assistant: default_code_assistant(),
             claude_permission_mode: default_claude_permission_mode(),
             kanban_column_order: Vec::new(),
         }
     }
+}
+
+fn default_code_assistant() -> String {
+    "claude".to_string()
 }
 
 fn default_claude_permission_mode() -> String {

@@ -1,16 +1,23 @@
-use crate::app::{App, AssignPurpose, DetailFocus, DetailLinkedProject, MentionRole, Mode, PageLine, PendingDelete, PrUserState, TreeForm, TreeNode};
+use crate::app::{
+    App, AssignPurpose, DetailFocus, DetailLinkedProject, MentionRole, Mode, PageLine,
+    PendingDelete, PrUserState, TicketOptionAction, TreeForm, TreeNode,
+};
 use jui_core::ticket::{fmt_date, fmt_seconds, parse_reply, priority_rank, Comment};
+use ratatui::layout::Alignment;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::layout::Alignment;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(2)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
         .split(f.area());
     draw_header(f, chunks[0], app);
     match &app.mode {
@@ -52,6 +59,10 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::ArchiveConfirm(_) => {
             draw_detail(f, chunks[1], app);
             draw_archive_confirm(f, app);
+        }
+        Mode::TicketOptions(_) => {
+            draw_detail(f, chunks[1], app);
+            draw_ticket_options(f, app);
         }
         Mode::PrCreate(_) => {
             draw_detail(f, chunks[1], app);
@@ -108,8 +119,10 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Mode::AssignPicker(form) => match form.purpose {
             AssignPurpose::Assignee => "assign",
             AssignPurpose::Reviewer => "reviewer",
+            AssignPurpose::DevQa => "dev qa",
         },
         Mode::ArchiveConfirm(_) => "archive?",
+        Mode::TicketOptions(_) => "options",
         Mode::PrCreate(_) => "pr",
         Mode::ActiveStatusConfig(_) => "workflow",
         Mode::Settings(_) => "settings",
@@ -133,7 +146,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
             &conf_pages_label
         }
     };
-    let cyan_bold = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let cyan_bold = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let prefix = format!(" jui — {}  |  ", mode);
     // Heuristic: surface error-shaped status messages in bold red so silent
     // failures (e.g. dirty-tree start-work) stop hiding in the noise.
@@ -174,10 +189,7 @@ fn draw_list(f: &mut Frame, area: Rect, app: &App) {
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(8),
-            Constraint::Length(mentioned_h),
-        ])
+        .constraints([Constraint::Min(8), Constraint::Length(mentioned_h)])
         .split(area);
     draw_list_active(f, chunks[0], app);
     draw_list_mentioned(f, chunks[1], app);
@@ -193,13 +205,13 @@ fn draw_list_active(f: &mut Frame, area: Rect, app: &App) {
     let key_grow = (extra / 6).min(6);
     let status_grow = (extra / 3).min(16);
     let mut prev_crumb: Option<String> = None;
-    let items: Vec<ListItem> = app
-        .active_idxs
+    let rows = app.active_search_rows();
+    let total_active = rows.len();
+    let items: Vec<ListItem> = rows
         .iter()
-        .enumerate()
         .filter_map(|(row_pos, i)| {
             let t = app.tickets.get(*i)?;
-            let depth = app.active_row_depths.get(row_pos).copied().unwrap_or(0);
+            let depth = app.active_row_depths.get(*row_pos).copied().unwrap_or(0);
             let child_count = app.parent_child_counts.get(&t.key).copied().unwrap_or(0);
             let expanded = app.expanded_parents.contains(&t.key);
 
@@ -219,11 +231,16 @@ fn draw_list_active(f: &mut Frame, area: Rect, app: &App) {
             let mut spans: Vec<Span> = Vec::new();
             if depth > 0 {
                 let indent = "  ".repeat(depth);
-                spans.push(Span::styled(format!("{indent}└─ "), Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format!("{indent}└─ "),
+                    Style::default().fg(Color::DarkGray),
+                ));
             } else if child_count > 0 {
                 let glyph = if expanded { "▾ " } else { "▸ " };
                 let style = if expanded {
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::Cyan)
                 };
@@ -242,7 +259,11 @@ fn draw_list_active(f: &mut Frame, area: Rect, app: &App) {
             ));
             let status_width = 14 + status_grow;
             spans.push(Span::styled(
-                format!("{:<width$} ", truncate(&t.status, status_width), width = status_width),
+                format!(
+                    "{:<width$} ",
+                    truncate(&t.status, status_width),
+                    width = status_width
+                ),
                 Style::default().fg(Color::Green),
             ));
             spans.push(priority_span(t.priority.as_deref()));
@@ -261,10 +282,20 @@ fn draw_list_active(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let mut state = ListState::default();
-    state.select(if app.active_idxs.is_empty() || !focused { None } else { Some(app.list_selected) });
+    state.select(if total_active == 0 || !focused {
+        None
+    } else {
+        Some(app.list_selected.min(total_active - 1))
+    });
+    let search_label = if app.ticket_search_active || !app.ticket_search_query.is_empty() {
+        format!(" · /{}", app.ticket_search_query)
+    } else {
+        String::new()
+    };
     let title = format!(
-        " Jira Assigned — {} · sort: {} {}",
-        app.active_idxs.len(),
+        " Jira Assigned — {}{} · sort: {} {}",
+        total_active,
+        search_label,
         app.sort_mode.label(),
         if app.inactive_idxs.is_empty() {
             String::new()
@@ -273,8 +304,17 @@ fn draw_list_active(f: &mut Frame, area: Rect, app: &App) {
         }
     );
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).border_style(focus_border(focused)).title(title))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(focus_border(focused))
+                .title(title),
+        )
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol(if focused { "▶ " } else { "  " });
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -301,7 +341,9 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 " (none) — you're not a reviewer or @-mentioned on any open tickets",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             )),
             inner,
         );
@@ -333,12 +375,19 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
             }
             spans.push(Span::styled(format!("{badge} "), badge_style));
             spans.push(Span::styled(format!("{glyph} "), glyph_style));
-            spans.push(Span::styled(format!("{:<12} ", t.key), Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(
+                format!("{:<12} ", t.key),
+                Style::default().fg(Color::Yellow),
+            ));
             // Status column auto-sizes to the longest visible status, capped
             // at 28 chars so workflow names like "Firmware Dev QA In Progress"
             // fit and the priority + summary aren't pushed under it.
             spans.push(Span::styled(
-                format!("{:<width$} ", truncate(&t.status, status_w), width = status_w),
+                format!(
+                    "{:<width$} ",
+                    truncate(&t.status, status_w),
+                    width = status_w
+                ),
                 Style::default().fg(Color::Green),
             ));
             spans.push(priority_span(t.priority.as_deref()));
@@ -348,10 +397,18 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let mut state = ListState::default();
-    state.select(if focused && total > 0 { Some(app.mentioned_selected.min(total - 1)) } else { None });
+    state.select(if focused && total > 0 {
+        Some(app.mentioned_selected.min(total - 1))
+    } else {
+        None
+    });
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol(if focused { "▶ " } else { "  " });
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -371,7 +428,9 @@ fn devqa_or_pr_label(
     {
         return Some((
             "STARTED",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     pr_state_label(role, pr_state?)
@@ -387,15 +446,21 @@ fn pr_state_label(role: MentionRole, state: PrUserState) -> Option<(&'static str
     Some(match state {
         PrUserState::Awaiting => (
             "AWAIT  ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ),
         PrUserState::Reviewing => (
             "REVIEW ",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         PrUserState::Completed => (
             "DONE   ",
-            Style::default().fg(Color::Green).add_modifier(Modifier::DIM),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::DIM),
         ),
     })
 }
@@ -407,7 +472,7 @@ fn pr_state_label(role: MentionRole, state: PrUserState) -> Option<(&'static str
 /// glyph; the user reads color to tell them apart.
 fn role_badge(role: MentionRole) -> (&'static str, Style) {
     let purple = Color::Rgb(170, 130, 255); // Jira side
-    let blue = Color::Rgb(80, 160, 255);    // GitHub side
+    let blue = Color::Rgb(80, 160, 255); // GitHub side
     match role {
         MentionRole::Assigned => (
             "[A]",
@@ -444,11 +509,22 @@ fn draw_archive(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
     let mut state = ListState::default();
-    state.select(if app.inactive_idxs.is_empty() { None } else { Some(app.archive_selected) });
-    let title = format!(" archive — {} resolved/done/closed · sort: updated ", app.inactive_idxs.len());
+    state.select(if app.inactive_idxs.is_empty() {
+        None
+    } else {
+        Some(app.archive_selected)
+    });
+    let title = format!(
+        " archive — {} resolved/done/closed · sort: updated ",
+        app.inactive_idxs.len()
+    );
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, area, &mut state);
 }
@@ -460,9 +536,19 @@ fn draw_kanban(f: &mut Frame, area: Rect, app: &App) {
     let title = if app.kanban_assignee_filter.is_empty() {
         format!(" kanban — {} tickets · {} columns ", total, n)
     } else {
-        let mut names: Vec<&str> = app.kanban_assignee_filter.iter().map(|s| s.as_str()).collect();
+        let mut names: Vec<&str> = app
+            .kanban_assignee_filter
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         names.sort();
-        format!(" kanban: {} — {} tickets ({} extra) · {} columns ", names.join(", "), total, app.kanban_extra.len(), n)
+        format!(
+            " kanban: {} — {} tickets ({} extra) · {} columns ",
+            names.join(", "),
+            total,
+            app.kanban_extra.len(),
+            n
+        )
     };
     let outer = Block::default().borders(Borders::ALL).title(title);
     let inner = outer.inner(area);
@@ -503,7 +589,12 @@ fn draw_kanban(f: &mut Frame, area: Rect, app: &App) {
     // Draw minimised strips on the left edge.
     for (slot, &ci) in left_min.iter().enumerate() {
         let x = inner.x + slot as u16 * strip_w;
-        let strip = Rect { x, y: inner.y, width: strip_w, height: inner.height };
+        let strip = Rect {
+            x,
+            y: inner.y,
+            width: strip_w,
+            height: inner.height,
+        };
         let (status, idxs) = &cols[ci];
         draw_minimized_column(f, strip, status, idxs.len(), ci == app.kanban_col);
     }
@@ -511,7 +602,12 @@ fn draw_kanban(f: &mut Frame, area: Rect, app: &App) {
     // Draw minimised strips on the right edge.
     for (slot, &ci) in right_min.iter().enumerate() {
         let x = inner.x + left_strips_w + middle_w + slot as u16 * strip_w;
-        let strip = Rect { x, y: inner.y, width: strip_w, height: inner.height };
+        let strip = Rect {
+            x,
+            y: inner.y,
+            width: strip_w,
+            height: inner.height,
+        };
         let (status, idxs) = &cols[ci];
         draw_minimized_column(f, strip, status, idxs.len(), ci == app.kanban_col);
     }
@@ -520,12 +616,20 @@ fn draw_kanban(f: &mut Frame, area: Rect, app: &App) {
     if expanded_idxs.is_empty() || middle_w == 0 {
         return;
     }
-    let middle_area = Rect { x: inner.x + left_strips_w, y: inner.y, width: middle_w, height: inner.height };
+    let middle_area = Rect {
+        x: inner.x + left_strips_w,
+        y: inner.y,
+        width: middle_w,
+        height: inner.height,
+    };
     let min_col_w: u16 = 22;
     let max_visible = ((middle_w / min_col_w) as usize).max(1);
     let visible_n = expanded_idxs.len().min(max_visible);
     // Slide window to keep focused expanded column visible.
-    let focused_pos = expanded_idxs.iter().position(|&i| i == app.kanban_col).unwrap_or(0);
+    let focused_pos = expanded_idxs
+        .iter()
+        .position(|&i| i == app.kanban_col)
+        .unwrap_or(0);
     let start = if expanded_idxs.len() <= visible_n {
         0
     } else {
@@ -571,9 +675,17 @@ fn draw_minimized_column(f: &mut Frame, area: Rect, status: &str, count: usize, 
     let chars: Vec<char> = status.chars().collect();
     let name_rows = inner.height.saturating_sub(if count > 0 { 1 } else { 0 }) as usize;
     for (row, ch) in chars.iter().take(name_rows).enumerate() {
-        let cell = Rect { x: inner.x, y: inner.y + row as u16, width: 1, height: 1 };
+        let cell = Rect {
+            x: inner.x,
+            y: inner.y + row as u16,
+            width: 1,
+            height: 1,
+        };
         f.render_widget(
-            Paragraph::new(Span::styled(ch.to_string(), Style::default().fg(text_color))),
+            Paragraph::new(Span::styled(
+                ch.to_string(),
+                Style::default().fg(text_color),
+            )),
             cell,
         );
     }
@@ -582,7 +694,12 @@ fn draw_minimized_column(f: &mut Frame, area: Rect, status: &str, count: usize, 
     if count > 0 && inner.height > 0 {
         let count_str = count.to_string();
         let cy = inner.y + inner.height - 1;
-        let cell = Rect { x: inner.x, y: cy, width: 1.max(count_str.len() as u16).min(inner.width), height: 1 };
+        let cell = Rect {
+            x: inner.x,
+            y: cy,
+            width: 1.max(count_str.len() as u16).min(inner.width),
+            height: 1,
+        };
         f.render_widget(
             Paragraph::new(Span::styled(count_str, Style::default().fg(Color::Yellow))),
             cell,
@@ -600,9 +717,13 @@ fn draw_kanban_column(
     card_sel: usize,
 ) {
     let header_style = if focused {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD)
     };
     let title = format!(" {} {} ", status.to_uppercase(), idxs.len());
     let block = Block::default()
@@ -642,9 +763,16 @@ fn draw_kanban_column(
 
     for (slot, i) in (scroll_start..scroll_end).enumerate() {
         let y = inner.y + (slot as u16) * card_h;
-        let card_area = Rect { x: inner.x, y, width: inner.width, height: card_h };
+        let card_area = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: card_h,
+        };
         let selected = focused && i == card_sel;
-        let Some(t) = app.kanban_ticket(idxs[i]) else { continue };
+        let Some(t) = app.kanban_ticket(idxs[i]) else {
+            continue;
+        };
         draw_kanban_card(f, card_area, t, selected);
     }
 }
@@ -657,11 +785,20 @@ fn draw_kanban_column_expanded(
     idxs: &[usize],
     card_sel: usize,
 ) {
-    let title = format!(" {} {} — expanded (e to collapse) ", status.to_uppercase(), idxs.len());
+    let title = format!(
+        " {} {} — expanded (e to collapse) ",
+        status.to_uppercase(),
+        idxs.len()
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(title, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -681,21 +818,37 @@ fn draw_kanban_column_expanded(
 
     for (slot, i) in (scroll_start..scroll_end).enumerate() {
         let y = inner.y + (slot as u16) * card_h;
-        let card_area = Rect { x: inner.x, y, width: inner.width, height: card_h };
+        let card_area = Rect {
+            x: inner.x,
+            y,
+            width: inner.width,
+            height: card_h,
+        };
         let selected = i == card_sel;
-        let Some(t) = app.kanban_ticket(idxs[i]) else { continue };
+        let Some(t) = app.kanban_ticket(idxs[i]) else {
+            continue;
+        };
         draw_kanban_card_expanded(f, card_area, t, selected);
     }
 }
 
-fn draw_kanban_card_expanded(f: &mut Frame, area: Rect, t: &jui_core::ticket::Ticket, selected: bool) {
+fn draw_kanban_card_expanded(
+    f: &mut Frame,
+    area: Rect,
+    t: &jui_core::ticket::Ticket,
+    selected: bool,
+) {
     use jui_core::ticket::fmt_seconds;
     let border_style = if selected {
-        Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let block = Block::default().borders(Borders::ALL).border_style(border_style);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -706,12 +859,24 @@ fn draw_kanban_card_expanded(f: &mut Frame, area: Rect, t: &jui_core::ticket::Ti
     // Row 1: key  type  parent summary
     let issue_type = t.issue_type.as_deref().unwrap_or("");
     let parent_budget = w.saturating_sub(t.key.len() + issue_type.len() + 4);
-    let parent_text = truncate(t.parent_summary.as_deref().unwrap_or_default(), parent_budget);
+    let parent_text = truncate(
+        t.parent_summary.as_deref().unwrap_or_default(),
+        parent_budget,
+    );
     let key_line = Line::from(vec![
-        Span::styled(t.key.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            t.key.clone(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(issue_type.to_string(), Style::default().fg(Color::Blue)),
-        Span::raw(if issue_type.is_empty() { String::new() } else { "  ".to_string() }),
+        Span::raw(if issue_type.is_empty() {
+            String::new()
+        } else {
+            "  ".to_string()
+        }),
         Span::styled(parent_text, Style::default().fg(Color::DarkGray)),
     ]);
 
@@ -776,11 +941,15 @@ fn draw_kanban_card_expanded(f: &mut Frame, area: Rect, t: &jui_core::ticket::Ti
 
 fn draw_kanban_card(f: &mut Frame, area: Rect, t: &jui_core::ticket::Ticket, selected: bool) {
     let border_style = if selected {
-        Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::LightCyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let block = Block::default().borders(Borders::ALL).border_style(border_style);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style);
     let inner = block.inner(area);
     f.render_widget(block, area);
     if inner.height == 0 || inner.width == 0 {
@@ -793,7 +962,12 @@ fn draw_kanban_card(f: &mut Frame, area: Rect, t: &jui_core::ticket::Ticket, sel
         parent_budget,
     );
     let key_line = Line::from(vec![
-        Span::styled(t.key.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            t.key.clone(),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw("  "),
         Span::styled(parent_text, Style::default().fg(Color::DarkGray)),
     ]);
@@ -851,21 +1025,34 @@ fn assignee_color(name: &str) -> Color {
         Color::LightRed,
         Color::Blue,
     ];
-    let hash = name.bytes().fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
+    let hash = name
+        .bytes()
+        .fold(0u32, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u32));
     PALETTE[(hash as usize) % PALETTE.len()]
 }
 
 fn draw_kanban_filter(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::KanbanFilter(form) = &app.mode else { return };
+    let Mode::KanbanFilter(form) = &app.mode else {
+        return;
+    };
 
     let popup_w = 56_u16.min(area.width.saturating_sub(4));
     // Extra rows if teams exist or save prompt active.
     let save_rows: u16 = if form.save_name.is_some() { 2 } else { 0 };
-    let team_rows: u16 = if form.teams.is_empty() { 0 } else { form.teams.len() as u16 + 1 }; // +1 separator
+    let team_rows: u16 = if form.teams.is_empty() {
+        0
+    } else {
+        form.teams.len() as u16 + 1
+    }; // +1 separator
     let popup_h = (4 + team_rows + save_rows + 18).min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-    let popup_area = Rect { x, y, width: popup_w, height: popup_h };
+    let popup_area = Rect {
+        x,
+        y,
+        width: popup_w,
+        height: popup_h,
+    };
 
     f.render_widget(ratatui::widgets::Clear, popup_area);
 
@@ -874,13 +1061,23 @@ fn draw_kanban_filter(f: &mut Frame, area: Rect, app: &App) {
     } else {
         format!(" filter: {} selected ", app.kanban_assignee_filter.len())
     };
-    let source_hint = if form.from_cache { " ·  ticket assignees only" } else { "" };
+    let source_hint = if form.from_cache {
+        " ·  ticket assignees only"
+    } else {
+        ""
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
             format!("{}{}", filter_label, source_hint),
-            Style::default().fg(if form.from_cache { Color::Yellow } else { Color::Cyan }).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(if form.from_cache {
+                    Color::Yellow
+                } else {
+                    Color::Cyan
+                })
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
@@ -899,61 +1096,146 @@ fn draw_kanban_filter(f: &mut Frame, area: Rect, app: &App) {
             "  ★ TEAMS  (enter to apply · ctrl+d to delete)",
             Style::default().fg(Color::Yellow),
         ));
-        f.render_widget(hdr, Rect { x: x0, y: y_cursor, width: w, height: 1 });
+        f.render_widget(
+            hdr,
+            Rect {
+                x: x0,
+                y: y_cursor,
+                width: w,
+                height: 1,
+            },
+        );
         y_cursor += 1;
 
         for (i, team) in form.teams.iter().enumerate() {
+            if y_cursor >= inner.y.saturating_add(inner.height) {
+                break;
+            }
             let cursor = form.save_name.is_none() && i == form.selected;
             let member_str = team.members.join(", ");
             let label = truncate(&format!("★ {}  ({})", team.name, member_str), w as usize);
             let style = if cursor {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD).bg(Color::DarkGray)
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+                    .bg(Color::DarkGray)
             } else {
                 Style::default().fg(Color::Yellow)
             };
             let p = Paragraph::new(Span::styled(label, style));
-            f.render_widget(p, Rect { x: x0, y: y_cursor, width: w, height: 1 });
+            f.render_widget(
+                p,
+                Rect {
+                    x: x0,
+                    y: y_cursor,
+                    width: w,
+                    height: 1,
+                },
+            );
             y_cursor += 1;
         }
 
         // Separator line.
+        if y_cursor >= inner.y.saturating_add(inner.height) {
+            return;
+        }
         let sep = Paragraph::new(Span::styled(
             "─".repeat(w as usize),
             Style::default().fg(Color::DarkGray),
         ));
-        f.render_widget(sep, Rect { x: x0, y: y_cursor, width: w, height: 1 });
+        f.render_widget(
+            sep,
+            Rect {
+                x: x0,
+                y: y_cursor,
+                width: w,
+                height: 1,
+            },
+        );
         y_cursor += 1;
     }
 
     // --- Save-name input ---
     if let Some(ref name) = form.save_name {
+        if y_cursor >= inner.y.saturating_add(inner.height) {
+            return;
+        }
         let prompt = Paragraph::new(Line::from(vec![
             Span::styled("  Save as team: ", Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{}_", name), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{}_", name),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
         ]));
-        f.render_widget(prompt, Rect { x: x0, y: y_cursor, width: w, height: 1 });
+        f.render_widget(
+            prompt,
+            Rect {
+                x: x0,
+                y: y_cursor,
+                width: w,
+                height: 1,
+            },
+        );
         y_cursor += 1;
-        let sep = Paragraph::new(Span::styled("─".repeat(w as usize), Style::default().fg(Color::DarkGray)));
-        f.render_widget(sep, Rect { x: x0, y: y_cursor, width: w, height: 1 });
+        if y_cursor >= inner.y.saturating_add(inner.height) {
+            return;
+        }
+        let sep = Paragraph::new(Span::styled(
+            "─".repeat(w as usize),
+            Style::default().fg(Color::DarkGray),
+        ));
+        f.render_widget(
+            sep,
+            Rect {
+                x: x0,
+                y: y_cursor,
+                width: w,
+                height: 1,
+            },
+        );
         y_cursor += 1;
     }
 
     // --- Search box ---
-    let remaining_h = inner.y + inner.height - y_cursor;
-    if remaining_h < 2 { return; }
+    let remaining_h = inner
+        .y
+        .saturating_add(inner.height)
+        .saturating_sub(y_cursor);
+    if remaining_h < 2 {
+        return;
+    }
 
-    let search_area = Rect { x: x0, y: y_cursor, width: w, height: 1 };
-    let list_area = Rect { x: x0, y: y_cursor + 1, width: w, height: remaining_h - 1 };
+    let search_area = Rect {
+        x: x0,
+        y: y_cursor,
+        width: w,
+        height: 1,
+    };
+    let list_area = Rect {
+        x: x0,
+        y: y_cursor + 1,
+        width: w,
+        height: remaining_h - 1,
+    };
 
-    let search_p = Paragraph::new(format!("/ {}_", form.query))
-        .style(Style::default().fg(Color::White).add_modifier(Modifier::BOLD));
+    let search_p = Paragraph::new(format!("/ {}_", form.query)).style(
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD),
+    );
     f.render_widget(search_p, search_area);
 
     // Build user list, offset selection by teams count.
     let n_teams = form.teams.len();
     let user_sel = form.selected.saturating_sub(n_teams);
     let max_visible = list_area.height as usize;
-    let scroll = if user_sel < max_visible { 0 } else { (user_sel + 1).saturating_sub(max_visible) };
+    let scroll = if user_sel < max_visible {
+        0
+    } else {
+        (user_sel + 1).saturating_sub(max_visible)
+    };
 
     let items: Vec<ListItem> = form
         .results
@@ -967,12 +1249,16 @@ fn draw_kanban_filter(f: &mut Frame, area: Rect, app: &App) {
             let checked = app.kanban_assignee_filter.contains(name);
             let cursor = form.save_name.is_none() && actual_row == form.selected;
             let check_style = if checked {
-                Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
             let name_style = if cursor {
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -986,17 +1272,21 @@ fn draw_kanban_filter(f: &mut Frame, area: Rect, app: &App) {
 
     let mut state = ListState::default();
     let visible_sel = user_sel.saturating_sub(scroll);
-    state.select(if form.results.is_empty() || form.selected < n_teams || form.save_name.is_some() {
-        None
-    } else {
-        Some(visible_sel)
-    });
+    state.select(
+        if form.results.is_empty() || form.selected < n_teams || form.save_name.is_some() {
+            None
+        } else {
+            Some(visible_sel)
+        },
+    );
     let list = List::new(items).highlight_style(Style::default().bg(Color::DarkGray));
     f.render_stateful_widget(list, list_area, &mut state);
 }
 
 fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
-    let outer = Block::default().borders(Borders::ALL).title(" detail · tab to switch panes ");
+    let outer = Block::default()
+        .borders(Borders::ALL)
+        .title(" detail · tab to switch panes ");
     let inner = outer.inner(area);
     f.render_widget(outer, area);
     let Some(t) = &app.detail else {
@@ -1066,23 +1356,32 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         .split(inner);
 
     let mut idx = 0;
-    draw_detail_info(f, chunks[idx], app, t); idx += 1;
-    draw_detail_projects(f, chunks[idx], app); idx += 1;
+    draw_detail_info(f, chunks[idx], app, t);
+    idx += 1;
+    draw_detail_projects(f, chunks[idx], app);
+    idx += 1;
     if pr_link_visible {
-        draw_detail_pr_link(f, chunks[idx], app); idx += 1;
+        draw_detail_pr_link(f, chunks[idx], app);
+        idx += 1;
     }
     if !is_subtask {
-        draw_detail_subtasks(f, chunks[idx], app, t); idx += 1;
+        draw_detail_subtasks(f, chunks[idx], app, t);
+        idx += 1;
     }
-    draw_detail_comments(f, chunks[idx], app); idx += 1;
+    draw_detail_comments(f, chunks[idx], app);
+    idx += 1;
     if pr_comments_visible {
         draw_detail_pr_comments(f, chunks[idx], app);
     }
 }
 
 fn draw_detail_pr_link(f: &mut Frame, area: Rect, app: &App) {
-    let Some(url) = &app.detail_pr_link else { return };
-    let block = Block::default().borders(Borders::ALL).title(" pull request ");
+    let Some(url) = &app.detail_pr_link else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" pull request ");
     let inner = block.inner(area);
     f.render_widget(block, area);
     let line = Line::from(vec![Span::styled(
@@ -1095,13 +1394,30 @@ fn draw_detail_pr_link(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn visible_subtask_count(app: &App, t: &jui_core::ticket::Ticket) -> usize {
-    if app.show_archived_subtasks { t.subtasks.len() }
-    else { t.subtasks.iter().filter(|s| !is_subtask_archived(s)).count() }
+    if app.show_archived_subtasks {
+        t.subtasks.len()
+    } else {
+        t.subtasks
+            .iter()
+            .filter(|s| !is_subtask_archived(s))
+            .count()
+    }
 }
 
 fn is_subtask_archived(s: &jui_core::ticket::SubtaskRef) -> bool {
     let status = s.status.as_deref().unwrap_or("").to_ascii_lowercase();
-    matches!(status.as_str(), "resolved" | "done" | "closed" | "archive" | "archived" | "won't do" | "wont do" | "cancelled" | "canceled")
+    matches!(
+        status.as_str(),
+        "resolved"
+            | "done"
+            | "closed"
+            | "archive"
+            | "archived"
+            | "won't do"
+            | "wont do"
+            | "cancelled"
+            | "canceled"
+    )
 }
 
 fn draw_detail_subtasks(f: &mut Frame, area: Rect, app: &App, t: &jui_core::ticket::Ticket) {
@@ -1145,7 +1461,9 @@ fn draw_detail_subtasks(f: &mut Frame, area: Rect, app: &App, t: &jui_core::tick
                 "resolved" | "done" | "closed"
             );
             let key_style = if inactive {
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
             } else {
                 Style::default().fg(Color::Yellow)
             };
@@ -1175,14 +1493,20 @@ fn draw_detail_subtasks(f: &mut Frame, area: Rect, app: &App, t: &jui_core::tick
         state.select(Some(app.subtask_selected.min(visible - 1)));
     }
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol(if focused { "▶ " } else { "  " });
     f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn focus_border(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     }
@@ -1199,11 +1523,19 @@ fn draw_detail_info(f: &mut Frame, area: Rect, app: &App, t: &jui_core::ticket::
 
     let mut lines = vec![
         Line::from(vec![
-            Span::styled(t.key.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                t.key.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(t.status.clone(), Style::default().fg(Color::Green)),
             Span::raw("  "),
-            Span::styled(t.priority.clone().unwrap_or_default(), Style::default().fg(Color::Magenta)),
+            Span::styled(
+                t.priority.clone().unwrap_or_default(),
+                Style::default().fg(Color::Magenta),
+            ),
         ]),
         Line::from(Span::styled(
             t.summary.clone(),
@@ -1225,9 +1557,15 @@ fn draw_detail_info(f: &mut Frame, area: Rect, app: &App, t: &jui_core::ticket::
             Span::styled("time:  ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!(
                 "estimate {} · remaining {} · logged {}  ",
-                t.original_estimate_seconds.map(fmt_seconds).unwrap_or_else(|| "—".into()),
-                t.remaining_estimate_seconds.map(fmt_seconds).unwrap_or_else(|| "—".into()),
-                t.time_spent_seconds.map(fmt_seconds).unwrap_or_else(|| "—".into()),
+                t.original_estimate_seconds
+                    .map(fmt_seconds)
+                    .unwrap_or_else(|| "—".into()),
+                t.remaining_estimate_seconds
+                    .map(fmt_seconds)
+                    .unwrap_or_else(|| "—".into()),
+                t.time_spent_seconds
+                    .map(fmt_seconds)
+                    .unwrap_or_else(|| "—".into()),
             )),
             Span::styled("(w to edit)", Style::default().fg(Color::DarkGray)),
         ]),
@@ -1235,8 +1573,14 @@ fn draw_detail_info(f: &mut Frame, area: Rect, app: &App, t: &jui_core::ticket::
             Span::styled("dates: ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!(
                 "created {} · updated {}",
-                t.created.as_deref().map(fmt_date).unwrap_or_else(|| "—".into()),
-                t.updated.as_deref().map(fmt_date).unwrap_or_else(|| "—".into()),
+                t.created
+                    .as_deref()
+                    .map(fmt_date)
+                    .unwrap_or_else(|| "—".into()),
+                t.updated
+                    .as_deref()
+                    .map(fmt_date)
+                    .unwrap_or_else(|| "—".into()),
             )),
         ]),
         Line::from(""),
@@ -1283,10 +1627,17 @@ fn draw_detail_projects(f: &mut Frame, area: Rect, app: &App) {
         .collect();
     let mut state = ListState::default();
     if focused && !app.detail_linked_projects.is_empty() {
-        state.select(Some(app.linked_project_selected.min(app.detail_linked_projects.len() - 1)));
+        state.select(Some(
+            app.linked_project_selected
+                .min(app.detail_linked_projects.len() - 1),
+        ));
     }
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol(if focused { "▶ " } else { "  " });
     f.render_stateful_widget(list, inner, &mut state);
 }
@@ -1294,13 +1645,21 @@ fn draw_detail_projects(f: &mut Frame, area: Rect, app: &App) {
 fn project_link_item(item: &DetailLinkedProject, pending_unlink: bool) -> ListItem<'_> {
     let p = &item.project;
     let suggested = item.state == "suggested";
+    let worktree = item.state == "worktree";
     let no_match = item.state == "no_match";
     if no_match {
         let spans = vec![
-            Span::styled(" ~ ", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " ~ ",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 "claude found no clear match",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             ),
             Span::styled(
                 "  (d to dismiss this notice)",
@@ -1309,8 +1668,20 @@ fn project_link_item(item: &DetailLinkedProject, pending_unlink: bool) -> ListIt
         ];
         return ListItem::new(Line::from(spans));
     }
-    let (marker, mstyle) = if suggested {
-        ("?", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+    let (marker, mstyle) = if worktree {
+        (
+            "◆",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if suggested {
+        (
+            "?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
     } else if !p.available {
         ("✗", Style::default().fg(Color::Red))
     } else if p.kind == "git" {
@@ -1321,19 +1692,34 @@ fn project_link_item(item: &DetailLinkedProject, pending_unlink: bool) -> ListIt
     let label = p
         .nickname
         .clone()
-        .or_else(|| p.path.file_name().and_then(|n| n.to_str()).map(str::to_string))
+        .or_else(|| {
+            p.path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| p.path.display().to_string());
-    let label_style = if suggested {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    let label_style = if worktree {
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else if suggested {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
-    let path_style = if suggested {
+    let path_style = if worktree {
+        Style::default().fg(Color::Magenta)
+    } else if suggested {
         Style::default().fg(Color::Yellow)
     } else if p.available {
         Style::default()
     } else {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM)
     };
     let mut spans = vec![
         Span::styled(format!(" {marker} "), mstyle),
@@ -1346,8 +1732,17 @@ fn project_link_item(item: &DetailLinkedProject, pending_unlink: bool) -> ListIt
             Style::default().fg(Color::Yellow),
         ));
     }
+    if worktree {
+        spans.push(Span::styled(
+            "  (existing ticket worktree)",
+            Style::default().fg(Color::Magenta),
+        ));
+    }
     if !p.available && !suggested {
-        spans.push(Span::styled("  (unavailable)", Style::default().fg(Color::Red)));
+        spans.push(Span::styled(
+            "  (unavailable)",
+            Style::default().fg(Color::Red),
+        ));
     }
     if pending_unlink {
         spans.push(Span::styled(
@@ -1363,7 +1758,11 @@ fn draw_detail_pr_comments(f: &mut Frame, area: Rect, app: &App) {
     let visible_idxs = app.visible_pr_comments();
     let hidden = app.hidden_pr_comment_count();
     let visible_count = visible_idxs.len();
-    let pr_url = app.pr_comments.first().map(|c| c.pr_url.clone()).unwrap_or_default();
+    let pr_url = app
+        .pr_comments
+        .first()
+        .map(|c| c.pr_url.clone())
+        .unwrap_or_default();
     let title_count = if hidden > 0 {
         format!("{visible_count} · {hidden} hidden")
     } else {
@@ -1389,7 +1788,9 @@ fn draw_detail_pr_comments(f: &mut Frame, area: Rect, app: &App) {
         f.render_widget(
             Paragraph::new(Span::styled(
                 format!("  {hidden} resolved · press H to show"),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             )),
             inner,
         );
@@ -1409,17 +1810,27 @@ fn draw_detail_pr_comments(f: &mut Frame, area: Rect, app: &App) {
         let is_reply = !c.in_reply_to_id.is_empty();
         let selected = focused && visible_i == app.pr_comment_selected;
         let header_style = if selected {
-            Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+            Style::default()
+                .bg(Color::Rgb(60, 60, 80))
+                .add_modifier(Modifier::BOLD)
         } else if resolved {
             // Dim resolved threads so they recede when the toggle is on.
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
         } else if is_reply {
-            Style::default().fg(Color::Rgb(140, 110, 180)).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Rgb(140, 110, 180))
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(Color::Rgb(180, 130, 220)).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Rgb(180, 130, 220))
+                .add_modifier(Modifier::BOLD)
         };
         let body_style = if resolved {
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC)
         } else {
             Style::default()
         };
@@ -1517,7 +1928,12 @@ fn draw_comments(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn comment_item<'a>(c: &'a Comment, width: usize, mine: bool, pending_delete: bool) -> ListItem<'a> {
+fn comment_item<'a>(
+    c: &'a Comment,
+    width: usize,
+    mine: bool,
+    pending_delete: bool,
+) -> ListItem<'a> {
     let date = fmt_date(&c.created);
     let parsed = parse_reply(&c.body);
 
@@ -1527,7 +1943,11 @@ fn comment_item<'a>(c: &'a Comment, width: usize, mine: bool, pending_delete: bo
         } else {
             Style::default().fg(Color::Green)
         };
-        let label = if pending_delete { "  (press 'd' again to delete)" } else { "  (you)" };
+        let label = if pending_delete {
+            "  (press 'd' again to delete)"
+        } else {
+            "  (you)"
+        };
         vec![Span::styled(label, style)]
     } else {
         vec![]
@@ -1539,7 +1959,9 @@ fn comment_item<'a>(c: &'a Comment, width: usize, mine: bool, pending_delete: bo
             Span::styled("  ↳ ", Style::default().fg(Color::Cyan)),
             Span::styled(
                 c.author.clone(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {date}  ")),
             Span::styled(
@@ -1553,7 +1975,9 @@ fn comment_item<'a>(c: &'a Comment, width: usize, mine: bool, pending_delete: bo
         let mut spans = vec![
             Span::styled(
                 c.author.clone(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::raw(format!("  {date}")),
         ];
@@ -1598,14 +2022,18 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_create(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::Create(form) = &app.mode else { return };
+    let Mode::Create(form) = &app.mode else {
+        return;
+    };
     let mut lines: Vec<Line> = Vec::new();
     if let Some(parent) = &form.parent {
         lines.push(Line::from(vec![
             Span::styled("↳ subtask of ", Style::default().fg(Color::Cyan)),
             Span::styled(
                 parent.clone(),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(""));
@@ -1613,8 +2041,16 @@ fn draw_create(f: &mut Frame, area: Rect, app: &App) {
     lines.push(field_line("project    ", &form.project, form.field == 0));
     lines.push(field_line("type       ", &form.issue_type, form.field == 1));
     lines.push(field_line("summary    ", &form.summary, form.field == 2));
-    lines.push(field_line("description", &form.description, form.field == 3));
-    lines.push(field_line("estimate   ", &form.time_estimate, form.field == 4));
+    lines.push(field_line(
+        "description",
+        &form.description,
+        form.field == 3,
+    ));
+    lines.push(field_line(
+        "estimate   ",
+        &form.time_estimate,
+        form.field == 4,
+    ));
     if form.field == 4 {
         lines.push(Line::from(Span::styled(
             "  examples: 8h, 2d 4h, 30m  (leave blank to skip)",
@@ -1638,11 +2074,17 @@ fn draw_create(f: &mut Frame, area: Rect, app: &App) {
         } else {
             for (i, (name, _id)) in form.assignee_results.iter().enumerate().take(8) {
                 let style = if i == form.assignee_picker_selected {
-                    Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 80))
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
-                let prefix = if i == form.assignee_picker_selected { "  ▶ " } else { "    " };
+                let prefix = if i == form.assignee_picker_selected {
+                    "  ▶ "
+                } else {
+                    "    "
+                };
                 lines.push(Line::from(vec![
                     Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
                     Span::styled(name.clone(), style),
@@ -1672,7 +2114,11 @@ fn draw_create(f: &mut Frame, area: Rect, app: &App) {
         "tab/shift+tab: switch   enter: next/submit   F5 or ctrl+enter or ctrl+s: submit anywhere   esc: cancel",
         Style::default().fg(Color::DarkGray),
     )));
-    let title = if form.parent.is_some() { " create subtask " } else { " create " };
+    let title = if form.parent.is_some() {
+        " create subtask "
+    } else {
+        " create "
+    };
     let p = Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title));
     f.render_widget(p, area);
 }
@@ -1723,7 +2169,9 @@ fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
         form.summary.clone()
     };
     let summary_style = if summary_active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -1736,7 +2184,9 @@ fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
     );
     let desc_label_active = form.field == 1;
     let desc_label_style = if desc_label_active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
@@ -1745,13 +2195,12 @@ fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
         label_spans.push(Span::raw("  "));
         label_spans.push(Span::styled(
             "(asking claude to tighten…)",
-            Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
         ));
     }
-    f.render_widget(
-        Paragraph::new(Line::from(label_spans)),
-        chunks[4],
-    );
+    f.render_widget(Paragraph::new(Line::from(label_spans)), chunks[4]);
     let body_text = if desc_label_active && !has_suggestion {
         insert_caret(&form.description, form.description_cursor)
     } else {
@@ -1767,17 +2216,19 @@ fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
             Line::from(""),
             Line::from(Span::styled(
                 "claude suggestion (y: accept · n: reject):",
-                Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
             )),
         ];
-        f.render_widget(Paragraph::new(sep_lines).wrap(Wrap { trim: false }), chunks[6]);
+        f.render_widget(
+            Paragraph::new(sep_lines).wrap(Wrap { trim: false }),
+            chunks[6],
+        );
         let sugg = form.suggestion.clone().unwrap_or_default();
         f.render_widget(
-            Paragraph::new(Span::styled(
-                sugg,
-                Style::default().fg(Color::Magenta),
-            ))
-            .wrap(Wrap { trim: false }),
+            Paragraph::new(Span::styled(sugg, Style::default().fg(Color::Magenta)))
+                .wrap(Wrap { trim: false }),
             chunks[7],
         );
         8
@@ -1788,16 +2239,21 @@ fn draw_edit(f: &mut Frame, area: Rect, app: &App) {
     let hint_text = if has_suggestion {
         "y: keep claude rewrite   n/esc: reject   (then ctrl+s/F5 to save)"
     } else {
-        "tab: switch · ←→↑↓/home/end: move · del: forward · enter: save (sum) / newline (desc) · ctrl+r or F6: claude tighten · ctrl+s/F5: save · esc: cancel"
+        "tab: switch · ←→↑↓/home/end: move · del: forward · enter: save (sum) / newline (desc) · ctrl+e: $EDITOR · ctrl+r/F6: claude tighten · ctrl+s/F5: save · esc: cancel"
     };
     f.render_widget(
-        Paragraph::new(Span::styled(hint_text, Style::default().fg(Color::DarkGray))),
+        Paragraph::new(Span::styled(
+            hint_text,
+            Style::default().fg(Color::DarkGray),
+        )),
         chunks[hint_idx],
     );
 }
 
 fn draw_comment(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::Comment(form) = &app.mode else { return };
+    let Mode::Comment(form) = &app.mode else {
+        return;
+    };
     let title = if form.reply_to.is_some() {
         format!(" reply on {} ", form.key)
     } else {
@@ -1808,21 +2264,35 @@ fn draw_comment(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     // If this is a reply, show the parent excerpt up top so the user has context.
-    let (top_h, has_quote) = if form.reply_to.is_some() { (4, true) } else { (1, false) };
+    let (top_h, has_quote) = if form.reply_to.is_some() {
+        (4, true)
+    } else {
+        (1, false)
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(top_h), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(top_h),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     if has_quote {
         let ctx = form.reply_to.as_ref().unwrap();
-        let excerpt = ctx.parent_body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        let excerpt = ctx
+            .parent_body
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("");
         let lines = vec![
             Line::from(vec![
                 Span::styled("↳ replying to ", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     ctx.parent_author.clone(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw(format!("  {}", fmt_date(&ctx.parent_date))),
             ]),
@@ -1854,7 +2324,9 @@ fn draw_comment(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_ticket_projects(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::TicketProjects(form) = &app.mode else { return };
+    let Mode::TicketProjects(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" link projects to {} ", form.ticket_key));
@@ -1876,28 +2348,57 @@ fn draw_ticket_projects(f: &mut Frame, area: Rect, app: &App) {
         .items
         .iter()
         .map(|item| {
-            let check = if item.linked { "[x]" } else { "[ ]" };
+            let is_worktree = item.state == "worktree";
+            let check = if is_worktree {
+                "[w]"
+            } else if item.linked {
+                "[x]"
+            } else {
+                "[ ]"
+            };
             let check_style = if item.linked {
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+                let color = if is_worktree {
+                    Color::Magenta
+                } else {
+                    Color::Green
+                };
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::DarkGray)
             };
             let path_style = if item.project.available {
                 Style::default()
             } else {
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
             };
             let mut spans = vec![
                 Span::styled(format!(" {check} "), check_style),
-                Span::styled(format!("{:<3}", item.project.kind), Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{:<3}", item.project.kind),
+                    Style::default().fg(Color::DarkGray),
+                ),
                 Span::raw("  "),
                 Span::styled(item.project.path.display().to_string(), path_style),
             ];
             if let Some(nick) = &item.project.nickname {
-                spans.push(Span::styled(format!("  ({nick})"), Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format!("  ({nick})"),
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
             if !item.project.available {
-                spans.push(Span::styled("  (unavailable)", Style::default().fg(Color::Red)));
+                spans.push(Span::styled(
+                    "  (unavailable)",
+                    Style::default().fg(Color::Red),
+                ));
+            }
+            if is_worktree {
+                spans.push(Span::styled(
+                    "  (existing ticket worktree)",
+                    Style::default().fg(Color::Magenta),
+                ));
             }
             ListItem::new(Line::from(spans))
         })
@@ -1905,13 +2406,19 @@ fn draw_ticket_projects(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default();
     state.select(Some(form.selected.min(form.items.len() - 1)));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_active_status_config(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::ActiveStatusConfig(form) = &app.mode else { return };
+    let Mode::ActiveStatusConfig(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" active workflow statuses ({}) ", form.items.len()));
@@ -1921,7 +2428,11 @@ fn draw_active_status_config(f: &mut Frame, area: Rect, app: &App) {
     // Reserve the bottom row for the add-input box (when adding) and the hint.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     if form.items.is_empty() {
@@ -1955,7 +2466,11 @@ fn draw_active_status_config(f: &mut Frame, area: Rect, app: &App) {
             state.select(Some(form.selected.min(form.items.len() - 1)));
         }
         let list = List::new(items)
-            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol("▶ ");
         let mut s = state;
         f.render_stateful_widget(list, chunks[0], &mut s);
@@ -1964,7 +2479,12 @@ fn draw_active_status_config(f: &mut Frame, area: Rect, app: &App) {
     // Add-input row (only when adding).
     if let Some(buf) = &form.adding {
         let line = Line::from(vec![
-            Span::styled(" new: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " new: ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(buf.clone(), Style::default().add_modifier(Modifier::BOLD)),
             Span::styled("▏", Style::default().fg(Color::Cyan)),
         ]);
@@ -1983,18 +2503,25 @@ fn draw_active_status_config(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::Settings(form) = &app.mode else { return };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" settings ");
+    let Mode::Settings(form) = &app.mode else {
+        return;
+    };
+    let block = Block::default().borders(Borders::ALL).title(" settings ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let rows: [(&str, &str); 4] = [
+    let rows: [(&str, &str); 5] = [
         ("Default create status", form.default_create_status.as_str()),
-        ("All-mine exclude status", form.all_mine_exclude_status.as_str()),
+        (
+            "All-mine exclude status",
+            form.all_mine_exclude_status.as_str(),
+        ),
         ("PR submit status", form.pr_submit_status.as_str()),
-        ("Claude permission mode", form.claude_permission_mode.as_str()),
+        ("Code assistant", form.code_assistant.as_str()),
+        (
+            "Claude permission mode",
+            form.claude_permission_mode.as_str(),
+        ),
     ];
 
     let mut items: Vec<ListItem> = Vec::new();
@@ -2002,7 +2529,10 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
         let value_span = if value.is_empty() {
             Span::styled("(empty)", Style::default().fg(Color::DarkGray))
         } else {
-            Span::styled((*value).to_string(), Style::default().add_modifier(Modifier::BOLD))
+            Span::styled(
+                (*value).to_string(),
+                Style::default().add_modifier(Modifier::BOLD),
+            )
         };
         let line = Line::from(vec![
             Span::styled(format!(" {label:<26} "), Style::default().fg(Color::Gray)),
@@ -2014,24 +2544,38 @@ fn draw_settings(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default();
     state.select(Some(form.selected.min(rows.len() - 1)));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(3), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
     let mut s = state;
     f.render_stateful_widget(list, chunks[0], &mut s);
 
     let help_line = match form.selected {
         0 => "applied as a post-create transition after a new ticket is created",
-        1 => "JQL clause: assignee = currentUser() AND status != \"<this>\" when the M-toggle is on",
-        3 => "default --permission-mode for Claude on start-work (overridable per-launch in the start-work pane)",
+        1 => {
+            "JQL clause: assignee = currentUser() AND status != \"<this>\" when the M-toggle is on"
+        }
+        3 => "assistant launched in tmux from start-work, implementation, and DevQA panes",
+        4 => "default --permission-mode for Claude on start-work (ignored by opencode)",
         _ => "",
     };
     f.render_widget(
-        Paragraph::new(Span::styled(help_line, Style::default().fg(Color::DarkGray))),
+        Paragraph::new(Span::styled(
+            help_line,
+            Style::default().fg(Color::DarkGray),
+        )),
         chunks[1],
     );
 
@@ -2091,10 +2635,7 @@ fn draw_rules(f: &mut Frame, area: Rect, app: &App) {
                 r.conditions.len(),
                 r.actions.len()
             );
-            ListItem::new(Line::from(vec![
-                enabled,
-                Span::styled(summary, name_style),
-            ]))
+            ListItem::new(Line::from(vec![enabled, Span::styled(summary, name_style)]))
         })
         .collect();
 
@@ -2149,12 +2690,11 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!(" {num} "),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(
-                    format!("({hot}) "),
-                    Style::default().fg(Color::DarkGray),
-                ),
+                Span::styled(format!("({hot}) "), Style::default().fg(Color::DarkGray)),
                 Span::raw(*desc),
             ]))
         })
@@ -2184,7 +2724,10 @@ fn draw_home(f: &mut Frame, area: Rect, app: &App) {
 
     if form.loading {
         f.render_widget(
-            Paragraph::new(Span::styled("loading…", Style::default().fg(Color::DarkGray))),
+            Paragraph::new(Span::styled(
+                "loading…",
+                Style::default().fg(Color::DarkGray),
+            )),
             feed_inner,
         );
         return;
@@ -2270,7 +2813,9 @@ fn format_home_ts(raw: &str) -> String {
 }
 
 fn draw_rule_log(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::RuleLog(form) = &app.mode else { return };
+    let Mode::RuleLog(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" rule log (5-day rolling) — j/k scroll · r refresh · esc back ");
@@ -2307,7 +2852,10 @@ fn draw_rule_log(f: &mut Frame, area: Rect, app: &App) {
             let status_span = if e.status == "ok" {
                 Span::styled("✓", Style::default().fg(Color::Green))
             } else {
-                Span::styled("✗", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                Span::styled(
+                    "✗",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )
             };
             let mut spans: Vec<Span> = vec![
                 Span::styled(format!("{ts}  "), Style::default().fg(Color::DarkGray)),
@@ -2435,7 +2983,9 @@ fn one_line(s: &str) -> String {
 
 fn draw_rule_edit(f: &mut Frame, area: Rect, app: &App) {
     use crate::app::{rule_edit_rows, RuleEditTarget, RuleRow};
-    let Mode::RuleEdit(form) = &app.mode else { return };
+    let Mode::RuleEdit(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" edit rule — {} ", form.rule.name));
@@ -2461,7 +3011,9 @@ fn draw_rule_edit(f: &mut Frame, area: Rect, app: &App) {
         let in_edit = selected && form.edit_buffer.is_some();
         let bullet = if selected { "▶ " } else { "  " };
         let row_style = if selected {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
         };
@@ -2471,14 +3023,21 @@ fn draw_rule_edit(f: &mut Frame, area: Rect, app: &App) {
             RuleRow::TriggerFilter => ("filter      ".into(), trigger_filter_text.clone()),
             RuleRow::Enabled => (
                 "enabled     ".into(),
-                if form.rule.enabled { "yes".into() } else { "no".into() },
+                if form.rule.enabled {
+                    "yes".into()
+                } else {
+                    "no".into()
+                },
             ),
             RuleRow::ConditionsHeader => (String::new(), "─── conditions ───".into()),
             RuleRow::Cond(idx) => match form.rule.conditions.get(idx) {
                 Some(c) => {
                     let pending = form.pending_remove_condition == Some(idx);
                     let prefix = if pending { "(d again) " } else { "" };
-                    (format!("cond[{idx}]    "), format!("{prefix}{}", condition_summary(c)))
+                    (
+                        format!("cond[{idx}]    "),
+                        format!("{prefix}{}", condition_summary(c)),
+                    )
                 }
                 None => (format!("cond[{idx}]    "), "(missing)".into()),
             },
@@ -2488,7 +3047,10 @@ fn draw_rule_edit(f: &mut Frame, area: Rect, app: &App) {
                 Some(a) => {
                     let pending = form.pending_remove_action == Some(idx);
                     let prefix = if pending { "(d again) " } else { "" };
-                    (format!("act[{idx}]     "), format!("{prefix}{}", action_summary(a)))
+                    (
+                        format!("act[{idx}]     "),
+                        format!("{prefix}{}", action_summary(a)),
+                    )
                 }
                 None => (format!("act[{idx}]     "), "(missing)".into()),
             },
@@ -2503,7 +3065,9 @@ fn draw_rule_edit(f: &mut Frame, area: Rect, app: &App) {
         if matches!(row, RuleRow::ConditionsHeader | RuleRow::ActionsHeader) {
             lines.push(Line::from(Span::styled(
                 value_render,
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             )));
         } else {
             lines.push(Line::from(vec![
@@ -2560,9 +3124,15 @@ fn draw_rule_edit(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_var_picker(f: &mut Frame, parent: Rect, app: &App) {
     use crate::app::filter_vars;
-    let Mode::RuleEdit(form) = &app.mode else { return };
-    let Some(vp) = form.var_picker.as_ref() else { return };
-    let Some(buf) = form.edit_buffer.as_ref() else { return };
+    let Mode::RuleEdit(form) = &app.mode else {
+        return;
+    };
+    let Some(vp) = form.var_picker.as_ref() else {
+        return;
+    };
+    let Some(buf) = form.edit_buffer.as_ref() else {
+        return;
+    };
     let filter = &buf[vp.anchor + 1..];
     let matches = filter_vars(filter);
 
@@ -2573,7 +3143,12 @@ fn draw_var_picker(f: &mut Frame, parent: Rect, app: &App) {
     let h = ((matches.len() as u16) + 3).clamp(5, 14);
     let x = parent.x + 2;
     let y = parent.y + 2;
-    let area = Rect { x, y, width: w, height: h };
+    let area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     f.render_widget(ratatui::widgets::Clear, area);
     let title = if filter.is_empty() {
@@ -2596,7 +3171,9 @@ fn draw_var_picker(f: &mut Frame, parent: Rect, app: &App) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{{{name}}}"),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  "),
                 Span::styled(*desc, Style::default().fg(Color::Gray)),
@@ -2616,7 +3193,8 @@ fn draw_var_picker(f: &mut Frame, parent: Rect, app: &App) {
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[0], &mut state);
 
-    let hint = "tab/enter: insert · ↑/↓ move · esc: close (keep `{`) · backspace past `{`: close + delete";
+    let hint =
+        "tab/enter: insert · ↑/↓ move · esc: close (keep `{`) · backspace past `{`: close + delete";
     f.render_widget(
         Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
         chunks[1],
@@ -2625,8 +3203,12 @@ fn draw_var_picker(f: &mut Frame, parent: Rect, app: &App) {
 
 fn draw_rule_edit_picker(f: &mut Frame, parent: Rect, app: &App) {
     use crate::app::RulePickerTarget;
-    let Mode::RuleEdit(form) = &app.mode else { return };
-    let Some(p) = form.picker.as_ref() else { return };
+    let Mode::RuleEdit(form) = &app.mode else {
+        return;
+    };
+    let Some(p) = form.picker.as_ref() else {
+        return;
+    };
 
     // Centered modal — same dimensions as the Settings picker for visual
     // consistency.
@@ -2634,7 +3216,12 @@ fn draw_rule_edit_picker(f: &mut Frame, parent: Rect, app: &App) {
     let h = parent.height.saturating_sub(4).min(20).max(8);
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
-    let area = Rect { x, y, width: w, height: h };
+    let area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     f.render_widget(ratatui::widgets::Clear, area);
 
@@ -2652,11 +3239,17 @@ fn draw_rule_edit_picker(f: &mut Frame, parent: Rect, app: &App) {
 
     let filter_line = Line::from(vec![
         Span::styled(" filter: ", Style::default().fg(Color::Cyan)),
-        Span::styled(p.query.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            p.query.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::styled("▏", Style::default().fg(Color::Cyan)),
     ]);
     let state_line = if p.loading {
-        Line::from(Span::styled(" loading…", Style::default().fg(Color::DarkGray)))
+        Line::from(Span::styled(
+            " loading…",
+            Style::default().fg(Color::DarkGray),
+        ))
     } else if let Some(err) = &p.error {
         Line::from(Span::styled(
             format!(" err: {err}"),
@@ -2691,15 +3284,24 @@ fn draw_rule_edit_picker(f: &mut Frame, parent: Rect, app: &App) {
 }
 
 fn draw_settings_picker(f: &mut Frame, parent: Rect, app: &App) {
-    let Mode::Settings(form) = &app.mode else { return };
-    let Some(p) = form.picker.as_ref() else { return };
+    let Mode::Settings(form) = &app.mode else {
+        return;
+    };
+    let Some(p) = form.picker.as_ref() else {
+        return;
+    };
 
     // Centered modal: 60% × 70% of the settings area, clamped.
     let w = parent.width.saturating_sub(4).min(70).max(30);
     let h = parent.height.saturating_sub(4).min(20).max(8);
     let x = parent.x + (parent.width.saturating_sub(w)) / 2;
     let y = parent.y + (parent.height.saturating_sub(h)) / 2;
-    let area = Rect { x, y, width: w, height: h };
+    let area = Rect {
+        x,
+        y,
+        width: w,
+        height: h,
+    };
 
     // Clear behind so we don't render on top of the list rows.
     f.render_widget(ratatui::widgets::Clear, area);
@@ -2722,11 +3324,17 @@ fn draw_settings_picker(f: &mut Frame, parent: Rect, app: &App) {
     // Top: filter input + status line.
     let filter_line = Line::from(vec![
         Span::styled(" filter: ", Style::default().fg(Color::Cyan)),
-        Span::styled(p.query.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(
+            p.query.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
         Span::styled("▏", Style::default().fg(Color::Cyan)),
     ]);
     let state_line = if p.loading {
-        Line::from(Span::styled(" loading…", Style::default().fg(Color::DarkGray)))
+        Line::from(Span::styled(
+            " loading…",
+            Style::default().fg(Color::DarkGray),
+        ))
     } else if let Some(err) = &p.error {
         Line::from(Span::styled(
             format!(" err: {err}"),
@@ -2752,13 +3360,19 @@ fn draw_settings_picker(f: &mut Frame, parent: Rect, app: &App) {
         list_state.select(Some(p.selected.min(matches.len() - 1)));
     }
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, chunks[1], &mut list_state);
 }
 
 fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::Projects(form) = &app.mode else { return };
+    let Mode::Projects(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" projects ({} configured) ", form.items.len()));
@@ -2779,7 +3393,8 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
         .iter()
         .enumerate()
         .map(|(i, p)| {
-            let pending = form.pending_remove.as_deref() == Some(p.path.as_path()) && i == form.selected;
+            let pending =
+                form.pending_remove.as_deref() == Some(p.path.as_path()) && i == form.selected;
             let (marker, marker_style) = if !p.available {
                 ("✗", Style::default().fg(Color::Red))
             } else if p.kind == "git" {
@@ -2789,7 +3404,9 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
             };
             let kind = format!("{:<3}", p.kind);
             let path_style = if !p.available {
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::DIM)
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM)
             } else {
                 Style::default()
             };
@@ -2800,10 +3417,16 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled(p.path.display().to_string(), path_style),
             ];
             if let Some(nick) = &p.nickname {
-                spans.push(Span::styled(format!("  ({nick})"), Style::default().fg(Color::DarkGray)));
+                spans.push(Span::styled(
+                    format!("  ({nick})"),
+                    Style::default().fg(Color::DarkGray),
+                ));
             }
             if !p.available {
-                spans.push(Span::styled("  (unavailable)", Style::default().fg(Color::Red)));
+                spans.push(Span::styled(
+                    "  (unavailable)",
+                    Style::default().fg(Color::Red),
+                ));
             }
             if pending {
                 spans.push(Span::styled(
@@ -2817,33 +3440,48 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default();
     state.select(Some(form.selected.min(form.items.len() - 1)));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_projects_add(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::ProjectsAdd(form) = &app.mode else { return };
-    let block = Block::default().borders(Borders::ALL).title(" add project ");
+    let Mode::ProjectsAdd(form) = &app.mode else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" add project ");
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     let header = Paragraph::new(Line::from(vec![
         Span::styled("filter: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{}▏", form.query),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     f.render_widget(header, chunks[0]);
 
     if form.loading {
-        let p = Paragraph::new("scanning $HOME for repos…").style(Style::default().fg(Color::DarkGray));
+        let p =
+            Paragraph::new("scanning $HOME for repos…").style(Style::default().fg(Color::DarkGray));
         f.render_widget(p, chunks[1]);
     } else if let Some(err) = &form.error {
         let p = Paragraph::new(format!("error: {err}")).style(Style::default().fg(Color::Red));
@@ -2861,9 +3499,17 @@ fn draw_projects_add(f: &mut Frame, area: Rect, app: &App) {
             })
             .collect();
         let mut state = ListState::default();
-        state.select(if items.is_empty() { None } else { Some(form.selected.min(items.len() - 1)) });
+        state.select(if items.is_empty() {
+            None
+        } else {
+            Some(form.selected.min(items.len() - 1))
+        });
         let list = List::new(items)
-            .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+            .highlight_style(
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )
             .highlight_symbol("▶ ");
         f.render_stateful_widget(list, chunks[1], &mut state);
     }
@@ -2876,7 +3522,9 @@ fn draw_projects_add(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_implementation(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::Implementation(form) = &app.mode else { return };
+    let Mode::Implementation(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" claude implementation — {} ", form.key));
@@ -2885,15 +3533,30 @@ fn draw_implementation(f: &mut Frame, area: Rect, app: &App) {
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
         .split(inner);
 
     let projects = if form.project_paths.is_empty() {
         "—".to_string()
     } else {
-        form.project_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(" · ")
+        form.project_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" · ")
     };
-    let header_text = format!("projects: {projects}\nupdated: {}", if form.updated_at.is_empty() { "—".into() } else { form.updated_at.clone() });
+    let header_text = format!(
+        "projects: {projects}\nupdated: {}",
+        if form.updated_at.is_empty() {
+            "—".into()
+        } else {
+            form.updated_at.clone()
+        }
+    );
     let header = Paragraph::new(header_text).style(Style::default().fg(Color::DarkGray));
     f.render_widget(header, chunks[0]);
 
@@ -2924,7 +3587,9 @@ fn draw_implementation(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::StartWorkPrompt(form) = &app.mode else { return };
+    let Mode::StartWorkPrompt(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" start work — {} ", form.ticket_key));
@@ -2942,7 +3607,9 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
     // Location row (always shown).
     let loc_selected = form.field == 0;
     let label_style = if loc_selected {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -2950,16 +3617,32 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
     let br_active = matches!(form.location, jui_core::scm::WorkLocation::BranchInRepo);
     let opt_style = |active: bool| {
         if active {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         }
     };
     lines.push(Line::from(vec![
         Span::styled("location  ", label_style),
-        Span::styled(if wt_active { "[●] worktree" } else { "[ ] worktree" }, opt_style(wt_active)),
+        Span::styled(
+            if wt_active {
+                "[●] worktree"
+            } else {
+                "[ ] worktree"
+            },
+            opt_style(wt_active),
+        ),
         Span::raw("   "),
-        Span::styled(if br_active { "[●] branch in repo" } else { "[ ] branch in repo" }, opt_style(br_active)),
+        Span::styled(
+            if br_active {
+                "[●] branch in repo"
+            } else {
+                "[ ] branch in repo"
+            },
+            opt_style(br_active),
+        ),
     ]));
     if loc_selected {
         lines.push(Line::from(Span::styled(
@@ -2968,9 +3651,36 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
+    let branch_style = if form.field == 1 {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+    };
+    let branch_text = if form.field == 1 {
+        insert_caret(&form.branch_slug, form.branch_cursor)
+    } else {
+        form.branch_slug.clone()
+    };
+    lines.push(Line::from(vec![
+        Span::styled("branch    ", Style::default().fg(Color::DarkGray)),
+        Span::styled(branch_text, branch_style),
+    ]));
+    if form.field == 1 {
+        lines.push(Line::from(Span::styled(
+            "  edit before submit. spaces/punctuation are normalized to '-' for git.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
     if form.need_time {
-        lines.push(field_line("estimate  ", &form.time_estimate, form.field == 1));
-        if form.field == 1 {
+        lines.push(field_line(
+            "estimate  ",
+            &form.time_estimate,
+            form.field == 2,
+        ));
+        if form.field == 2 {
             lines.push(Line::from(Span::styled(
                 "  examples: 8h, 2d 4h, 30m",
                 Style::default().fg(Color::DarkGray),
@@ -2978,8 +3688,8 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
         }
     }
     if form.need_priority {
-        lines.push(field_line("priority  ", &form.priority, form.field == 2));
-        if form.field == 2 {
+        lines.push(field_line("priority  ", &form.priority, form.field == 3));
+        if form.field == 3 {
             let hint = if form.valid_priorities.is_empty() {
                 "  examples: Highest, High, Medium, Low, Lowest".to_string()
             } else {
@@ -2991,10 +3701,12 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
             )));
         }
     }
-    // Plan-mode toggle row (always shown, field index 3).
-    let plan_selected = form.field == 3;
+    // Plan-mode toggle row (always shown, field index 4).
+    let plan_selected = form.field == 4;
     let plan_label_style = if plan_selected {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -3006,13 +3718,18 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
         ),
         Span::raw("   "),
         Span::styled(
-            if form.plan_mode { "[ ] off" } else { "[●] off" },
+            if form.plan_mode {
+                "[ ] off"
+            } else {
+                "[●] off"
+            },
             opt_style(!form.plan_mode),
         ),
     ]));
     if plan_selected {
         let detail = if form.plan_mode {
-            "  ←/→ or space to toggle. launches Claude with --permission-mode plan.".to_string()
+            "  ←/→ or space to toggle. for Claude, launches with --permission-mode plan."
+                .to_string()
         } else {
             format!(
                 "  ←/→ or space to toggle. off → uses configured default ({}).",
@@ -3029,10 +3746,12 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
         )));
     }
 
-    // Extra-shell toggle row (always shown, field index 4).
-    let shell_selected = form.field == 4;
+    // Extra-shell toggle row (always shown, field index 5).
+    let shell_selected = form.field == 5;
     let shell_label_style = if shell_selected {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -3040,18 +3759,26 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
         Span::styled("shell pane", shell_label_style),
         Span::raw(" "),
         Span::styled(
-            if form.open_shell_pane { "[●] yes" } else { "[ ] yes" },
+            if form.open_shell_pane {
+                "[●] yes"
+            } else {
+                "[ ] yes"
+            },
             opt_style(form.open_shell_pane),
         ),
         Span::raw("   "),
         Span::styled(
-            if form.open_shell_pane { "[ ] no" } else { "[●] no" },
+            if form.open_shell_pane {
+                "[ ] no"
+            } else {
+                "[●] no"
+            },
             opt_style(!form.open_shell_pane),
         ),
     ]));
     if shell_selected {
         lines.push(Line::from(Span::styled(
-            "  ←/→ or space to toggle. opens an extra shell pane in the worktree next to Claude.",
+            "  ←/→ or space to toggle. opens an extra shell pane in the worktree next to the assistant.",
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -3073,7 +3800,9 @@ fn draw_start_work_prompt(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_devqa_prompt(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::DevQaPrompt(form) = &app.mode else { return };
+    let Mode::DevQaPrompt(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" begin dev qa — {} ", form.ticket_key));
@@ -3082,7 +3811,9 @@ fn draw_devqa_prompt(f: &mut Frame, area: Rect, app: &App) {
 
     let opt_style = |active: bool| {
         if active {
-            Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         }
@@ -3102,11 +3833,27 @@ fn draw_devqa_prompt(f: &mut Frame, area: Rect, app: &App) {
         Line::from(vec![
             Span::styled(
                 "checkout  ",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(if wt { "[●] git worktree" } else { "[ ] git worktree" }, opt_style(wt)),
+            Span::styled(
+                if wt {
+                    "[●] git worktree"
+                } else {
+                    "[ ] git worktree"
+                },
+                opt_style(wt),
+            ),
             Span::raw("   "),
-            Span::styled(if !wt { "[●] branch in repo" } else { "[ ] branch in repo" }, opt_style(!wt)),
+            Span::styled(
+                if !wt {
+                    "[●] branch in repo"
+                } else {
+                    "[ ] branch in repo"
+                },
+                opt_style(!wt),
+            ),
         ]),
         Line::from(Span::styled(
             if wt {
@@ -3142,7 +3889,9 @@ fn draw_devqa_prompt(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_devqa_resolve_confirm(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::DevQaResolveConfirm(form) = &app.mode else { return };
+    let Mode::DevQaResolveConfirm(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" resolve dev qa — {} ", form.ticket_key));
@@ -3152,12 +3901,19 @@ fn draw_devqa_resolve_confirm(f: &mut Frame, area: Rect, app: &App) {
     let mut lines = vec![
         Line::from(Span::styled(
             "Resolve DevQA — this posts to GitHub:",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(vec![
             Span::raw("  • comment "),
-            Span::styled("DevQA: Passed", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "DevQA: Passed",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw(" on the PR"),
         ]),
         Line::from("  • 🚀 reaction on the PR's top comment"),
@@ -3186,7 +3942,9 @@ fn draw_devqa_resolve_confirm(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_devqa_cleanup_confirm(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::DevQaCleanupConfirm(form) = &app.mode else { return };
+    let Mode::DevQaCleanupConfirm(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" remove dev qa worktree — {} ", form.ticket_key));
@@ -3196,7 +3954,9 @@ fn draw_devqa_cleanup_confirm(f: &mut Frame, area: Rect, app: &App) {
     let lines = vec![
         Line::from(Span::styled(
             "The DevQA worktree has uncommitted changes.",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -3217,7 +3977,9 @@ fn draw_devqa_cleanup_confirm(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_edit_priority(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::EditPriority(form) = &app.mode else { return };
+    let Mode::EditPriority(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" priority — {} ", form.key));
@@ -3237,19 +3999,32 @@ fn draw_edit_priority(f: &mut Frame, area: Rect, app: &App) {
         .options
         .iter()
         .map(|name| {
-            ListItem::new(Line::from(vec![priority_span(Some(name)), Span::raw(name.clone())]))
+            ListItem::new(Line::from(vec![
+                priority_span(Some(name)),
+                Span::raw(name.clone()),
+            ]))
         })
         .collect();
     let mut state = ListState::default();
-    state.select(if form.options.is_empty() { None } else { Some(form.selected) });
+    state.select(if form.options.is_empty() {
+        None
+    } else {
+        Some(form.selected)
+    });
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_edit_time(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::EditTime(form) = &app.mode else { return };
+    let Mode::EditTime(form) = &app.mode else {
+        return;
+    };
     let lines = vec![
         Line::from(format!("time tracking — {}", form.key)),
         Line::from(""),
@@ -3275,7 +4050,9 @@ fn draw_edit_time(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_transition(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::Transition(form) = &app.mode else { return };
+    let Mode::Transition(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(" transition {} ", form.key));
@@ -3288,8 +4065,7 @@ fn draw_transition(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     if let Some(err) = &form.error {
-        let p = Paragraph::new(format!("error: {err}"))
-            .style(Style::default().fg(Color::Red));
+        let p = Paragraph::new(format!("error: {err}")).style(Style::default().fg(Color::Red));
         f.render_widget(p, inner);
         return;
     }
@@ -3300,16 +4076,27 @@ fn draw_transition(f: &mut Frame, area: Rect, app: &App) {
         .map(|t| {
             let to = t.to_status.clone().unwrap_or_default();
             let line = Line::from(vec![
-                Span::styled(format!("{:<24}", t.name), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{:<24}", t.name),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(format!("→ {to}"), Style::default().fg(Color::Green)),
             ]);
             ListItem::new(line)
         })
         .collect();
     let mut state = ListState::default();
-    state.select(if form.options.is_empty() { None } else { Some(form.selected) });
+    state.select(if form.options.is_empty() {
+        None
+    } else {
+        Some(form.selected)
+    });
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
 }
@@ -3329,12 +4116,13 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("tab", "expand subtasks"),
             ("S-tab", "toggle section"),
             ("enter", "open"),
+            ("/", "search"),
             ("r", "refresh"),
             ("o", "sort"),
             ("n", "new"),
             ("s", "start"),
             ("M", "all mine"),
-            ("K", "show/hide done PRs"),
+            ("K", "done PRs"),
             ("q", "back"),
         ],
         Mode::Kanban => vec![
@@ -3348,21 +4136,23 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("r", "refresh"),
             ("b/esc", "back"),
         ],
-        Mode::KanbanFilter(ref form) => if form.save_name.is_some() {
-            vec![("type", "team name"), ("enter", "save"), ("esc", "cancel")]
-        } else {
-            let mut hints = vec![
-                ("type", "search"),
-                ("j/k", "move"),
-                ("space/enter", "toggle"),
-                ("ctrl+c", "clear all"),
-                ("esc", "done"),
-            ];
-            if !app.kanban_assignee_filter.is_empty() {
-                hints.push(("ctrl+s", "save team"));
+        Mode::KanbanFilter(ref form) => {
+            if form.save_name.is_some() {
+                vec![("type", "team name"), ("enter", "save"), ("esc", "cancel")]
+            } else {
+                let mut hints = vec![
+                    ("type", "search"),
+                    ("j/k", "move"),
+                    ("space/enter", "toggle"),
+                    ("ctrl+c", "clear all"),
+                    ("esc", "done"),
+                ];
+                if !app.kanban_assignee_filter.is_empty() {
+                    hints.push(("ctrl+s", "save team"));
+                }
+                hints
             }
-            hints
-        },
+        }
         Mode::Projects(_) => vec![
             ("j/k", "move"),
             ("a", "add"),
@@ -3380,12 +4170,22 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             if form.adding.is_some() {
                 vec![("type", "status"), ("enter", "add"), ("esc", "cancel")]
             } else {
-                vec![("j/k", "move"), ("i", "add"), ("d×2", "remove"), ("esc", "back")]
+                vec![
+                    ("j/k", "move"),
+                    ("i", "add"),
+                    ("d×2", "remove"),
+                    ("esc", "back"),
+                ]
             }
         }
         Mode::Settings(form) => {
             if form.picker.is_some() {
-                vec![("type", "filter"), ("↑/↓", "move"), ("enter", "pick"), ("esc", "cancel")]
+                vec![
+                    ("type", "filter"),
+                    ("↑/↓", "move"),
+                    ("enter", "pick"),
+                    ("esc", "cancel"),
+                ]
             } else {
                 vec![("j/k", "move"), ("i/enter", "edit"), ("esc/q", "back")]
             }
@@ -3400,24 +4200,29 @@ fn mode_hints(app: &App) -> Vec<Hint> {
         Mode::Detail => match app.detail_focus {
             DetailFocus::Info => {
                 let s_label = match app.detail.as_ref() {
-                    Some(t) if crate::app::ticket_status_active(&t.status, &app.active_statuses) => "stop",
+                    Some(t)
+                        if crate::app::ticket_status_active(&t.status, &app.active_statuses) =>
+                    {
+                        "stop"
+                    }
                     _ => "start",
                 };
                 let is_subtask = app
                     .detail
                     .as_ref()
                     .and_then(|t| t.issue_type.as_deref())
-                    .map(|x| x.eq_ignore_ascii_case("sub-task") || x.eq_ignore_ascii_case("subtask"))
+                    .map(|x| {
+                        x.eq_ignore_ascii_case("sub-task") || x.eq_ignore_ascii_case("subtask")
+                    })
                     .unwrap_or(false);
                 let mut v: Vec<Hint> = vec![
                     ("tab", "pane"),
                     ("e", "edit"),
-                    ("c", "comment"),
                     ("t", "trans"),
                     ("w", "time"),
                     ("i", "prio"),
-                    ("L", "link"),
                 ];
+                v.push(("O", "options"));
                 if !is_subtask {
                     v.push(("T", "subtask"));
                 }
@@ -3431,11 +4236,18 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                     // DevQA already started → P resolves it (pass + 🚀).
                     v.push(("P", "pass DevQA"));
                 }
-                v.push(("Q", if devqa_started { "re-open DevQA" } else { "begin DevQA" }));
-                if has_pr {
-                    v.push(("K", "PR state"));
+                if !crate::app::detail_ticket_assigned_to_me(app) {
+                    v.push((
+                        "Q",
+                        if devqa_started {
+                            "re-open DevQA"
+                        } else {
+                            "begin DevQA"
+                        },
+                    ));
                 }
-                v.push(("C", "claude"));
+                v.push(("K", "mark review"));
+                v.push(("C", "ask ai"));
                 v.push(("s", s_label));
                 v.push(("D", "archive"));
                 v.push(("esc", "back"));
@@ -3453,7 +4265,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                         ("a", "add"),
                         ("y", "approve"),
                         ("d", "dismiss/unlink"),
-                        ("C", "claude"),
+                        ("C", "ask ai"),
                         ("esc", "back"),
                     ]
                 } else {
@@ -3462,7 +4274,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                         ("j/k", "move"),
                         ("a", "add"),
                         ("d", "unlink"),
-                        ("C", "claude"),
+                        ("C", "ask ai"),
                         ("esc", "back"),
                     ]
                 }
@@ -3474,7 +4286,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                 ("a", "add subtask"),
                 ("A", "toggle archived"),
                 ("D", "archive"),
-                ("C", "claude"),
+                ("C", "ask ai"),
                 ("esc", "back"),
             ],
             DetailFocus::PrComments => vec![
@@ -3482,8 +4294,15 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                 ("j/k", "move"),
                 ("r", "reply"),
                 ("R", "resolve thread"),
-                ("H", if app.show_resolved_pr_comments { "hide resolved" } else { "show resolved" }),
-                ("c", "ask claude"),
+                (
+                    "H",
+                    if app.show_resolved_pr_comments {
+                        "hide resolved"
+                    } else {
+                        "show resolved"
+                    },
+                ),
+                ("c", "ask ai"),
                 ("esc", "back"),
             ],
             DetailFocus::Comments => vec![
@@ -3492,15 +4311,13 @@ fn mode_hints(app: &App) -> Vec<Hint> {
                 ("c", "new"),
                 ("R", "reply"),
                 ("d", "delete (own)"),
-                ("C", "claude"),
+                ("C", "ask ai"),
                 ("esc", "back"),
             ],
         },
-        Mode::TicketProjects(_) => vec![
-            ("j/k", "move"),
-            ("space/enter", "toggle"),
-            ("esc", "back"),
-        ],
+        Mode::TicketProjects(_) => {
+            vec![("j/k", "move"), ("space/enter", "toggle"), ("esc", "back")]
+        }
         Mode::Create(_) => vec![
             ("tab", "next"),
             ("enter", "next/submit"),
@@ -3509,14 +4326,12 @@ fn mode_hints(app: &App) -> Vec<Hint> {
         ],
         Mode::Edit(form) => {
             if form.suggestion.is_some() {
-                vec![
-                    ("y", "keep claude rewrite"),
-                    ("n/esc", "reject"),
-                ]
+                vec![("y", "keep claude rewrite"), ("n/esc", "reject")]
             } else {
                 vec![
                     ("tab", "switch field"),
                     ("enter", "save (sum) / newline (desc)"),
+                    ("ctrl+e", "$EDITOR"),
                     ("ctrl+r", "claude tighten"),
                     ("ctrl+s/F5", "save"),
                     ("esc", "cancel"),
@@ -3524,21 +4339,9 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             }
         }
         Mode::Comment(_) => vec![("ctrl+s", "submit"), ("esc", "cancel")],
-        Mode::Transition(_) => vec![
-            ("j/k", "move"),
-            ("enter", "submit"),
-            ("esc", "cancel"),
-        ],
-        Mode::EditTime(_) => vec![
-            ("tab", "switch"),
-            ("enter", "submit"),
-            ("esc", "cancel"),
-        ],
-        Mode::EditPriority(_) => vec![
-            ("j/k", "move"),
-            ("enter", "set"),
-            ("esc", "cancel"),
-        ],
+        Mode::Transition(_) => vec![("j/k", "move"), ("enter", "submit"), ("esc", "cancel")],
+        Mode::EditTime(_) => vec![("tab", "switch"), ("enter", "submit"), ("esc", "cancel")],
+        Mode::EditPriority(_) => vec![("j/k", "move"), ("enter", "set"), ("esc", "cancel")],
         Mode::StartWorkPrompt(_) => vec![
             ("tab", "switch"),
             ("enter", "submit"),
@@ -3550,14 +4353,11 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("enter", "launch"),
             ("esc", "cancel"),
         ],
-        Mode::DevQaResolveConfirm(_) => vec![
-            ("enter/y", "post pass + 🚀"),
-            ("esc/n", "cancel"),
-        ],
-        Mode::DevQaCleanupConfirm(_) => vec![
-            ("enter/y", "discard + remove"),
-            ("esc/n", "keep worktree"),
-        ],
+        Mode::DevQaResolveConfirm(_) => vec![("enter/y", "post pass + 🚀"), ("esc/n", "cancel")],
+        Mode::DevQaCleanupConfirm(_) => {
+            vec![("enter/y", "discard + remove"), ("esc/n", "keep worktree")]
+        }
+        Mode::TicketOptions(_) => vec![("j/k", "move"), ("enter", "select"), ("esc", "close")],
         Mode::Implementation(_) => vec![
             ("j/k", "scroll"),
             ("s", "save md"),
@@ -3572,28 +4372,31 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("r", "reload"),
             ("esc/q", "back"),
         ],
-        Mode::ConfluencePages(form) => if form.search_active {
-            vec![
-                ("type", "filter"),
-                ("enter", "search"),
-                ("j/k", "move results"),
-                ("esc", "cancel"),
-            ]
-        } else {
-            vec![
-                ("j/k", "move"),
-                ("/", "search"),
-                ("enter", "view page"),
-                ("l/→", "drill into children"),
-                ("h/←/esc", "back"),
-            ]
-        },
-        Mode::PageView(_) => vec![],  // PageView draws its own footer
+        Mode::ConfluencePages(form) => {
+            if form.search_active {
+                vec![
+                    ("type", "filter"),
+                    ("enter", "search"),
+                    ("j/k", "move results"),
+                    ("esc", "cancel"),
+                ]
+            } else {
+                vec![
+                    ("j/k", "move"),
+                    ("/", "search"),
+                    ("enter", "view page"),
+                    ("l/→", "drill into children"),
+                    ("h/←/esc", "back"),
+                ]
+            }
+        }
+        Mode::PageView(_) => vec![], // PageView draws its own footer
         Mode::Tree(form) => {
             let mut hints: Vec<Hint> = vec![
                 ("j/k", "move"),
                 ("o/Tab", "toggle"),
                 ("O/C", "expand/collapse all"),
+                ("/", "search"),
             ];
             let selected_is_subtask = form
                 .visible
@@ -3606,7 +4409,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             }
             hints.extend([
                 ("v", "two-col"),
-                ("K", "show/hide done PRs"),
+                ("K", "done PRs"),
                 ("Enter", "detail"),
                 ("q", "back"),
             ]);
@@ -3618,10 +4421,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("enter", "select"),
             ("esc", "cancel"),
         ],
-        Mode::ArchiveConfirm(_) => vec![
-            ("y/enter", "confirm"),
-            ("n/esc", "cancel"),
-        ],
+        Mode::ArchiveConfirm(_) => vec![("y/enter", "confirm"), ("n/esc", "cancel")],
         Mode::PrCommentReply(_) => vec![
             ("type", "edit"),
             ("←/→/↑/↓", "caret"),
@@ -3630,18 +4430,11 @@ fn mode_hints(app: &App) -> Vec<Hint> {
         ],
         Mode::PrCreate(form) => {
             if form.remote_pick.is_some() {
-                return vec![
-                    ("j/k", "move"),
-                    ("enter", "save + push"),
-                    ("esc", "cancel"),
-                ];
+                return vec![("j/k", "move"), ("enter", "save + push"), ("esc", "cancel")];
             }
             if form.review_state == crate::app::PrReviewState::Reviewing {
                 if app.pending_pr_review.is_some() {
-                    vec![
-                        ("…", "running /review"),
-                        ("esc", "cancel"),
-                    ]
+                    vec![("…", "running /review"), ("esc", "cancel")]
                 } else {
                     vec![
                         ("j/k · PgUp/PgDn", "scroll"),
@@ -3702,10 +4495,16 @@ fn mode_hints(app: &App) -> Vec<Hint> {
 
 fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
     use ratatui::layout::{Constraint, Direction, Layout};
-    let Mode::PrCommentReply(form) = &app.mode else { return };
+    let Mode::PrCommentReply(form) = &app.mode else {
+        return;
+    };
     let total = f.area();
-    let height = (total.height * 80 / 100).max(18).min(total.height.saturating_sub(2));
-    let width = (total.width * 70 / 100).max(60).min(total.width.saturating_sub(2));
+    let height = (total.height * 80 / 100)
+        .max(18)
+        .min(total.height.saturating_sub(2));
+    let width = (total.width * 70 / 100)
+        .max(60)
+        .min(total.width.saturating_sub(2));
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3726,7 +4525,9 @@ fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
 
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(20, 20, 28))).borders(Borders::NONE),
+        Block::default()
+            .style(Style::default().bg(Color::Rgb(20, 20, 28)))
+            .borders(Borders::NONE),
         area,
     );
 
@@ -3740,7 +4541,9 @@ fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Cyan))
         .title(Line::from(Span::styled(
             kind_label,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -3751,7 +4554,12 @@ fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
     // context is right above your draft.
     lines.push(Line::from(vec![
         Span::styled("  replying to ", Style::default().fg(Color::DarkGray)),
-        Span::styled(form.parent_author.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            form.parent_author.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
     ]));
     let wrap_w = inner.width.saturating_sub(4) as usize;
     for ln in form.parent_body.lines().take(8) {
@@ -3765,7 +4573,9 @@ fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
     if form.parent_body.lines().count() > 8 {
         lines.push(Line::from(Span::styled(
             "  │ … (parent truncated)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
     }
     lines.push(Line::from(""));
@@ -3773,7 +4583,9 @@ fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
     // Body editor with caret.
     lines.push(Line::from(Span::styled(
         "  your reply:",
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     )));
     {
         let body = form.body.as_str();
@@ -3782,7 +4594,9 @@ fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
             vec![""]
         } else {
             let mut v: Vec<&str> = body.split('\n').collect();
-            if v.is_empty() { v.push(""); }
+            if v.is_empty() {
+                v.push("");
+            }
             v
         };
         let mut offset = 0usize;
@@ -3818,7 +4632,9 @@ fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
     if form.busy {
         lines.push(Line::from(Span::styled(
             "  posting…",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
     } else {
         lines.push(Line::from(Span::styled(
@@ -3830,12 +4646,18 @@ fn draw_pr_comment_reply(f: &mut Frame, app: &App) {
 }
 
 fn draw_pr_create(f: &mut Frame, app: &App) {
-    use ratatui::layout::{Constraint, Direction, Layout};
     use crate::app::PrCreateForm;
-    let Mode::PrCreate(form) = &app.mode else { return };
+    use ratatui::layout::{Constraint, Direction, Layout};
+    let Mode::PrCreate(form) = &app.mode else {
+        return;
+    };
     let total = f.area();
-    let height = (total.height * 80 / 100).max(20).min(total.height.saturating_sub(2));
-    let width = (total.width * 70 / 100).max(60).min(total.width.saturating_sub(2));
+    let height = (total.height * 80 / 100)
+        .max(20)
+        .min(total.height.saturating_sub(2));
+    let width = (total.width * 70 / 100)
+        .max(60)
+        .min(total.width.saturating_sub(2));
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -3856,7 +4678,9 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
 
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(20, 20, 28))).borders(Borders::NONE),
+        Block::default()
+            .style(Style::default().bg(Color::Rgb(20, 20, 28)))
+            .borders(Borders::NONE),
         area,
     );
 
@@ -3866,7 +4690,9 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         .border_style(Style::default().fg(Color::Yellow))
         .title(Line::from(Span::styled(
             title,
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -3877,17 +4703,23 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             "  where should jui PUSH your branch?",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
         lines.push(Line::from(Span::styled(
             "  (must be a fork you can write to — usually NOT `origin`)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
         lines.push(Line::from(""));
         for (i, (name, url)) in p.items.iter().enumerate() {
             let prefix = if i == p.selected { "  ▶ " } else { "    " };
             let style = if i == p.selected {
-                Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::Rgb(60, 60, 80))
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
@@ -3912,12 +4744,14 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  PR target is always origin/develop — this only controls WHERE the branch pushes.",
+            "  This controls WHERE the branch pushes. PR target remains upstream/develop.",
             Style::default().fg(Color::DarkGray),
         )));
         lines.push(Line::from(Span::styled(
             "  j/k move · enter save+push · esc cancel · (saved per project)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
         f.render_widget(Paragraph::new(lines), inner);
         return;
@@ -3929,19 +4763,31 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
             Line::from(""),
             Line::from(vec![
                 Span::raw("  No GitHub handle for "),
-                Span::styled(p.display_name.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    p.display_name.clone(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
             ]),
             Line::from(""),
             Line::from(vec![
                 Span::raw("  github handle: "),
                 Span::styled("@", Style::default().fg(Color::DarkGray)),
-                Span::styled(p.handle.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    p.handle.clone(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("█", Style::default().fg(Color::Yellow)),
             ]),
             Line::from(""),
             Line::from(Span::styled(
                 "  Saved to ~/.config/jui/users.toml — Enter to save and retry, Esc to cancel.",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             )),
         ];
         f.render_widget(Paragraph::new(lines), inner);
@@ -3951,7 +4797,9 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
     let cur = form.field;
     let label = |i: u8, name: &str| -> Span<'static> {
         let style = if cur == i {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -3960,12 +4808,27 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
 
     let mut lines: Vec<Line> = Vec::new();
 
+    if !form.route_hint.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("route     ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                form.route_hint.clone(),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(""));
+    }
+
     // Title field — split around the cursor so the caret renders inline.
     let title_cursor = form.title_cursor.min(form.title.len());
     let (title_pre, title_post) = form.title.split_at(title_cursor);
     let title_style = if cur == 0 {
         Style::default().add_modifier(Modifier::BOLD)
-    } else { Style::default() };
+    } else {
+        Style::default()
+    };
     let mut title_spans = vec![
         label(0, "title"),
         Span::raw(" "),
@@ -3988,11 +4851,15 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         body_label_spans.push(Span::raw("  "));
         body_label_spans.push(Span::styled(
             app.spinner_glyph().to_string(),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
         body_label_spans.push(Span::styled(
             " asking claude…",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::ITALIC),
         ));
     }
     lines.push(Line::from(body_label_spans));
@@ -4004,23 +4871,30 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         } else {
             // Preserve trailing empty line so a caret after a final '\n' has somewhere to go.
             let mut v: Vec<&str> = body.split('\n').collect();
-            if v.is_empty() { v.push(""); }
+            if v.is_empty() {
+                v.push("");
+            }
             v
         };
         let mut offset = 0usize;
+        let body_w = (inner.width as usize).saturating_sub(4).max(1);
         for ln in body_lines.iter() {
             let line_end = offset + ln.len();
-            let mut spans = vec![Span::raw("  ")];
-            if cur == 1 && body_cursor >= offset && body_cursor <= line_end {
+            let rendered = if cur == 1 && body_cursor >= offset && body_cursor <= line_end {
                 let rel = body_cursor - offset;
-                let (pre, post) = ln.split_at(rel.min(ln.len()));
-                spans.push(Span::raw(pre.to_string()));
-                spans.push(Span::styled("▏", Style::default().fg(Color::Yellow)));
-                spans.push(Span::raw(post.to_string()));
+                insert_caret(ln, rel.min(ln.len()))
             } else {
-                spans.push(Span::raw((*ln).to_string()));
+                (*ln).to_string()
+            };
+            if rendered.is_empty() {
+                lines.push(Line::from("  "));
+            } else {
+                let chars: Vec<char> = rendered.chars().collect();
+                for chunk in chars.chunks(body_w) {
+                    let text: String = chunk.iter().collect();
+                    lines.push(Line::from(vec![Span::raw("  "), Span::raw(text)]));
+                }
             }
-            lines.push(Line::from(spans));
             offset = line_end + 1; // +1 for the consumed '\n'
         }
     }
@@ -4030,7 +4904,9 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
     if let Some(s) = &form.suggestion {
         lines.push(Line::from(Span::styled(
             "  ── claude rewrite (y accept · n reject) ─────────────────────",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )));
         for ln in s.lines().take(20) {
             lines.push(Line::from(vec![
@@ -4041,7 +4917,9 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         if s.lines().count() > 20 {
             lines.push(Line::from(Span::styled(
                 "  … (truncated; accept to insert in full)",
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             )));
         }
         lines.push(Line::from(""));
@@ -4058,7 +4936,9 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         Span::styled(reviewer_text, Style::default()),
         if cur == 2 && form.reviewer.is_none() {
             Span::styled("█", Style::default().fg(Color::Yellow))
-        } else { Span::raw("") },
+        } else {
+            Span::raw("")
+        },
     ]));
     if cur == 2 && form.reviewer.is_none() {
         if form.reviewer_results.is_empty() {
@@ -4069,9 +4949,17 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         } else {
             for (i, (name, _)) in form.reviewer_results.iter().enumerate().take(6) {
                 let style = if i == form.reviewer_picker_selected {
-                    Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
-                } else { Style::default().fg(Color::DarkGray) };
-                let prefix = if i == form.reviewer_picker_selected { "  ▶ " } else { "    " };
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 80))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let prefix = if i == form.reviewer_picker_selected {
+                    "  ▶ "
+                } else {
+                    "    "
+                };
                 lines.push(Line::from(vec![
                     Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
                     Span::styled(name.clone(), style),
@@ -4092,7 +4980,9 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         Span::styled(devqa_text, Style::default()),
         if cur == 3 && form.devqa.is_none() {
             Span::styled("█", Style::default().fg(Color::Yellow))
-        } else { Span::raw("") },
+        } else {
+            Span::raw("")
+        },
     ]));
     if cur == 3 && form.devqa.is_none() {
         if form.devqa_results.is_empty() {
@@ -4103,9 +4993,17 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
         } else {
             for (i, (name, _)) in form.devqa_results.iter().enumerate().take(6) {
                 let style = if i == form.devqa_picker_selected {
-                    Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
-                } else { Style::default().fg(Color::DarkGray) };
-                let prefix = if i == form.devqa_picker_selected { "  ▶ " } else { "    " };
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 80))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let prefix = if i == form.devqa_picker_selected {
+                    "  ▶ "
+                } else {
+                    "    "
+                };
                 lines.push(Line::from(vec![
                     Span::styled(prefix.to_string(), Style::default().fg(Color::DarkGray)),
                     Span::styled(name.clone(), style),
@@ -4130,7 +5028,9 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
     if form.busy {
         lines.push(Line::from(Span::styled(
             "  submitting…",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
     } else if form.review_state == crate::app::PrReviewState::Reviewing {
         // Headline + hint live above the review pane; the pane itself is
@@ -4141,17 +5041,23 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
                 Span::raw("  "),
                 Span::styled(
                     app.spinner_glyph().to_string(),
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     " claude review running… (esc cancels)",
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::ITALIC),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::ITALIC),
                 ),
             ]));
         } else if form.review_output.is_some() {
             lines.push(Line::from(Span::styled(
                 "  /review output (j/k or PgUp/PgDn to scroll):",
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )));
         } else {
             lines.push(Line::from(Span::styled(
@@ -4177,7 +5083,10 @@ fn draw_pr_create(f: &mut Frame, app: &App) {
     if form.review_state == crate::app::PrReviewState::Reviewing {
         let split = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length((lines.len() as u16).min(inner.height / 2)), Constraint::Min(3)])
+            .constraints([
+                Constraint::Length((lines.len() as u16).min(inner.height / 2)),
+                Constraint::Min(3),
+            ])
             .split(inner);
         f.render_widget(Paragraph::new(lines), split[0]);
         draw_pr_review_pane(f, split[1], form);
@@ -4192,7 +5101,9 @@ fn draw_pr_review_pane(f: &mut Frame, area: Rect, form: &crate::app::PrCreateFor
         .border_style(Style::default().fg(Color::DarkGray))
         .title(Span::styled(
             " claude /review ",
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -4220,7 +5131,9 @@ fn draw_pr_review_pane(f: &mut Frame, area: Rect, form: &crate::app::PrCreateFor
 
 /// Greedy whitespace-aware wrap for long error/status messages in modals.
 fn wrap_line(s: &str, w: usize) -> Vec<String> {
-    if w == 0 || s.len() <= w { return vec![s.to_string()]; }
+    if w == 0 || s.len() <= w {
+        return vec![s.to_string()];
+    }
     let mut out = Vec::new();
     let mut cur = String::new();
     for word in s.split_whitespace() {
@@ -4239,17 +5152,23 @@ fn wrap_line(s: &str, w: usize) -> Vec<String> {
             out.push(split);
         }
     }
-    if !cur.is_empty() { out.push(cur); }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
     out
 }
 
 fn draw_archive_confirm(f: &mut Frame, app: &App) {
     use ratatui::layout::{Alignment, Constraint, Direction, Layout};
-    let Mode::ArchiveConfirm(form) = &app.mode else { return };
+    let Mode::ArchiveConfirm(form) = &app.mode else {
+        return;
+    };
     let total = f.area();
     let has_error = form.error.is_some();
     let height = if has_error { 22u16 } else { 9u16 }.min(total.height.saturating_sub(2));
-    let width = (total.width * 70 / 100).max(60).min(total.width.saturating_sub(2));
+    let width = (total.width * 70 / 100)
+        .max(60)
+        .min(total.width.saturating_sub(2));
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4269,19 +5188,30 @@ fn draw_archive_confirm(f: &mut Frame, app: &App) {
     let area = h[1];
 
     f.render_widget(ratatui::widgets::Clear, area);
-    let bg = if has_error { Color::Rgb(40, 16, 16) } else { Color::Rgb(20, 28, 32) };
+    let bg = if has_error {
+        Color::Rgb(40, 16, 16)
+    } else {
+        Color::Rgb(20, 28, 32)
+    };
     let border = if has_error { Color::Red } else { Color::Yellow };
     f.render_widget(
-        Block::default().style(Style::default().bg(bg)).borders(Borders::NONE),
+        Block::default()
+            .style(Style::default().bg(bg))
+            .borders(Borders::NONE),
         area,
     );
-    let title = if has_error { " archive failed " } else { " archive ticket? " };
+    let title = if has_error {
+        " archive failed "
+    } else {
+        " archive ticket? "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border))
-        .title(Line::from(vec![
-            Span::styled(title, Style::default().fg(border).add_modifier(Modifier::BOLD)),
-        ]));
+        .title(Line::from(vec![Span::styled(
+            title,
+            Style::default().fg(border).add_modifier(Modifier::BOLD),
+        )]));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -4289,7 +5219,12 @@ fn draw_archive_confirm(f: &mut Frame, app: &App) {
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
-            Span::styled(form.key.clone(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                form.key.clone(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(form.summary.clone(), Style::default()),
         ]),
@@ -4309,21 +5244,122 @@ fn draw_archive_confirm(f: &mut Frame, app: &App) {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("[ Enter / Esc ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[ Enter / Esc ]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  dismiss"),
         ]));
     } else {
         lines.push(Line::from(Span::styled(
             "  Will transition the ticket to Won't Do / Cancelled / Closed / Done.",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         )));
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("[ y / Enter ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[ y / Enter ]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  archive    "),
-            Span::styled("[ n / Esc ]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "[ n / Esc ]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  cancel"),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner);
+}
+
+fn draw_ticket_options(f: &mut Frame, app: &App) {
+    use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+    let Mode::TicketOptions(form) = &app.mode else {
+        return;
+    };
+    let total = f.area();
+    let height = 16u16.min(total.height.saturating_sub(2));
+    let width = 86u16.max(56).min(total.width.saturating_sub(2));
+    let v = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length((total.height.saturating_sub(height)) / 2),
+            Constraint::Length(height),
+            Constraint::Min(0),
+        ])
+        .split(total);
+    let h = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length((total.width.saturating_sub(width)) / 2),
+            Constraint::Length(width),
+            Constraint::Min(0),
+        ])
+        .split(v[1]);
+    let area = h[1];
+    f.render_widget(ratatui::widgets::Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Line::from(vec![
+            Span::styled(
+                format!(" ticket options — {} ", form.key),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "(enter select · esc close)",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("  Claude session:   ", Style::default().fg(Color::DarkGray)),
+            Span::raw(form.claude_session.clone().unwrap_or_else(|| "—".into())),
+        ]),
+        Line::from(vec![
+            Span::styled("  opencode session: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(form.opencode_session.clone().unwrap_or_else(|| "—".into())),
+        ]),
+        Line::from(""),
+    ];
+    for (i, action) in form.actions.iter().enumerate() {
+        let selected = i == form.selected;
+        let label = match action {
+            TicketOptionAction::Time => "change time / log work",
+            TicketOptionAction::Priority => "change priority",
+            TicketOptionAction::Reviewer => "change reviewer",
+            TicketOptionAction::DevQa => "change DevQA assignee",
+            TicketOptionAction::ResetPullRequest => "close PR + reset for new PR",
+            TicketOptionAction::ClearClaudeSession => "clear Claude session id",
+            TicketOptionAction::ClearOpencodeSession => "clear opencode session id",
+        };
+        let style = if selected {
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                if selected { "  ▶ " } else { "    " },
+                Style::default().fg(Color::Green),
+            ),
+            Span::styled(label.to_string(), style),
         ]));
     }
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner);
@@ -4331,12 +5367,16 @@ fn draw_archive_confirm(f: &mut Frame, app: &App) {
 
 fn draw_assign_picker(f: &mut Frame, app: &App) {
     use ratatui::layout::{Constraint, Direction, Layout};
-    let Mode::AssignPicker(form) = &app.mode else { return };
+    let Mode::AssignPicker(form) = &app.mode else {
+        return;
+    };
 
     // Center a popup ~60% wide, ~16 rows tall.
     let total = f.area();
     let height = 16u16.min(total.height.saturating_sub(2));
-    let width = (total.width * 60 / 100).max(50).min(total.width.saturating_sub(2));
+    let width = (total.width * 60 / 100)
+        .max(50)
+        .min(total.width.saturating_sub(2));
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4365,13 +5405,17 @@ fn draw_assign_picker(f: &mut Frame, app: &App) {
     let title_text = match form.purpose {
         AssignPurpose::Assignee => format!(" assign {} ", form.key),
         AssignPurpose::Reviewer => format!(" set reviewer on {} ", form.key),
+        AssignPurpose::DevQa => format!(" set DevQA on {} ", form.key),
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
-        .title(Line::from(vec![
-            Span::styled(title_text, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-        ]));
+        .title(Line::from(vec![Span::styled(
+            title_text,
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )]));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -4389,7 +5433,12 @@ fn draw_assign_picker(f: &mut Frame, app: &App) {
     // Query
     let query_line = Line::from(vec![
         Span::styled("query: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(form.query.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            form.query.clone(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("█", Style::default().fg(Color::Yellow)),
     ]);
     f.render_widget(Paragraph::new(query_line), chunks[0]);
@@ -4397,9 +5446,13 @@ fn draw_assign_picker(f: &mut Frame, app: &App) {
     let hint = match form.purpose {
         AssignPurpose::Assignee => "type ≥ 2 chars · empty + enter = me",
         AssignPurpose::Reviewer => "type ≥ 2 chars · enter to set",
+        AssignPurpose::DevQa => "type ≥ 2 chars · enter to set",
     };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))),
+        Paragraph::new(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        ))),
         chunks[1],
     );
 
@@ -4407,7 +5460,9 @@ fn draw_assign_picker(f: &mut Frame, app: &App) {
     let result_lines: Vec<Line> = if form.results.is_empty() {
         vec![Line::from(Span::styled(
             "  (no results)",
-            Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
         ))]
     } else {
         form.results
@@ -4415,7 +5470,9 @@ fn draw_assign_picker(f: &mut Frame, app: &App) {
             .enumerate()
             .map(|(i, (name, _id))| {
                 let style = if i == form.selected {
-                    Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .bg(Color::Rgb(60, 60, 80))
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default()
                 };
@@ -4451,7 +5508,9 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
     let rows = (hints.len().max(legend.len()) as u16).max(1) + 4;
     let height = rows.min(total.height.saturating_sub(2));
     let width_pct = if two_col { 80 } else { 70 };
-    let width = (total.width * width_pct / 100).max(40).min(total.width.saturating_sub(2));
+    let width = (total.width * width_pct / 100)
+        .max(40)
+        .min(total.width.saturating_sub(2));
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4477,7 +5536,12 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
         .title(Line::from(vec![
-            Span::styled(" help ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                " help ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled("(esc/q/? to close)", Style::default().fg(Color::DarkGray)),
         ]));
     let inner = block.inner(area);
@@ -4489,7 +5553,9 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
     );
     f.render_widget(block, area);
 
-    let key_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
     let exp_style = Style::default();
     let max_key_w = hints.iter().map(|(k, _)| k.len()).max().unwrap_or(1);
     let key_lines: Vec<Line> = hints
@@ -4516,15 +5582,9 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
             Paragraph::new(key_lines).alignment(Alignment::Left),
             cols[0],
         );
-        f.render_widget(
-            Paragraph::new(legend).alignment(Alignment::Left),
-            cols[1],
-        );
+        f.render_widget(Paragraph::new(legend).alignment(Alignment::Left), cols[1]);
     } else {
-        f.render_widget(
-            Paragraph::new(key_lines).alignment(Alignment::Left),
-            inner,
-        );
+        f.render_widget(Paragraph::new(key_lines).alignment(Alignment::Left), inner);
     }
 }
 
@@ -4538,7 +5598,9 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         return Vec::new();
     }
     let dim = Style::default().fg(Color::DarkGray);
-    let header = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let header = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
     let body = Style::default();
     let mut lines: Vec<Line<'static>> = Vec::new();
     let entry = |badge: &str, badge_style: Style, label: &str| {
@@ -4550,7 +5612,10 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         ])
     };
 
-    lines.push(Line::from(Span::styled(" Role badges  (purple = Jira · blue = GitHub)", header)));
+    lines.push(Line::from(Span::styled(
+        " Role badges  (purple = Jira · blue = GitHub)",
+        header,
+    )));
     let (b, s) = role_badge(MentionRole::Assigned);
     lines.push(entry(b, s, "Assigned to you (Jira)"));
     let (b, s) = role_badge(MentionRole::Reviewer);
@@ -4561,7 +5626,10 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
     lines.push(entry(b, s, "Mentioned (GitHub @-mention)"));
     lines.push(Line::from(""));
 
-    lines.push(Line::from(Span::styled(" PR review state (your tracker)", header)));
+    lines.push(Line::from(Span::styled(
+        " PR review state (your tracker)",
+        header,
+    )));
     if let Some((b, s)) = pr_state_label(MentionRole::Github, PrUserState::Awaiting) {
         lines.push(entry(b.trim_end(), s, "Awaiting your review (default)"));
     }
@@ -4569,19 +5637,29 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(entry(b.trim_end(), s, "Actively reviewing (auto on Q)"));
     }
     if let Some((b, s)) = pr_state_label(MentionRole::Github, PrUserState::Completed) {
-        lines.push(entry(b.trim_end(), s, "Completed (auto on gh APPROVED, hidden default)"));
+        lines.push(entry(
+            b.trim_end(),
+            s,
+            "Completed (auto on gh APPROVED, hidden default)",
+        ));
     }
     lines.push(entry(
         "[PR]",
-        Style::default().fg(Color::Rgb(80, 160, 255)).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Rgb(80, 160, 255))
+            .add_modifier(Modifier::BOLD),
         "You have an open PR authored — sinks below not-yet-PR'd in Tree",
     ));
     lines.push(Line::from(""));
 
     lines.push(Line::from(Span::styled(" Issue type glyphs", header)));
     for (gl, name) in [
-        ("⚡", "Epic"), ("✦", "Story"), ("☑", "Task"),
-        ("✗", "Bug"), ("↳", "Sub-task"), ("▲", "Improvement"),
+        ("⚡", "Epic"),
+        ("✦", "Story"),
+        ("☑", "Task"),
+        ("✗", "Bug"),
+        ("↳", "Sub-task"),
+        ("▲", "Improvement"),
         ("✱", "Spike"),
     ] {
         let style = Style::default().fg(type_color(Some(name)));
@@ -4610,7 +5688,12 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
         ]));
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled("italic dim", Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)),
+            Span::styled(
+                "italic dim",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
             Span::styled("  ancestor pulled in for context only", dim),
         ]));
     }
@@ -4618,28 +5701,28 @@ fn legend_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// Per-(key, footer_short) → 3-word(ish) description shown in the `?` help
-/// overlay. Footer hints stay terse for the bottom bar; the overlay lifts
-/// `mode_hints` entries through this table to give the user enough context to
-/// disambiguate similar verbs ("link" — link what?).
+/// Per-(key, footer_short) → simple description shown in the `?` help overlay.
+/// Footer hints stay terse for the bottom bar; the overlay lifts `mode_hints`
+/// entries through this table so each command says what it actually changes.
 fn long_desc(key: &str, short: &str) -> Option<&'static str> {
     match (key, short) {
         // List view
-        ("j/k", "move") => Some("move selection up/down"),
-        ("tab", "expand subtasks") => Some("expand/collapse subtasks"),
-        ("S-tab", "toggle section") => Some("switch active/mentioned section"),
-        ("enter", "open") => Some("open ticket detail"),
-        ("r", "refresh") => Some("force refresh from Jira"),
-        ("o", "sort") => Some("cycle sort mode"),
-        ("n", "new") => Some("create new top-level ticket"),
-        ("s", "start") => Some("start work session"),
-        ("s", "stop") => Some("stop work + transition"),
-        ("T", "tree") => Some("open ticket tree view"),
-        ("a", "archive") => Some("view archived tickets"),
-        ("b", "board") => Some("open kanban board"),
-        ("p", "projects") => Some("manage linked projects"),
-        ("W", "workflow") => Some("edit active Jira statuses (start/stop)"),
-        ("f", "confluence") => Some("browse Confluence pages"),
+        ("j/k", "move") => Some("Move the selected ticket up or down."),
+        ("tab", "expand subtasks") => Some("Show or hide this ticket's subtasks."),
+        ("S-tab", "toggle section") => Some("Switch between active tickets and review mentions."),
+        ("enter", "open") => Some("Open the selected ticket details."),
+        ("/", "search") => Some("Search/filter matching rows as you type."),
+        ("r", "refresh") => Some("Reload the active list from Jira."),
+        ("o", "sort") => Some("Cycle the active list sort order."),
+        ("n", "new") => Some("Create a new top-level Jira ticket."),
+        ("s", "start") => Some("Start work: status, branch/worktree, assistant."),
+        ("s", "stop") => Some("Stop work and move the ticket back."),
+        ("T", "tree") => Some("Open the parent/subtask tree view."),
+        ("a", "archive") => Some("Show closed, done, or archived tickets."),
+        ("b", "board") => Some("Open the Jira-status kanban board."),
+        ("p", "projects") => Some("Add or remove local project roots."),
+        ("W", "workflow") => Some("Choose statuses that count as active work."),
+        ("f", "confluence") => Some("Browse cached/live Confluence pages."),
         ("q", "quit") => Some("quit jui"),
 
         // Kanban
@@ -4672,18 +5755,21 @@ fn long_desc(key: &str, short: &str) -> Option<&'static str> {
         ("t", "trans") => Some("transition ticket status"),
         ("w", "time") => Some("log time worked"),
         ("i", "prio") => Some("edit ticket priority"),
+        ("O", "options") => Some("Open time, priority, reviewer, and AI sessions."),
         ("L", "link") => Some("link a local project"),
         ("T", "subtask") => Some("create child sub-task"),
         ("@", "assign") => Some("change ticket assignee"),
         ("R", "reviewer") => Some("set ticket reviewer"),
-        ("P", "open PR") => Some("open GitHub pull request"),
-        ("P", "pass DevQA") => Some("post 'DevQA: Passed' + 🚀, advance ticket"),
-        ("Q", "begin DevQA") => Some("start DevQA on PR"),
-        ("Q", "re-open DevQA") => Some("re-open the Claude DevQA session"),
-        ("C", "claude") => Some("launch Claude in tmux"),
+        ("Y", "DevQA") => Some("set ticket DevQA assignee"),
+        ("P", "open PR") => Some("Push branch, open PR, update Jira status."),
+        ("P", "pass DevQA") => Some("Post DevQA passed, react, advance Jira."),
+        ("Q", "begin DevQA") => Some("Check out PR and launch assistant for QA."),
+        ("Q", "re-open DevQA") => Some("Re-open the existing DevQA assistant."),
+        ("C", "ask ai") => Some("Ask the configured assistant about this ticket."),
+        ("c", "ask ai") => Some("Ask the configured assistant about this context."),
         ("D", "archive") => Some("archive this ticket"),
-        ("K", "PR state") => Some("cycle PR review state"),
-        ("K", "show/hide done PRs") => Some("toggle completed PRs"),
+        ("K", "mark review") => Some("Cycle local review marker: To Review/Reviewing/Done."),
+        ("K", "done PRs") => Some("Show or hide PRs marked Done locally."),
         ("esc", "back") => Some("back to previous view"),
 
         // Detail · Projects
@@ -4697,9 +5783,9 @@ fn long_desc(key: &str, short: &str) -> Option<&'static str> {
         ("A", "toggle archived") => Some("show/hide archived subtasks"),
 
         // Detail · Comments
-        ("c", "new") => Some("post a new comment"),
-        ("R", "reply") => Some("reply to selected comment"),
-        ("d", "delete (own)") => Some("delete your comment"),
+        ("c", "new") => Some("Write a new Jira comment."),
+        ("R", "reply") => Some("Reply to the selected comment."),
+        ("d", "delete (own)") => Some("Delete your own selected comment."),
 
         // Tree
         ("o/Tab", "toggle") => Some("toggle node expand/collapse"),
@@ -4715,29 +5801,38 @@ fn long_desc(key: &str, short: &str) -> Option<&'static str> {
 
         // Page viewer
         ("j/k", "scroll") => Some("scroll page up/down"),
-        ("/", "search") => Some("search within page"),
         ("n/N", "next/prev") => Some("next/previous match"),
         ("e", "edit") => Some("edit in $EDITOR"),
         ("S", "sync") => Some("sync edits via mark"),
 
         // Archive / PR / Assign confirms
-        ("y/enter", "confirm") => Some("confirm and proceed"),
-        ("n/esc", "cancel") => Some("cancel without changes"),
-        ("F5/^S", "submit") => Some("submit the form"),
-        ("type", "edit/search") => Some("type to edit/search"),
-        ("type", "search/edit") => Some("type to search/edit"),
-        ("↑/↓", "pick") => Some("up/down to pick"),
-        ("↑/↓", "move") => Some("move within picker"),
-        ("enter", "select") => Some("select highlighted entry"),
-        ("enter", "next/submit") => Some("next field or submit"),
-        ("F5/ctrl+enter/ctrl+s", "submit") => Some("submit anywhere"),
+        ("y/enter", "confirm") => Some("Confirm this irreversible action."),
+        ("n/esc", "cancel") => Some("Cancel and leave everything unchanged."),
+        ("F5/^S", "submit") => Some("Submit this form now."),
+        ("type", "edit/search") => Some("Type to edit the field or search."),
+        ("type", "search/edit") => Some("Type to search, then edit/save."),
+        ("↑/↓", "pick") => Some("Move through picker choices."),
+        ("↑/↓", "move") => Some("Move within this list."),
+        ("enter", "select") => Some("Choose the highlighted item."),
+        ("enter", "next/submit") => Some("Advance fields; submit at the end."),
+        ("F5/ctrl+enter/ctrl+s", "submit") => Some("Submit from any field."),
+        ("tab", "switch") => Some("Move to the next form field."),
+        ("enter", "submit") => Some("Submit the current form."),
+        ("F5/ctrl+s", "submit") => Some("Submit without leaving the field."),
+        ("←/→/space", "toggle") => Some("Toggle the selected option."),
+        ("enter", "launch") => Some("Start the checkout and assistant."),
+        ("enter/y", "post pass + 🚀") => Some("Post DevQA pass and advance Jira."),
+        ("enter/y", "discard + remove") => Some("Discard changes and remove worktree."),
+        ("esc/n", "keep worktree") => Some("Keep dirty worktree in place."),
 
         _ => None,
     }
 }
 
 fn render_hints(hints: &[Hint]) -> Line<'static> {
-    let key_style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
     let sep_style = Style::default().fg(Color::DarkGray);
     let exp_style = Style::default().fg(Color::DarkGray);
     let mut spans: Vec<Span<'static>> = Vec::with_capacity(hints.len() * 4);
@@ -4765,7 +5860,9 @@ fn insert_caret(s: &str, cursor: usize) -> String {
 
 fn field_line<'a>(label: &'a str, value: &'a str, active: bool) -> Line<'a> {
     let style = if active {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default()
     };
@@ -4783,10 +5880,23 @@ fn field_line<'a>(label: &'a str, value: &'a str, active: bool) -> Line<'a> {
 fn issue_type_glyph(typ: Option<&str>) -> (&'static str, Style) {
     let t = typ.unwrap_or("").to_ascii_lowercase();
     match t.as_str() {
-        "epic" => ("⚡", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
-        "story" => ("✦", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        "epic" => (
+            "⚡",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        ),
+        "story" => (
+            "✦",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        ),
         "task" => ("✓", Style::default().fg(Color::Cyan)),
-        "sub-task" | "subtask" => ("↳", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)),
+        "sub-task" | "subtask" => (
+            "↳",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+        ),
         "bug" => ("●", Style::default().fg(Color::Red)),
         "improvement" => ("↑", Style::default().fg(Color::Blue)),
         "spike" => ("◇", Style::default().fg(Color::Yellow)),
@@ -4839,11 +5949,21 @@ fn breadcrumb_line_from_text(text: &str) -> Line<'static> {
 }
 
 fn truncate(s: &str, n: usize) -> String {
-    if s.len() <= n { s.to_string() } else { format!("{}…", &s[..n.saturating_sub(1)]) }
+    if s.chars().count() <= n {
+        s.to_string()
+    } else if n == 0 {
+        String::new()
+    } else {
+        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
 }
 
 fn draw_confluence_spaces(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::ConfluenceSpaces(form) = &app.mode else { return };
+    let Mode::ConfluenceSpaces(form) = &app.mode else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" confluence spaces ");
@@ -4863,9 +5983,10 @@ fn draw_confluence_spaces(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
     if form.spaces.is_empty() {
-        let p = Paragraph::new(
-            Span::styled("no spaces found", Style::default().fg(Color::DarkGray))
-        );
+        let p = Paragraph::new(Span::styled(
+            "no spaces found",
+            Style::default().fg(Color::DarkGray),
+        ));
         f.render_widget(p, inner);
         return;
     }
@@ -4875,7 +5996,9 @@ fn draw_confluence_spaces(f: &mut Frame, area: Rect, app: &App) {
         .map(|s| {
             let key_span = Span::styled(
                 format!(" {:<12} ", s.key),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             );
             let name_span = Span::raw(s.name.clone());
             let mut spans = vec![key_span, name_span];
@@ -4891,13 +6014,19 @@ fn draw_confluence_spaces(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default();
     state.select(Some(form.selected.min(form.spaces.len() - 1)));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
 }
 
 fn draw_confluence_pages(f: &mut Frame, area: Rect, app: &App) {
-    let Mode::ConfluencePages(form) = &app.mode else { return };
+    let Mode::ConfluencePages(form) = &app.mode else {
+        return;
+    };
     let crumb_display = if form.breadcrumb.is_empty() {
         format!(" {} — pages ", form.space_name)
     } else {
@@ -4934,10 +6063,17 @@ fn draw_confluence_pages(f: &mut Frame, area: Rect, app: &App) {
 
         // Search bar.
         let search_line = Line::from(vec![
-            Span::styled("/", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 format!(" {}▏", form.search_query),
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 "  (enter to search, esc to cancel)",
@@ -4990,7 +6126,11 @@ fn draw_confluence_pages(f: &mut Frame, area: Rect, app: &App) {
             let mut state = ListState::default();
             state.select(sel);
             let list = List::new(items)
-                .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
                 .highlight_symbol("▶ ");
             f.render_stateful_widget(list, chunks[1], &mut state);
         }
@@ -5000,7 +6140,10 @@ fn draw_confluence_pages(f: &mut Frame, area: Rect, app: &App) {
     // Normal page list.
     if form.pages.is_empty() {
         f.render_widget(
-            Paragraph::new(Span::styled("no pages", Style::default().fg(Color::DarkGray))),
+            Paragraph::new(Span::styled(
+                "no pages",
+                Style::default().fg(Color::DarkGray),
+            )),
             inner,
         );
         return;
@@ -5024,7 +6167,11 @@ fn draw_confluence_pages(f: &mut Frame, area: Rect, app: &App) {
     let mut state = ListState::default();
     state.select(Some(form.selected.min(form.pages.len() - 1)));
     let list = List::new(items)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▶ ");
     f.render_stateful_widget(list, inner, &mut state);
 }
@@ -5032,7 +6179,9 @@ fn draw_confluence_pages(f: &mut Frame, area: Rect, app: &App) {
 fn draw_page_view(f: &mut Frame, area: Rect, app: &mut App) {
     use ratatui::widgets::{Scrollbar, ScrollbarOrientation, ScrollbarState};
     use ratatui_image::StatefulImage;
-    let Mode::PageView(form) = &mut app.mode else { return };
+    let Mode::PageView(form) = &mut app.mode else {
+        return;
+    };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -5046,7 +6195,12 @@ fn draw_page_view(f: &mut Frame, area: Rect, app: &mut App) {
     // Header
     let hdr = Paragraph::new(Line::from(vec![
         Span::styled(" ", Style::default()),
-        Span::styled(form.title.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            form.title.clone(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(
             format!("  [{}/{}]", form.scroll + 1, form.lines.len().max(1)),
             Style::default().fg(Color::DarkGray),
@@ -5063,17 +6217,28 @@ fn draw_page_view(f: &mut Frame, area: Rect, app: &mut App) {
 
     let visible_count = end - scroll;
     let visible: Vec<(usize, PageLine)> = (scroll..end)
-        .map(|i| (i, match &form.lines[i] {
-            PageLine::Spans(s) => PageLine::Spans(s.clone()),
-            PageLine::Blank => PageLine::Blank,
-            PageLine::Image { id, row, height } => PageLine::Image { id: *id, row: *row, height: *height },
-        }))
+        .map(|i| {
+            (
+                i,
+                match &form.lines[i] {
+                    PageLine::Spans(s) => PageLine::Spans(s.clone()),
+                    PageLine::Blank => PageLine::Blank,
+                    PageLine::Image { id, row, height } => PageLine::Image {
+                        id: *id,
+                        row: *row,
+                        height: *height,
+                    },
+                },
+            )
+        })
         .collect();
 
     for row_idx in 0..visible_count {
         let (global_idx, line) = &visible[row_idx];
         let y = content_area.y + row_idx as u16;
-        if y >= content_area.y + content_area.height { break; }
+        if y >= content_area.y + content_area.height {
+            break;
+        }
         let line_area = Rect::new(content_area.x, y, content_area.width.saturating_sub(1), 1);
         let is_cursor = form.search_matches.get(form.search_cursor) == Some(global_idx);
         let is_match = !is_cursor && form.search_matches.binary_search(global_idx).is_ok();
@@ -5081,9 +6246,17 @@ fn draw_page_view(f: &mut Frame, area: Rect, app: &mut App) {
         match line {
             PageLine::Spans(spans) => {
                 let styled: Vec<Span<'static>> = if is_cursor {
-                    spans.iter().map(|s| Span::styled(s.content.clone(), s.style.bg(Color::Rgb(80, 60, 0)))).collect()
+                    spans
+                        .iter()
+                        .map(|s| Span::styled(s.content.clone(), s.style.bg(Color::Rgb(80, 60, 0))))
+                        .collect()
                 } else if is_match {
-                    spans.iter().map(|s| Span::styled(s.content.clone(), s.style.bg(Color::Rgb(40, 40, 40)))).collect()
+                    spans
+                        .iter()
+                        .map(|s| {
+                            Span::styled(s.content.clone(), s.style.bg(Color::Rgb(40, 40, 40)))
+                        })
+                        .collect()
                 } else {
                     spans.clone()
                 };
@@ -5111,12 +6284,17 @@ fn draw_page_view(f: &mut Frame, area: Rect, app: &mut App) {
     if form.lines.len() > viewport_h {
         let sb_area = Rect::new(
             content_area.x + content_area.width.saturating_sub(1),
-            content_area.y, 1, content_area.height,
+            content_area.y,
+            1,
+            content_area.height,
         );
         let mut sb_state = ScrollbarState::new(max_scroll).position(scroll);
         f.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight).begin_symbol(None).end_symbol(None),
-            sb_area, &mut sb_state,
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None),
+            sb_area,
+            &mut sb_state,
         );
     }
 
@@ -5128,40 +6306,97 @@ fn draw_page_view(f: &mut Frame, area: Rect, app: &mut App) {
 
     if form.search_active {
         let match_info = if form.search_matches.is_empty() {
-            if form.search_query.is_empty() { String::new() } else { "no matches".to_string() }
+            if form.search_query.is_empty() {
+                String::new()
+            } else {
+                "no matches".to_string()
+            }
         } else {
             format!("{}/{}", form.search_cursor + 1, form.search_matches.len())
         };
         let search_line = Line::from(vec![
-            Span::styled("/ ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "/ ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(form.search_query.clone(), Style::default()),
             Span::styled("█", Style::default().fg(Color::Yellow)),
             Span::styled(
-                if match_info.is_empty() { String::new() } else { format!("  {}", match_info) },
+                if match_info.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", match_info)
+                },
                 Style::default().fg(Color::DarkGray),
             ),
         ]);
         let hint_line = Line::from(vec![
-            Span::styled("n/N", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "n/N",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" next/prev  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Esc", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Esc",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" close", Style::default().fg(Color::DarkGray)),
         ]);
         f.render_widget(Paragraph::new(vec![search_line, hint_line]), inner);
     } else {
-        let pct = if form.lines.is_empty() { 100 } else { (scroll * 100 / form.lines.len()).min(100) };
+        let pct = if form.lines.is_empty() {
+            100
+        } else {
+            (scroll * 100 / form.lines.len()).min(100)
+        };
         let hints = Line::from(vec![
-            Span::styled("j/k", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "j/k",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("d/u", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "d/u",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" ½pg  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("/", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" search  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("e", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "e",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" edit  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("S", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "S",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" sync  ", Style::default().fg(Color::DarkGray)),
-            Span::styled("q", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "q",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" back  ", Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{}%", pct), Style::default().fg(Color::DarkGray)),
         ]);
@@ -5175,7 +6410,9 @@ fn type_color(issue_type: Option<&str>) -> Color {
         t if t.eq_ignore_ascii_case("story") => Color::Green,
         t if t.eq_ignore_ascii_case("task") => Color::Blue,
         t if t.eq_ignore_ascii_case("bug") => Color::Red,
-        t if t.eq_ignore_ascii_case("sub-task") || t.eq_ignore_ascii_case("subtask") => Color::DarkGray,
+        t if t.eq_ignore_ascii_case("sub-task") || t.eq_ignore_ascii_case("subtask") => {
+            Color::DarkGray
+        }
         _ => Color::White,
     }
 }
@@ -5218,7 +6455,11 @@ fn tree_node_line_with_pr_state(
 ) -> Line<'static> {
     let indent = "  ".repeat(node.depth as usize);
     let arrow = if !node.children.is_empty() {
-        if node.expanded { "▼ " } else { "▶ " }
+        if node.expanded {
+            "▼ "
+        } else {
+            "▶ "
+        }
     } else {
         "  "
     };
@@ -5229,20 +6470,34 @@ fn tree_node_line_with_pr_state(
     let summary_style = if node.is_mine {
         Style::default()
     } else {
-        Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::ITALIC)
     };
     let bg = if selected {
         Style::default().bg(Color::Rgb(60, 60, 80))
     } else {
         Style::default()
     };
-    let summary = if node.summary.is_empty() { "—".to_string() } else { node.summary.clone() };
+    let summary = if node.summary.is_empty() {
+        "—".to_string()
+    } else {
+        node.summary.clone()
+    };
     let type_color_v = type_color(node.issue_type.as_deref());
     let label = type_label(node.issue_type.as_deref());
     let mut spans: Vec<Span<'static>> = vec![
-        Span::styled(format!("{indent}{arrow}"), Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{indent}{arrow}"),
+            Style::default().fg(Color::DarkGray),
+        ),
         Span::styled(format!("{glyph} "), Style::default().fg(type_color_v)),
-        Span::styled(label.to_string(), Style::default().fg(type_color_v).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            label.to_string(),
+            Style::default()
+                .fg(type_color_v)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  ", Style::default()),
     ];
     // Role badge (only on leaves the user actually owns; ancestors get blanks
@@ -5271,12 +6526,19 @@ fn tree_node_line_with_pr_state(
     spans.push(Span::styled(node.key.clone(), key_style));
     spans.push(Span::styled("  ", Style::default()));
     spans.push(Span::styled(summary, summary_style));
-    spans.push(Span::styled(format!("  [{}]", node.status), Style::default().fg(Color::DarkGray)));
+    spans.push(Span::styled(
+        format!("  [{}]", node.status),
+        Style::default().fg(Color::DarkGray),
+    ));
     Line::from(spans).style(bg)
 }
 
 fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
     let Mode::Tree(form) = &app.mode else { return };
+    if app.ticket_search_active || !app.ticket_search_query.is_empty() {
+        draw_tree_single(f, area, form, app);
+        return;
+    }
     if form.two_column {
         draw_tree_two_column(f, area, form, app);
     } else {
@@ -5285,15 +6547,18 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_tree_single(f: &mut Frame, area: Rect, form: &TreeForm, app: &App) {
+    let visible = app.tree_search_visible(form);
+    let title = if app.ticket_search_active || !app.ticket_search_query.is_empty() {
+        format!(" tickets — tree (/) /{} ", app.ticket_search_query)
+    } else {
+        " tickets — tree (T) ".to_string()
+    };
     let inner = Block::default()
         .borders(Borders::ALL)
-        .title(" tickets — tree (T) ")
+        .title(title.as_str())
         .inner(area);
-    f.render_widget(
-        Block::default().borders(Borders::ALL).title(" tickets — tree (T) "),
-        area,
-    );
-    if form.visible.is_empty() {
+    f.render_widget(Block::default().borders(Borders::ALL).title(title), area);
+    if visible.is_empty() {
         f.render_widget(
             Paragraph::new("no tickets").style(Style::default().fg(Color::DarkGray)),
             inner,
@@ -5301,15 +6566,16 @@ fn draw_tree_single(f: &mut Frame, area: Rect, form: &TreeForm, app: &App) {
         return;
     }
     let viewport_h = inner.height as usize;
-    let scroll = form.selected.saturating_sub(viewport_h.saturating_sub(1) / 2);
-    let scroll = scroll.min(form.visible.len().saturating_sub(viewport_h).max(0));
-    let end = (scroll + viewport_h).min(form.visible.len());
+    let selected = form.selected.min(visible.len().saturating_sub(1));
+    let scroll = selected.saturating_sub(viewport_h.saturating_sub(1) / 2);
+    let scroll = scroll.min(visible.len().saturating_sub(viewport_h).max(0));
+    let end = (scroll + viewport_h).min(visible.len());
     let lines: Vec<Line> = (scroll..end)
         .map(|i| {
-            let node_idx = form.visible[i];
+            let node_idx = visible[i];
             let node = &form.nodes[node_idx];
             let pr_state = node.role.and_then(|_| Some(app.pr_state(&node.key)));
-            tree_node_line_with_pr_state(node, i == form.selected, pr_state)
+            tree_node_line_with_pr_state(node, i == selected, pr_state)
         })
         .collect();
     f.render_widget(Paragraph::new(lines), inner);
@@ -5339,7 +6605,9 @@ fn draw_tree_two_column(f: &mut Frame, area: Rect, form: &TreeForm, app: &App) {
             // Walk up via parent_key (could refactor by storing parent index, but cheap).
             let parent_key = form.nodes[cur].parent_key.clone();
             let Some(pk) = parent_key else { break };
-            let Some(p_idx) = form.nodes.iter().position(|n| n.key == pk) else { break };
+            let Some(p_idx) = form.nodes.iter().position(|n| n.key == pk) else {
+                break;
+            };
             cur = p_idx;
         }
     }
@@ -5350,14 +6618,23 @@ fn draw_tree_two_column(f: &mut Frame, area: Rect, form: &TreeForm, app: &App) {
         .map(|(i, &r)| {
             let n = &form.nodes[r];
             let style = if i == selected_root_idx {
-                Style::default().bg(Color::Rgb(60, 60, 80)).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .bg(Color::Rgb(60, 60, 80))
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
             };
             Line::from(vec![
-                Span::styled(format!("{} ", type_glyph(n.issue_type.as_deref())),
-                    Style::default().fg(type_color(n.issue_type.as_deref()))),
-                Span::styled(n.key.clone(), Style::default().fg(type_color(n.issue_type.as_deref())).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("{} ", type_glyph(n.issue_type.as_deref())),
+                    Style::default().fg(type_color(n.issue_type.as_deref())),
+                ),
+                Span::styled(
+                    n.key.clone(),
+                    Style::default()
+                        .fg(type_color(n.issue_type.as_deref()))
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("  "),
                 Span::styled(n.summary.clone(), Style::default()),
             ])
@@ -5371,7 +6648,9 @@ fn draw_tree_two_column(f: &mut Frame, area: Rect, form: &TreeForm, app: &App) {
     let right_inner = right_block.inner(chunks[1]);
     f.render_widget(right_block, chunks[1]);
 
-    let Some(&root_idx) = form.roots.get(selected_root_idx) else { return };
+    let Some(&root_idx) = form.roots.get(selected_root_idx) else {
+        return;
+    };
     let mut subtree_visible: Vec<usize> = Vec::new();
     push_subtree(&form.nodes, root_idx, &mut subtree_visible);
     let viewport_h = right_inner.height as usize;
@@ -5399,12 +6678,16 @@ fn push_subtree(nodes: &[TreeNode], idx: usize, out: &mut Vec<usize>) {
     let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut stack: Vec<usize> = vec![idx];
     while let Some(i) = stack.pop() {
-        if !visited.insert(i) { continue; }
+        if !visited.insert(i) {
+            continue;
+        }
         out.push(i);
         if nodes[i].expanded {
             // push children in reverse so visual order is preserved when popping
             for &c in nodes[i].children.iter().rev() {
-                if !visited.contains(&c) { stack.push(c); }
+                if !visited.contains(&c) {
+                    stack.push(c);
+                }
             }
         }
     }

@@ -31,6 +31,51 @@ pub struct JiraApi {
     pub login: String,
 }
 
+fn text_to_adf(body: &str) -> Value {
+    let mut content = Vec::new();
+    let paragraphs: Vec<&str> = body.split("\n\n").collect();
+    for para in paragraphs {
+        let mut nodes = Vec::new();
+        for (i, line) in para.split('\n').enumerate() {
+            if i > 0 {
+                nodes.push(serde_json::json!({ "type": "hardBreak" }));
+            }
+            if !line.is_empty() {
+                nodes.push(serde_json::json!({ "type": "text", "text": line }));
+            }
+        }
+        content.push(serde_json::json!({
+            "type": "paragraph",
+            "content": nodes,
+        }));
+    }
+    if content.is_empty() {
+        content.push(serde_json::json!({
+            "type": "paragraph",
+            "content": [],
+        }));
+    }
+    serde_json::json!({
+        "type": "doc",
+        "version": 1,
+        "content": content,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::text_to_adf;
+
+    #[test]
+    fn text_to_adf_preserves_line_and_paragraph_breaks() {
+        let adf = text_to_adf("one\ntwo\n\nthree");
+        assert_eq!(adf["content"][0]["content"][0]["text"], "one");
+        assert_eq!(adf["content"][0]["content"][1]["type"], "hardBreak");
+        assert_eq!(adf["content"][0]["content"][2]["text"], "two");
+        assert_eq!(adf["content"][1]["content"][0]["text"], "three");
+    }
+}
+
 impl JiraApi {
     /// Read jira-cli's config (~/.config/.jira/.config.yml) for server URL + login email.
     pub fn from_jira_cli_config() -> Result<Self> {
@@ -52,7 +97,10 @@ impl JiraApi {
             }
         }
         Ok(Self {
-            server: server.context("no `server:` in jira-cli config")?.trim_end_matches('/').to_string(),
+            server: server
+                .context("no `server:` in jira-cli config")?
+                .trim_end_matches('/')
+                .to_string(),
             login: login.context("no `login:` in jira-cli config")?,
         })
     }
@@ -64,9 +112,12 @@ impl JiraApi {
         let url = format!("{}/rest/api/3/priority", self.server);
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-H", "Accept: application/json",
-                "-u", &format!("{}:{}", self.login, token),
+                "-sS",
+                "--fail-with-body",
+                "-H",
+                "Accept: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
                 &url,
             ])
             .output()
@@ -95,9 +146,12 @@ impl JiraApi {
         let url = format!("{}/rest/api/3/status", self.server);
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-H", "Accept: application/json",
-                "-u", &format!("{}:{}", self.login, token),
+                "-sS",
+                "--fail-with-body",
+                "-H",
+                "Accept: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
                 &url,
             ])
             .output()
@@ -128,9 +182,12 @@ impl JiraApi {
         // for a personal tool — same posture as `jira-cli` itself.
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-H", "Accept: application/json",
-                "-u", &format!("{}:{}", self.login, token),
+                "-sS",
+                "--fail-with-body",
+                "-H",
+                "Accept: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
                 &url,
             ])
             .output()
@@ -142,8 +199,7 @@ impl JiraApi {
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }
-        let v: Value = serde_json::from_slice(&out.stdout)
-            .context("parsing transitions JSON")?;
+        let v: Value = serde_json::from_slice(&out.stdout).context("parsing transitions JSON")?;
         let arr = v
             .get("transitions")
             .and_then(|x| x.as_array())
@@ -165,14 +221,16 @@ impl JiraApi {
     }
 
     pub async fn myself(&self) -> Result<MyselfInfo> {
-        let token = std::env::var("JIRA_API_TOKEN")
-            .context("JIRA_API_TOKEN not set")?;
+        let token = std::env::var("JIRA_API_TOKEN").context("JIRA_API_TOKEN not set")?;
         let url = format!("{}/rest/api/3/myself", self.server);
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-H", "Accept: application/json",
-                "-u", &format!("{}:{}", self.login, token),
+                "-sS",
+                "--fail-with-body",
+                "-H",
+                "Accept: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
                 &url,
             ])
             .output()
@@ -186,22 +244,37 @@ impl JiraApi {
         }
         let v: Value = serde_json::from_slice(&out.stdout)?;
         Ok(MyselfInfo {
-            account_id: v.get("accountId").and_then(|x| x.as_str())
-                .ok_or_else(|| anyhow!("/myself missing accountId"))?.to_string(),
-            display_name: v.get("displayName").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-            email: v.get("emailAddress").and_then(|x| x.as_str()).map(str::to_string),
+            account_id: v
+                .get("accountId")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| anyhow!("/myself missing accountId"))?
+                .to_string(),
+            display_name: v
+                .get("displayName")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string(),
+            email: v
+                .get("emailAddress")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
         })
     }
 
     pub async fn delete_comment(&self, issue_key: &str, comment_id: &str) -> Result<()> {
-        let token = std::env::var("JIRA_API_TOKEN")
-            .context("JIRA_API_TOKEN not set")?;
-        let url = format!("{}/rest/api/3/issue/{}/comment/{}", self.server, issue_key, comment_id);
+        let token = std::env::var("JIRA_API_TOKEN").context("JIRA_API_TOKEN not set")?;
+        let url = format!(
+            "{}/rest/api/3/issue/{}/comment/{}",
+            self.server, issue_key, comment_id
+        );
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-X", "DELETE",
-                "-u", &format!("{}:{}", self.login, token),
+                "-sS",
+                "--fail-with-body",
+                "-X",
+                "DELETE",
+                "-u",
+                &format!("{}:{}", self.login, token),
                 &url,
             ])
             .output()
@@ -237,12 +310,18 @@ impl JiraApi {
             let body_str = serde_json::to_string(body)?;
             let out = Command::new("curl")
                 .args([
-                    "-sS", "--fail-with-body",
-                    "-X", "PUT",
-                    "-H", "Accept: application/json",
-                    "-H", "Content-Type: application/json",
-                    "-u", &format!("{}:{}", self.login, token),
-                    "--data", &body_str,
+                    "-sS",
+                    "--fail-with-body",
+                    "-X",
+                    "PUT",
+                    "-H",
+                    "Accept: application/json",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-u",
+                    &format!("{}:{}", self.login, token),
+                    "--data",
+                    &body_str,
                     &url,
                 ])
                 .output()
@@ -263,18 +342,64 @@ impl JiraApi {
         ))
     }
 
+    /// Set issue description via REST using Atlassian Document Format so line
+    /// breaks survive round-trips. jira-cli's `issue edit -b` flattens some
+    /// multiline bodies depending on shell/Jira version.
+    pub async fn set_description(&self, key: &str, body: &str) -> Result<()> {
+        let token = std::env::var("JIRA_API_TOKEN")
+            .context("JIRA_API_TOKEN not set; needed to update description")?;
+        let url = format!("{}/rest/api/3/issue/{}", self.server, key);
+        let payload = serde_json::json!({
+            "fields": {
+                "description": text_to_adf(body),
+            }
+        });
+        let body_str = serde_json::to_string(&payload)?;
+        let out = Command::new("curl")
+            .args([
+                "-sS",
+                "--fail-with-body",
+                "-X",
+                "PUT",
+                "-H",
+                "Accept: application/json",
+                "-H",
+                "Content-Type: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
+                "--data",
+                &body_str,
+                &url,
+            ])
+            .output()
+            .await
+            .context("invoking curl")?;
+        if !out.status.success() {
+            return Err(anyhow!(
+                "PUT description failed: {}{}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                String::from_utf8_lossy(&out.stdout).trim(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Delete an issue via REST. `jira-cli`'s `issue delete` is interactive and
     /// rejects `--no-input`, so we go straight to the API.
     pub async fn delete_issue(&self, key: &str) -> Result<()> {
-        let token = std::env::var("JIRA_API_TOKEN")
-            .context("JIRA_API_TOKEN not set; needed to delete")?;
+        let token =
+            std::env::var("JIRA_API_TOKEN").context("JIRA_API_TOKEN not set; needed to delete")?;
         let url = format!("{}/rest/api/3/issue/{}", self.server, key);
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-X", "DELETE",
-                "-H", "Accept: application/json",
-                "-u", &format!("{}:{}", self.login, token),
+                "-sS",
+                "--fail-with-body",
+                "-X",
+                "DELETE",
+                "-H",
+                "Accept: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
                 &url,
             ])
             .output()
@@ -294,18 +419,24 @@ impl JiraApi {
     /// display name / email and rejects account IDs on Cloud, so we go straight to
     /// `PUT /rest/api/3/issue/{key}/assignee`.
     pub async fn set_assignee(&self, key: &str, account_id: &str) -> Result<()> {
-        let token = std::env::var("JIRA_API_TOKEN")
-            .context("JIRA_API_TOKEN not set; needed to assign")?;
+        let token =
+            std::env::var("JIRA_API_TOKEN").context("JIRA_API_TOKEN not set; needed to assign")?;
         let url = format!("{}/rest/api/3/issue/{}/assignee", self.server, key);
         let body = serde_json::json!({ "accountId": account_id }).to_string();
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-X", "PUT",
-                "-H", "Accept: application/json",
-                "-H", "Content-Type: application/json",
-                "-u", &format!("{}:{}", self.login, token),
-                "--data", &body,
+                "-sS",
+                "--fail-with-body",
+                "-X",
+                "PUT",
+                "-H",
+                "Accept: application/json",
+                "-H",
+                "Content-Type: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
+                "--data",
+                &body,
                 &url,
             ])
             .output()
@@ -325,11 +456,7 @@ impl JiraApi {
     /// `None` when the field is unset (or the field exists on schema but is
     /// null), `Some(account_id)` when set. Tries both string and object
     /// shapes so it matches whatever set_reviewer ended up writing.
-    pub async fn user_custom_field(
-        &self,
-        key: &str,
-        field_id: &str,
-    ) -> Result<Option<String>> {
+    pub async fn user_custom_field(&self, key: &str, field_id: &str) -> Result<Option<String>> {
         let token = std::env::var("JIRA_API_TOKEN")
             .context("JIRA_API_TOKEN not set; needed to read custom field")?;
         let url = format!(
@@ -338,9 +465,12 @@ impl JiraApi {
         );
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-H", "Accept: application/json",
-                "-u", &format!("{}:{}", self.login, token),
+                "-sS",
+                "--fail-with-body",
+                "-H",
+                "Accept: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
                 &url,
             ])
             .output()
@@ -357,7 +487,10 @@ impl JiraApi {
         let account_id = match raw {
             None | Some(Value::Null) => None,
             Some(Value::String(s)) if !s.is_empty() => Some(s.clone()),
-            Some(Value::Object(o)) => o.get("accountId").and_then(|x| x.as_str()).map(str::to_string),
+            Some(Value::Object(o)) => o
+                .get("accountId")
+                .and_then(|x| x.as_str())
+                .map(str::to_string),
             Some(Value::Array(arr)) => arr
                 .first()
                 .and_then(|v| v.get("accountId").and_then(|x| x.as_str()))
@@ -391,12 +524,18 @@ impl JiraApi {
             let body_str = serde_json::to_string(body)?;
             let out = Command::new("curl")
                 .args([
-                    "-sS", "--fail-with-body",
-                    "-X", "PUT",
-                    "-H", "Accept: application/json",
-                    "-H", "Content-Type: application/json",
-                    "-u", &format!("{}:{}", self.login, token),
-                    "--data", &body_str,
+                    "-sS",
+                    "--fail-with-body",
+                    "-X",
+                    "PUT",
+                    "-H",
+                    "Accept: application/json",
+                    "-H",
+                    "Content-Type: application/json",
+                    "-u",
+                    &format!("{}:{}", self.login, token),
+                    "--data",
+                    &body_str,
                     &url,
                 ])
                 .output()
@@ -433,10 +572,16 @@ impl JiraApi {
         let url = format!("{}/rest/api/3/issue/{}", self.server, key);
         let mut tt = serde_json::Map::new();
         if let Some(o) = original {
-            tt.insert("originalEstimate".into(), serde_json::Value::String(o.into()));
+            tt.insert(
+                "originalEstimate".into(),
+                serde_json::Value::String(o.into()),
+            );
         }
         if let Some(r) = remaining {
-            tt.insert("remainingEstimate".into(), serde_json::Value::String(r.into()));
+            tt.insert(
+                "remainingEstimate".into(),
+                serde_json::Value::String(r.into()),
+            );
         }
         let body = serde_json::json!({
             "fields": { "timetracking": serde_json::Value::Object(tt) }
@@ -444,12 +589,18 @@ impl JiraApi {
         let body_str = serde_json::to_string(&body)?;
         let out = Command::new("curl")
             .args([
-                "-sS", "--fail-with-body",
-                "-X", "PUT",
-                "-H", "Accept: application/json",
-                "-H", "Content-Type: application/json",
-                "-u", &format!("{}:{}", self.login, token),
-                "--data", &body_str,
+                "-sS",
+                "--fail-with-body",
+                "-X",
+                "PUT",
+                "-H",
+                "Accept: application/json",
+                "-H",
+                "Content-Type: application/json",
+                "-u",
+                &format!("{}:{}", self.login, token),
+                "--data",
+                &body_str,
                 &url,
             ])
             .output()
@@ -480,9 +631,12 @@ impl JiraApi {
             );
             let out = Command::new("curl")
                 .args([
-                    "-sS", "--fail-with-body",
-                    "-H", "Accept: application/json",
-                    "-u", &format!("{}:{}", self.login, token),
+                    "-sS",
+                    "--fail-with-body",
+                    "-H",
+                    "Accept: application/json",
+                    "-u",
+                    &format!("{}:{}", self.login, token),
                     &url,
                 ])
                 .output()
@@ -491,8 +645,8 @@ impl JiraApi {
             if !out.status.success() {
                 break;
             }
-            let arr: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout)
-                .unwrap_or_default();
+            let arr: Vec<serde_json::Value> =
+                serde_json::from_slice(&out.stdout).unwrap_or_default();
             if arr.is_empty() {
                 break;
             }
@@ -502,9 +656,18 @@ impl JiraApi {
                 if account_type == "app" {
                     continue;
                 }
-                let Some(account_id) = u.get("accountId").and_then(|x| x.as_str()) else { continue };
-                let display_name = u.get("displayName").and_then(|x| x.as_str()).unwrap_or("").to_string();
-                let email = u.get("emailAddress").and_then(|x| x.as_str()).map(str::to_string);
+                let Some(account_id) = u.get("accountId").and_then(|x| x.as_str()) else {
+                    continue;
+                };
+                let display_name = u
+                    .get("displayName")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let email = u
+                    .get("emailAddress")
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string);
                 users.push(UserInfo {
                     account_id: account_id.to_string(),
                     display_name,
@@ -518,10 +681,13 @@ impl JiraApi {
         }
         Ok(users)
     }
-}  // end impl JiraApi
+} // end impl JiraApi
 
 fn default_priorities() -> Vec<String> {
-    ["Highest", "High", "Medium", "Low", "Lowest"].iter().map(|s| s.to_string()).collect()
+    ["Highest", "High", "Medium", "Low", "Lowest"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 fn unquote(s: &str) -> String {

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -19,14 +20,23 @@ pub fn detect(start: &Path) -> ScmRepo {
     let mut cur = Some(start);
     while let Some(dir) = cur {
         if dir.join(".git").exists() {
-            return ScmRepo { kind: ScmKind::Git, root: dir.to_path_buf() };
+            return ScmRepo {
+                kind: ScmKind::Git,
+                root: dir.to_path_buf(),
+            };
         }
         if dir.join(".svn").exists() {
-            return ScmRepo { kind: ScmKind::Svn, root: dir.to_path_buf() };
+            return ScmRepo {
+                kind: ScmKind::Svn,
+                root: dir.to_path_buf(),
+            };
         }
         cur = dir.parent();
     }
-    ScmRepo { kind: ScmKind::None, root: start.to_path_buf() }
+    ScmRepo {
+        kind: ScmKind::None,
+        root: start.to_path_buf(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +77,9 @@ pub enum WorkLocation {
 }
 
 impl Default for WorkLocation {
-    fn default() -> Self { WorkLocation::Worktree }
+    fn default() -> Self {
+        WorkLocation::Worktree
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -87,9 +99,74 @@ pub fn start_work(
             WorkLocation::Worktree => git_start_work(&repo.root, key, slug),
             WorkLocation::BranchInRepo => git_start_work_in_repo(&repo.root, key, slug),
         },
-        ScmKind::Svn => Ok(StartWorkOutcome::SvnExport { value: slug.to_string() }),
+        ScmKind::Svn => Ok(StartWorkOutcome::SvnExport {
+            value: slug.to_string(),
+        }),
         ScmKind::None => Ok(StartWorkOutcome::NoScm),
     }
+}
+
+/// Find an already-registered git worktree for `key` below `root`'s repository.
+/// Matches either the checked-out branch or the worktree directory name, so it
+/// handles both jui-created slugs and manually-created ticket worktrees.
+pub fn find_existing_worktree_for_key(
+    root: &Path,
+    key: &str,
+    slug: &str,
+) -> Result<Option<(PathBuf, String)>> {
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("running git worktree list")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+
+    let repo_root = detect(root).root.canonicalize().ok();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines().chain([""]) {
+        if line.is_empty() {
+            if let Some(p) = path.take() {
+                let b = branch.take().unwrap_or_else(|| slug.to_string());
+                let is_main_repo = repo_root
+                    .as_ref()
+                    .and_then(|root| p.canonicalize().ok().map(|canon| canon == *root))
+                    .unwrap_or(false);
+                if !is_main_repo && p.exists() && worktree_matches_ticket(&p, &b, key, slug) {
+                    return Ok(Some((p, b)));
+                }
+            }
+            branch = None;
+            continue;
+        }
+        if let Some(raw) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(raw));
+        } else if let Some(raw) = line.strip_prefix("branch ") {
+            branch = Some(raw.strip_prefix("refs/heads/").unwrap_or(raw).to_string());
+        }
+    }
+    Ok(None)
+}
+
+fn worktree_matches_ticket(path: &Path, branch: &str, key: &str, slug: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let normalized_key = crate::ticket::normalized_ticket_key(&key);
+    let slug = slug.to_ascii_lowercase();
+    let branch = branch.to_ascii_lowercase();
+    branch.contains(&key)
+        || (!normalized_key.is_empty() && branch.contains(&normalized_key))
+        || path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| {
+                let name = name.to_ascii_lowercase();
+                name.contains(&key)
+                    || (!normalized_key.is_empty() && name.contains(&normalized_key))
+                    || name.contains(&slug)
+            })
+            .unwrap_or(false)
 }
 
 /// Branch-in-main-repo start-work:
@@ -148,15 +225,16 @@ fn git_start_work_in_repo(root: &Path, key: &str, slug: &str) -> Result<StartWor
         let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
         // Git's "already used by worktree" error is the most common branch-in-repo
         // failure — surface a clearer message pointing at the worktree.
-        let friendly = if err.contains("already used by worktree") || err.contains("is already checked out") {
-            format!(
-                "branch '{branch}' is already checked out in a worktree — \
+        let friendly =
+            if err.contains("already used by worktree") || err.contains("is already checked out") {
+                format!(
+                    "branch '{branch}' is already checked out in a worktree — \
                  use 'worktree' mode to reuse it, or `git worktree remove` the old one first. \
                  (git said: {err})"
-            )
-        } else {
-            err
-        };
+                )
+            } else {
+                err
+            };
         return Err(StartWorkError::Git(friendly).into());
     }
 
@@ -172,15 +250,9 @@ fn git_start_work_in_repo(root: &Path, key: &str, slug: &str) -> Result<StartWor
 ///   1. Search local branches for one whose name contains the (lowercased) ticket key.
 ///   2. If a branch is found, attach a worktree to it; otherwise create a new branch
 ///      named `slug` from HEAD and attach a worktree to it.
-///   3. Worktree path is `<repo>/../<repo-name>-worktrees/<slug>`.
+///   3. Worktree path is `<repo>/worktrees/<slug>`.
 fn git_start_work(root: &Path, key: &str, slug: &str) -> Result<StartWorkOutcome> {
-    let repo_name = root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("repo")
-        .to_string();
-    let parent = root.parent().unwrap_or(root);
-    let worktrees_root = parent.join(format!("{}-worktrees", repo_name));
+    let worktrees_root = root.join("worktrees");
     let path = worktrees_root.join(slug);
 
     // If the target path already exists, leave it alone — assume previous run.
@@ -199,6 +271,7 @@ fn git_start_work(root: &Path, key: &str, slug: &str) -> Result<StartWorkOutcome
 
     std::fs::create_dir_all(&worktrees_root)
         .with_context(|| format!("creating {}", worktrees_root.display()))?;
+    ensure_worktrees_excluded(root)?;
 
     let existing_branch = find_branch_for_key(root, key)?;
     let (branch, created) = match existing_branch {
@@ -233,6 +306,22 @@ fn git_start_work(root: &Path, key: &str, slug: &str) -> Result<StartWorkOutcome
     })
 }
 
+pub fn ensure_worktrees_excluded(root: &Path) -> Result<()> {
+    let exclude = root.join(".git").join("info").join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if existing.lines().any(|line| line.trim() == "/worktrees/") {
+        return Ok(());
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude)
+        .with_context(|| format!("opening {}", exclude.display()))?
+        .write_all(b"\n/worktrees/\n")
+        .with_context(|| format!("writing {}", exclude.display()))?;
+    Ok(())
+}
+
 /// Search local branches for one whose name contains the (lowercased) ticket key.
 /// Returns the first match. Branch comparison is case-insensitive.
 pub fn find_branch_for_key(root: &Path, key: &str) -> Result<Option<String>> {
@@ -245,8 +334,12 @@ pub fn find_branch_for_key(root: &Path, key: &str) -> Result<Option<String>> {
         return Ok(None);
     }
     let needle = key.to_ascii_lowercase();
+    let normalized_needle = crate::ticket::normalized_ticket_key(key);
     for line in String::from_utf8_lossy(&out.stdout).lines() {
-        if line.to_ascii_lowercase().contains(&needle) {
+        let line_lc = line.to_ascii_lowercase();
+        if line_lc.contains(&needle)
+            || (!normalized_needle.is_empty() && line_lc.contains(&normalized_needle))
+        {
             return Ok(Some(line.to_string()));
         }
     }
@@ -297,7 +390,9 @@ pub fn gh_slug_for_remote(path: &Path, remote: &str) -> Option<String> {
         .args(["-C", path.to_str()?, "remote", "get-url", remote])
         .output()
         .ok()?;
-    if !out.status.success() { return None; }
+    if !out.status.success() {
+        return None;
+    }
     let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
     parse_github_slug(&url)
 }
@@ -326,15 +421,15 @@ pub fn find_clone_for_gh_repo(
     fallback
 }
 
-/// The conventional jui worktree path for a ticket slug: sibling to the repo
-/// at `<repo>/../<repo-name>-worktrees/<slug>`. Returns `None` if `cwd` isn't
+/// The conventional jui worktree path for a ticket slug: under the repo at
+/// `<repo>/worktrees/<slug>`. Returns `None` if `cwd` isn't
 /// inside a git repo.
 pub fn worktree_path_for_slug(cwd: &Path, slug: &str) -> Option<std::path::PathBuf> {
     let repo = detect(cwd);
-    if !matches!(repo.kind, ScmKind::Git) { return None; }
-    let repo_name = repo.root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
-    let parent = repo.root.parent().unwrap_or(&repo.root);
-    Some(parent.join(format!("{}-worktrees", repo_name)).join(slug))
+    if !matches!(repo.kind, ScmKind::Git) {
+        return None;
+    }
+    Some(repo.root.join("worktrees").join(slug))
 }
 
 pub fn current_git_branch(root: &Path) -> Result<Option<String>> {
@@ -379,21 +474,31 @@ fn walk(
     // different name (e.g. via a symlink).
     let canonical = std::fs::canonicalize(dir).ok();
     if let Some(c) = &canonical {
-        if !visited.insert(c.clone()) { return; }
+        if !visited.insert(c.clone()) {
+            return;
+        }
     }
 
     if dir.join(".git").exists() {
-        out.push(RepoEntry { path: dir.to_path_buf(), kind: "git".into() });
+        out.push(RepoEntry {
+            path: dir.to_path_buf(),
+            kind: "git".into(),
+        });
         return;
     }
     if dir.join(".svn").exists() {
-        out.push(RepoEntry { path: dir.to_path_buf(), kind: "svn".into() });
+        out.push(RepoEntry {
+            path: dir.to_path_buf(),
+            kind: "svn".into(),
+        });
         return;
     }
     if depth >= max_depth {
         return;
     }
-    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in rd.filter_map(|e| e.ok()) {
         let path = entry.path();
         // `entry.file_type()` is lstat — symlinks-to-directories return false
@@ -402,11 +507,15 @@ fn walk(
             continue;
         }
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            if name.starts_with('.') { continue; }
+            if name.starts_with('.') {
+                continue;
+            }
             if matches!(
                 name,
                 "node_modules" | "target" | "dist" | "build" | "venv" | ".cache" | "__pycache__"
-            ) { continue; }
+            ) {
+                continue;
+            }
         }
         walk(&path, depth + 1, max_depth, out, visited);
     }
@@ -447,9 +556,22 @@ mod tests {
     #[test]
     fn extracts_key_from_branch() {
         assert_eq!(extract_ticket_key("proj-123-add-login"), None); // requires uppercase
-        assert_eq!(extract_ticket_key("feature/PROJ-123-add-login"), Some("PROJ-123".into()));
+        assert_eq!(
+            extract_ticket_key("feature/PROJ-123-add-login"),
+            Some("PROJ-123".into())
+        );
         assert_eq!(extract_ticket_key("ENG-7"), Some("ENG-7".into()));
         assert_eq!(extract_ticket_key("noticket"), None);
         assert_eq!(extract_ticket_key("A-1"), None); // single-letter prefix rejected
+    }
+
+    #[test]
+    fn worktree_matches_normalized_ticket_key() {
+        assert!(worktree_matches_ticket(
+            Path::new("/tmp/repo/worktrees/proj123-login-auth"),
+            "proj123-login-auth",
+            "PROJ-123",
+            "proj-123-add-login-auth-flow"
+        ));
     }
 }

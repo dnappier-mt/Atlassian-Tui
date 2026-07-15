@@ -96,6 +96,18 @@ impl Cache {
                 created_at TEXT NOT NULL,
                 last_used_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS ticket_assistant_sessions (
+                ticket_key TEXT NOT NULL,
+                assistant TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                last_used_at TEXT NOT NULL,
+                PRIMARY KEY (ticket_key, assistant)
+            );
+            INSERT OR IGNORE INTO ticket_assistant_sessions
+                (ticket_key, assistant, session_id, created_at, last_used_at)
+            SELECT ticket_key, 'claude', session_id, created_at, last_used_at
+            FROM ticket_claude_sessions;
             "#,
         )?;
         conn.execute_batch(
@@ -330,12 +342,26 @@ impl Cache {
             for t in tickets {
                 let labels = serde_json::to_string(&t.labels)?;
                 stmt.execute(params![
-                    t.key, t.summary, t.status, t.assignee, t.reporter,
-                    t.priority, t.issue_type, t.updated, t.description, labels, now_iso,
-                    t.original_estimate_seconds, t.remaining_estimate_seconds, t.time_spent_seconds,
+                    t.key,
+                    t.summary,
+                    t.status,
+                    t.assignee,
+                    t.reporter,
+                    t.priority,
+                    t.issue_type,
+                    t.updated,
+                    t.description,
+                    labels,
+                    now_iso,
+                    t.original_estimate_seconds,
+                    t.remaining_estimate_seconds,
+                    t.time_spent_seconds,
                     t.created,
-                    t.parent_key, t.parent_summary, t.parent_issue_type,
-                    t.grandparent_key, t.grandparent_summary,
+                    t.parent_key,
+                    t.parent_summary,
+                    t.parent_issue_type,
+                    t.grandparent_key,
+                    t.grandparent_summary,
                 ])?;
             }
             // Record status-change rows for any ticket whose previous status
@@ -399,10 +425,14 @@ impl Cache {
         let mut seen: HashSet<String> = HashSet::new();
         let mut queue: Vec<String> = keys.to_vec();
         while let Some(k) = queue.pop() {
-            if !seen.insert(k.clone()) { continue; }
+            if !seen.insert(k.clone()) {
+                continue;
+            }
             if let Some(t) = self.get_ticket(&k)? {
                 if let Some(pk) = t.parent_key.clone() {
-                    if !seen.contains(&pk) { queue.push(pk); }
+                    if !seen.contains(&pk) {
+                        queue.push(pk);
+                    }
                 }
                 out.push(t);
             }
@@ -411,9 +441,12 @@ impl Cache {
     }
 
     pub fn delete_ticket(&self, key: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM tickets WHERE key = ?1", [key])?;
-        self.conn.execute("DELETE FROM comments WHERE ticket_key = ?1", [key])?;
-        self.conn.execute("DELETE FROM pr_comments WHERE ticket_key = ?1", [key])?;
+        self.conn
+            .execute("DELETE FROM tickets WHERE key = ?1", [key])?;
+        self.conn
+            .execute("DELETE FROM comments WHERE ticket_key = ?1", [key])?;
+        self.conn
+            .execute("DELETE FROM pr_comments WHERE ticket_key = ?1", [key])?;
         Ok(())
     }
 
@@ -427,7 +460,10 @@ impl Cache {
     ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let tx = self.conn.transaction()?;
-        tx.execute("DELETE FROM pr_comments WHERE ticket_key = ?1", [ticket_key])?;
+        tx.execute(
+            "DELETE FROM pr_comments WHERE ticket_key = ?1",
+            [ticket_key],
+        )?;
         {
             let mut stmt = tx.prepare(
                 r#"INSERT INTO pr_comments
@@ -471,9 +507,9 @@ impl Cache {
     }
 
     pub fn get_pr_state(&self, ticket_key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT state FROM pr_user_state WHERE ticket_key = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT state FROM pr_user_state WHERE ticket_key = ?1")?;
         let mut rows = stmt.query([ticket_key])?;
         if let Some(row) = rows.next()? {
             return Ok(Some(row.get::<_, String>(0)?));
@@ -482,10 +518,10 @@ impl Cache {
     }
 
     pub fn get_all_pr_states(&self) -> Result<std::collections::HashMap<String, String>> {
-        let mut stmt = self.conn.prepare("SELECT ticket_key, state FROM pr_user_state")?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ticket_key, state FROM pr_user_state")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
@@ -516,9 +552,9 @@ impl Cache {
     /// Repo slug + PR number tied to a ticket, or `None` if no PR is on
     /// file. Used by the reply flow to route gh API calls.
     pub fn get_ticket_pr_meta(&self, ticket_key: &str) -> Result<Option<(String, u64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT repo, pr_number FROM ticket_prs WHERE ticket_key = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT repo, pr_number FROM ticket_prs WHERE ticket_key = ?1")?;
         let mut rows = stmt.query([ticket_key])?;
         if let Some(row) = rows.next()? {
             let repo: String = row.get(0)?;
@@ -529,9 +565,9 @@ impl Cache {
     }
 
     pub fn get_ticket_pr_url(&self, ticket_key: &str) -> Result<Option<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT pr_url FROM ticket_prs WHERE ticket_key = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT pr_url FROM ticket_prs WHERE ticket_key = ?1")?;
         let mut rows = stmt.query([ticket_key])?;
         if let Some(row) = rows.next()? {
             return Ok(Some(row.get::<_, String>(0)?));
@@ -555,12 +591,32 @@ impl Cache {
                 created: r.get::<_, String>(4)?,
                 body: r.get::<_, String>(5)?,
                 comment_id: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
-                kind: r.get::<_, String>(7).unwrap_or_else(|_| "issue".to_string()),
+                kind: r
+                    .get::<_, String>(7)
+                    .unwrap_or_else(|_| "issue".to_string()),
                 is_resolved: r.get::<_, i64>(8).unwrap_or(0) != 0,
-                in_reply_to_id: r.get::<_, Option<String>>(9).ok().flatten().unwrap_or_default(),
+                in_reply_to_id: r
+                    .get::<_, Option<String>>(9)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
             })
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    pub fn clear_ticket_pr(&self, ticket_key: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM ticket_prs WHERE ticket_key = ?1", [ticket_key])?;
+        self.conn.execute(
+            "DELETE FROM pr_comments WHERE ticket_key = ?1",
+            [ticket_key],
+        )?;
+        self.conn.execute(
+            "DELETE FROM pr_user_state WHERE ticket_key = ?1",
+            [ticket_key],
+        )?;
+        Ok(())
     }
 
     /// Confirmed local project paths linked to `ticket_key`. Used by the
@@ -579,7 +635,11 @@ impl Cache {
     }
 
     /// Replace the cached comments for `ticket_key`. Order is preserved via `idx`.
-    pub fn upsert_comments(&mut self, ticket_key: &str, items: &[crate::ticket::Comment]) -> Result<()> {
+    pub fn upsert_comments(
+        &mut self,
+        ticket_key: &str,
+        items: &[crate::ticket::Comment],
+    ) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         let tx = self.conn.transaction()?;
         tx.execute("DELETE FROM comments WHERE ticket_key = ?1", [ticket_key])?;
@@ -625,9 +685,9 @@ impl Cache {
 
     /// Seconds since these comments were last refreshed. None means cache miss.
     pub fn comments_age_secs(&self, ticket_key: &str) -> Result<Option<i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT MAX(cached_at) FROM comments WHERE ticket_key = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT MAX(cached_at) FROM comments WHERE ticket_key = ?1")?;
         let now = chrono::Utc::now().timestamp();
         let mut rows = stmt.query([ticket_key])?;
         if let Some(row) = rows.next()? {
@@ -657,9 +717,9 @@ impl Cache {
     /// Resolve cached mention rows back to full Tickets via the `tickets` table,
     /// preserving the role's stored order.
     pub fn get_mentions(&self, role: &str) -> Result<Vec<Ticket>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT ticket_key FROM mentions WHERE role = ?1 ORDER BY idx",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ticket_key FROM mentions WHERE role = ?1 ORDER BY idx")?;
         let keys: Vec<String> = stmt
             .query_map([role], |r| r.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -676,9 +736,9 @@ impl Cache {
     /// Raw cached mention keys for the given role (no Ticket join — used for
     /// roles like `"authored"` where the caller only needs the key set).
     pub fn get_mention_keys(&self, role: &str) -> Result<Vec<String>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT ticket_key FROM mentions WHERE role = ?1 ORDER BY idx",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT ticket_key FROM mentions WHERE role = ?1 ORDER BY idx")?;
         let keys: Vec<String> = stmt
             .query_map([role], |r| r.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -688,7 +748,9 @@ impl Cache {
 
     /// Age of the freshest mention row for the given role (cache freshness check).
     pub fn mentions_age_secs(&self, role: &str) -> Result<Option<i64>> {
-        let mut stmt = self.conn.prepare("SELECT MAX(cached_at) FROM mentions WHERE role = ?1")?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT MAX(cached_at) FROM mentions WHERE role = ?1")?;
         let now = chrono::Utc::now().timestamp();
         let mut rows = stmt.query([role])?;
         if let Some(row) = rows.next()? {
@@ -828,14 +890,18 @@ impl Cache {
         if keys.is_empty() {
             return Ok(Default::default());
         }
-        let placeholders = std::iter::repeat("?").take(keys.len()).collect::<Vec<_>>().join(",");
+        let placeholders = std::iter::repeat("?")
+            .take(keys.len())
+            .collect::<Vec<_>>()
+            .join(",");
         let sql = format!(
             "SELECT ticket_key, project_path FROM ticket_projects
              WHERE state = 'confirmed' AND ticket_key IN ({placeholders})
              ORDER BY linked_at"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
         let rows = stmt.query_map(params.as_slice(), |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
         })?;
@@ -876,12 +942,19 @@ impl Cache {
         Ok(())
     }
 
-    pub fn get_implementation(&self, ticket_key: &str) -> Result<Option<(String, Vec<String>, String)>> {
+    pub fn get_implementation(
+        &self,
+        ticket_key: &str,
+    ) -> Result<Option<(String, Vec<String>, String)>> {
         let mut stmt = self.conn.prepare(
             "SELECT markdown, project_paths, updated_at FROM ticket_implementations WHERE ticket_key = ?1",
         )?;
         let mut rows = stmt.query_map([ticket_key], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
         })?;
         match rows.next() {
             Some(row) => {
@@ -905,26 +978,55 @@ impl Cache {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn get_claude_session(&self, ticket_key: &str) -> Result<Option<String>> {
+    pub fn get_assistant_session(
+        &self,
+        ticket_key: &str,
+        assistant: &str,
+    ) -> Result<Option<String>> {
         let mut stmt = self.conn.prepare(
-            "SELECT session_id FROM ticket_claude_sessions WHERE ticket_key = ?1",
+            "SELECT session_id FROM ticket_assistant_sessions
+             WHERE ticket_key = ?1 AND assistant = ?2",
         )?;
-        let mut rows = stmt.query_map([ticket_key], |r| r.get::<_, String>(0))?;
+        let mut rows = stmt.query_map(params![ticket_key, assistant], |r| r.get::<_, String>(0))?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
     }
 
-    pub fn set_claude_session(&self, ticket_key: &str, session_id: &str) -> Result<()> {
+    pub fn set_assistant_session(
+        &self,
+        ticket_key: &str,
+        assistant: &str,
+        session_id: &str,
+    ) -> Result<()> {
         let now = chrono::Utc::now().to_rfc3339();
         self.conn.execute(
-            "INSERT INTO ticket_claude_sessions (ticket_key, session_id, created_at, last_used_at)
-             VALUES (?1, ?2, ?3, ?3)
-             ON CONFLICT(ticket_key) DO UPDATE SET last_used_at = excluded.last_used_at",
-            params![ticket_key, session_id, now],
+            "INSERT INTO ticket_assistant_sessions
+                (ticket_key, assistant, session_id, created_at, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(ticket_key, assistant) DO UPDATE SET
+                 session_id = excluded.session_id,
+                 last_used_at = excluded.last_used_at",
+            params![ticket_key, assistant, session_id, now],
         )?;
         Ok(())
+    }
+
+    pub fn clear_assistant_session(&self, ticket_key: &str, assistant: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM ticket_assistant_sessions WHERE ticket_key = ?1 AND assistant = ?2",
+            params![ticket_key, assistant],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_claude_session(&self, ticket_key: &str) -> Result<Option<String>> {
+        self.get_assistant_session(ticket_key, "claude")
+    }
+
+    pub fn set_claude_session(&self, ticket_key: &str, session_id: &str) -> Result<()> {
+        self.set_assistant_session(ticket_key, "claude", session_id)
     }
 
     pub fn get_pr_draft(&self, ticket_key: &str) -> Result<Option<PrDraft>> {
@@ -999,9 +1101,9 @@ impl Cache {
 
     pub fn get_push_remote(&self, project_path: &Path) -> Result<Option<String>> {
         let key = project_path.to_string_lossy();
-        let mut stmt = self.conn.prepare(
-            "SELECT remote_name FROM project_push_remotes WHERE project_path = ?1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT remote_name FROM project_push_remotes WHERE project_path = ?1")?;
         let mut rows = stmt.query_map([key.as_ref()], |r| r.get::<_, String>(0))?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
@@ -1103,12 +1205,10 @@ impl Cache {
     }
 
     pub fn list_teams(&self) -> Result<Vec<(String, Vec<String>)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT name, members FROM teams ORDER BY name",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name, members FROM teams ORDER BY name")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         let mut out = Vec::new();
         for row in rows {
             let (name, json) = row?;
@@ -1119,7 +1219,8 @@ impl Cache {
     }
 
     pub fn delete_team(&self, name: &str) -> Result<()> {
-        self.conn.execute("DELETE FROM teams WHERE name = ?1", [name])?;
+        self.conn
+            .execute("DELETE FROM teams WHERE name = ?1", [name])?;
         Ok(())
     }
 
@@ -1148,12 +1249,10 @@ impl Cache {
         Ok(())
     }
 
-    pub fn get_confluence_spaces(
-        &self,
-    ) -> Result<Vec<crate::confluence_api::ConfluenceSpace>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT key, name, description FROM confluence_spaces ORDER BY name",
-        )?;
+    pub fn get_confluence_spaces(&self) -> Result<Vec<crate::confluence_api::ConfluenceSpace>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT key, name, description FROM confluence_spaces ORDER BY name")?;
         let rows: Vec<_> = stmt
             .query_map([], |r| {
                 Ok(crate::confluence_api::ConfluenceSpace {
@@ -1171,7 +1270,9 @@ impl Cache {
     pub fn confluence_spaces_age_secs(&self) -> Result<Option<u64>> {
         let oldest: Option<i64> = self
             .conn
-            .query_row("SELECT MIN(cached_at) FROM confluence_spaces", [], |r| r.get(0))
+            .query_row("SELECT MIN(cached_at) FROM confluence_spaces", [], |r| {
+                r.get(0)
+            })
             .ok()
             .flatten();
         Ok(oldest.map(|t| (chrono::Utc::now().timestamp() - t).max(0) as u64))
@@ -1209,8 +1310,12 @@ impl Cache {
             )?;
             for p in pages {
                 stmt.execute(params![
-                    p.id, p.title, p.has_children as i64,
-                    space_key, parent_id, now
+                    p.id,
+                    p.title,
+                    p.has_children as i64,
+                    space_key,
+                    parent_id,
+                    now
                 ])?;
             }
         }
@@ -1229,15 +1334,16 @@ impl Cache {
                     "SELECT id, title, has_children FROM confluence_pages
                      WHERE parent_id = ?1 ORDER BY title",
                 )?;
-                let v: Vec<_> = stmt.query_map(params![pid], |r| {
-                    Ok(crate::confluence_api::ConfluencePage {
-                        id: r.get(0)?,
-                        title: r.get(1)?,
-                        has_children: r.get::<_, i64>(2)? != 0,
-                    })
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+                let v: Vec<_> = stmt
+                    .query_map(params![pid], |r| {
+                        Ok(crate::confluence_api::ConfluencePage {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            has_children: r.get::<_, i64>(2)? != 0,
+                        })
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
                 v
             }
             None => {
@@ -1245,15 +1351,16 @@ impl Cache {
                     "SELECT id, title, has_children FROM confluence_pages
                      WHERE space_key = ?1 AND parent_id IS NULL ORDER BY title",
                 )?;
-                let v: Vec<_> = stmt.query_map(params![space_key], |r| {
-                    Ok(crate::confluence_api::ConfluencePage {
-                        id: r.get(0)?,
-                        title: r.get(1)?,
-                        has_children: r.get::<_, i64>(2)? != 0,
-                    })
-                })?
-                .filter_map(|r| r.ok())
-                .collect();
+                let v: Vec<_> = stmt
+                    .query_map(params![space_key], |r| {
+                        Ok(crate::confluence_api::ConfluencePage {
+                            id: r.get(0)?,
+                            title: r.get(1)?,
+                            has_children: r.get::<_, i64>(2)? != 0,
+                        })
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
                 v
             }
         };

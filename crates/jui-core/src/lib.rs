@@ -1,7 +1,7 @@
 pub mod cache;
 pub mod claude;
-pub mod confluence_api;
 pub mod config;
+pub mod confluence_api;
 pub mod github;
 pub mod ipc;
 pub mod jira;

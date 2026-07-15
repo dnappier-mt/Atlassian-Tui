@@ -65,11 +65,15 @@ impl JiraCli {
         let limit_s = limit.to_string();
         let v = self
             .run_json(&[
-                "issue", "list",
-                "-q", jql,
-                "--order-by", "updated",
+                "issue",
+                "list",
+                "-q",
+                jql,
+                "--order-by",
+                "updated",
                 "--reverse",
-                "--paginate", &limit_s,
+                "--paginate",
+                &limit_s,
                 "--raw",
             ])
             .await?;
@@ -82,12 +86,15 @@ impl JiraCli {
     }
 
     pub async fn comments(&self, key: &str) -> Result<Vec<Comment>> {
-        let v = self.run_json(&["issue", "view", key, "--comments", "100", "--raw"]).await?;
+        let v = self
+            .run_json(&["issue", "view", key, "--comments", "100", "--raw"])
+            .await?;
         Ok(parse_comments(&v))
     }
 
     pub async fn add_comment(&self, key: &str, body: &str) -> Result<()> {
-        self.run_ok(&["issue", "comment", "add", key, body, "--no-input"]).await?;
+        self.run_ok(&["issue", "comment", "add", key, body, "--no-input"])
+            .await?;
         Ok(())
     }
 
@@ -98,7 +105,8 @@ impl JiraCli {
     }
 
     pub async fn assign(&self, key: &str, assignee: &str) -> Result<()> {
-        self.run_ok(&["issue", "assign", key, assignee, "--no-input"]).await?;
+        self.run_ok(&["issue", "assign", key, assignee, "--no-input"])
+            .await?;
         Ok(())
     }
 
@@ -116,10 +124,14 @@ impl JiraCli {
         parent: Option<&str>,
     ) -> Result<String> {
         let mut args: Vec<String> = vec![
-            "issue".into(), "create".into(),
-            "-p".into(), project.into(),
-            "-t".into(), issue_type.into(),
-            "-s".into(), summary.into(),
+            "issue".into(),
+            "create".into(),
+            "-p".into(),
+            project.into(),
+            "-t".into(),
+            issue_type.into(),
+            "-s".into(),
+            summary.into(),
             "--no-input".into(),
         ];
         if let Some(b) = body {
@@ -143,17 +155,20 @@ impl JiraCli {
     }
 
     pub async fn edit_summary(&self, key: &str, summary: &str) -> Result<()> {
-        self.run_ok(&["issue", "edit", key, "-s", summary, "--no-input"]).await?;
+        self.run_ok(&["issue", "edit", key, "-s", summary, "--no-input"])
+            .await?;
         Ok(())
     }
 
     pub async fn edit_description(&self, key: &str, body: &str) -> Result<()> {
-        self.run_ok(&["issue", "edit", key, "-b", body, "--no-input"]).await?;
+        self.run_ok(&["issue", "edit", key, "-b", body, "--no-input"])
+            .await?;
         Ok(())
     }
 
     pub async fn edit_priority(&self, key: &str, priority: &str) -> Result<()> {
-        self.run_ok(&["issue", "edit", key, "-y", priority, "--no-input"]).await?;
+        self.run_ok(&["issue", "edit", key, "-y", priority, "--no-input"])
+            .await?;
         Ok(())
     }
 
@@ -188,7 +203,10 @@ impl JiraCli {
             }
         }
         if !grandparent_keys.is_empty() {
-            let grand = self.batch_fetch(&grandparent_keys).await.unwrap_or_default();
+            let grand = self
+                .batch_fetch(&grandparent_keys)
+                .await
+                .unwrap_or_default();
             for t in tickets.iter_mut() {
                 if let Some(gk) = &t.grandparent_key {
                     if let Some(g) = grand.get(gk) {
@@ -265,8 +283,12 @@ impl JiraCli {
         new_estimate: Option<&str>,
     ) -> Result<()> {
         let mut args: Vec<String> = vec![
-            "issue".into(), "worklog".into(), "add".into(),
-            key.into(), time_spent.into(), "--no-input".into(),
+            "issue".into(),
+            "worklog".into(),
+            "add".into(),
+            key.into(),
+            time_spent.into(),
+            "--no-input".into(),
         ];
         if let Some(c) = comment {
             args.push("--comment".into());
@@ -290,7 +312,9 @@ fn parse_search_response(v: &Value) -> Result<Vec<Ticket>> {
     } else if let Some(arr) = v.get("issues").and_then(|x| x.as_array()) {
         arr
     } else {
-        return Err(anyhow!("unexpected jira-cli response shape (not array or {{issues}})"));
+        return Err(anyhow!(
+            "unexpected jira-cli response shape (not array or {{issues}})"
+        ));
     };
     Ok(issues.iter().filter_map(parse_issue).collect())
 }
@@ -298,7 +322,11 @@ fn parse_search_response(v: &Value) -> Result<Vec<Ticket>> {
 fn parse_issue(v: &Value) -> Option<Ticket> {
     let key = v.get("key")?.as_str()?.to_string();
     let f = v.get("fields")?;
-    let summary = f.get("summary").and_then(|x| x.as_str()).unwrap_or("").to_string();
+    let summary = f
+        .get("summary")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let status = f
         .get("status")
         .and_then(|x| x.get("name"))
@@ -326,8 +354,14 @@ fn parse_issue(v: &Value) -> Option<Ticket> {
         .and_then(|x| x.get("name"))
         .and_then(|x| x.as_str())
         .map(str::to_string);
-    let updated = f.get("updated").and_then(|x| x.as_str()).map(str::to_string);
-    let created = f.get("created").and_then(|x| x.as_str()).map(str::to_string);
+    let updated = f
+        .get("updated")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
+    let created = f
+        .get("created")
+        .and_then(|x| x.as_str())
+        .map(str::to_string);
     let description = f.get("description").and_then(|d| match d {
         Value::String(s) => Some(s.clone()),
         Value::Object(_) => Some(adf_to_text(d)),
@@ -336,7 +370,11 @@ fn parse_issue(v: &Value) -> Option<Ticket> {
     let labels = f
         .get("labels")
         .and_then(|x| x.as_array())
-        .map(|arr| arr.iter().filter_map(|l| l.as_str().map(str::to_string)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| l.as_str().map(str::to_string))
+                .collect()
+        })
         .unwrap_or_default();
 
     // Time tracking. `view --raw` returns a `timetracking` object with `*Seconds` fields,
@@ -369,7 +407,11 @@ fn parse_issue(v: &Value) -> Option<Ticket> {
         .and_then(|x| x.as_str())
         .map(str::to_string);
     if parent_key.is_none() {
-        for cf in &["customfield_10014", "customfield_10008", "customfield_10006"] {
+        for cf in &[
+            "customfield_10014",
+            "customfield_10008",
+            "customfield_10006",
+        ] {
             if let Some(v) = f.get(*cf).and_then(|x| x.as_str()) {
                 if !v.is_empty() {
                     parent_key = Some(v.to_string());
@@ -404,7 +446,12 @@ fn parse_issue(v: &Value) -> Option<Ticket> {
                         .and_then(|x| x.get("name"))
                         .and_then(|x| x.as_str())
                         .map(str::to_string);
-                    Some(crate::ticket::SubtaskRef { key, summary, status, issue_type })
+                    Some(crate::ticket::SubtaskRef {
+                        key,
+                        summary,
+                        status,
+                        issue_type,
+                    })
                 })
                 .collect()
         })
@@ -493,13 +540,19 @@ fn walk_adf(node: &Value, out: &mut String) {
         "mention" => {
             if let Some(t) = attrs.and_then(|a| a.get("text")).and_then(|x| x.as_str()) {
                 out.push_str(t);
-            } else if let Some(d) = attrs.and_then(|a| a.get("displayName")).and_then(|x| x.as_str()) {
+            } else if let Some(d) = attrs
+                .and_then(|a| a.get("displayName"))
+                .and_then(|x| x.as_str())
+            {
                 out.push('@');
                 out.push_str(d);
             }
         }
         "emoji" => {
-            if let Some(s) = attrs.and_then(|a| a.get("shortName")).and_then(|x| x.as_str()) {
+            if let Some(s) = attrs
+                .and_then(|a| a.get("shortName"))
+                .and_then(|x| x.as_str())
+            {
                 out.push_str(s);
             }
         }
@@ -510,18 +563,43 @@ fn walk_adf(node: &Value, out: &mut String) {
                 out.push(']');
             }
         }
+        "hardBreak" => out.push('\n'),
         "date" => {
-            if let Some(ts) = attrs.and_then(|a| a.get("timestamp")).and_then(|x| x.as_str()) {
+            if let Some(ts) = attrs
+                .and_then(|a| a.get("timestamp"))
+                .and_then(|x| x.as_str())
+            {
                 out.push_str(ts);
             }
         }
         _ => {}
     }
 
-    if matches!(node_type, "paragraph" | "heading" | "listItem" | "codeBlock"
-        | "blockquote" | "rule" | "bulletList" | "orderedList" | "panel"
-        | "tableRow" | "tableCell" | "tableHeader" | "mediaSingle"
-        | "mediaGroup" | "media") {
+    if matches!(
+        node_type,
+        "paragraph"
+            | "heading"
+            | "codeBlock"
+            | "blockquote"
+            | "rule"
+            | "panel"
+            | "mediaSingle"
+            | "mediaGroup"
+            | "media"
+    ) {
+        if let Some(arr) = node.get("content").and_then(|x| x.as_array()) {
+            for c in arr {
+                walk_adf(c, out);
+            }
+        }
+        out.push('\n');
+        out.push('\n');
+        return;
+    }
+    if matches!(
+        node_type,
+        "listItem" | "bulletList" | "orderedList" | "tableRow" | "tableCell" | "tableHeader"
+    ) {
         if let Some(arr) = node.get("content").and_then(|x| x.as_array()) {
             for c in arr {
                 walk_adf(c, out);
@@ -557,13 +635,48 @@ fn parse_comments(v: &Value) -> Vec<Comment> {
                     .and_then(|a| a.get("displayName"))
                     .and_then(|x| x.as_str())?
                     .to_string(),
-                created: c.get("created").and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                body: c.get("body").map(|b| match b {
-                    Value::String(s) => s.clone(),
-                    Value::Object(_) => adf_to_text(b),
-                    _ => String::new(),
-                }).unwrap_or_default(),
+                created: c
+                    .get("created")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                body: c
+                    .get("body")
+                    .map(|b| match b {
+                        Value::String(s) => s.clone(),
+                        Value::Object(_) => adf_to_text(b),
+                        _ => String::new(),
+                    })
+                    .unwrap_or_default(),
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::adf_to_text;
+    use serde_json::json;
+
+    #[test]
+    fn adf_to_text_preserves_paragraph_spacing_and_hard_breaks() {
+        let adf = json!({
+            "type": "doc",
+            "version": 1,
+            "content": [
+                { "type": "paragraph", "content": [{ "type": "text", "text": "first" }] },
+                { "type": "paragraph", "content": [{ "type": "text", "text": "second" }] },
+                {
+                    "type": "paragraph",
+                    "content": [
+                        { "type": "text", "text": "a" },
+                        { "type": "hardBreak" },
+                        { "type": "text", "text": "b" }
+                    ]
+                }
+            ]
+        });
+
+        assert_eq!(adf_to_text(&adf), "first\n\nsecond\n\na\nb");
+    }
 }

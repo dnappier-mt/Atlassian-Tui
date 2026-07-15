@@ -41,7 +41,9 @@ pub struct PrComment {
     pub in_reply_to_id: String,
 }
 
-fn default_pr_comment_kind() -> String { "issue".to_string() }
+fn default_pr_comment_kind() -> String {
+    "issue".to_string()
+}
 
 /// What the github::pr_* fetchers return before the daemon enriches with
 /// ticket_key / pr_url / pr_number / repo. Five fields keep the fetch
@@ -87,7 +89,14 @@ pub struct CreatedPr {
 /// an error if the directory has no GitHub remote or `gh` isn't on PATH.
 pub async fn repo_slug(path: &Path) -> Result<String> {
     let out = Command::new("gh")
-        .args(["repo", "view", "--json", "nameWithOwner", "-q", ".nameWithOwner"])
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "-q",
+            ".nameWithOwner",
+        ])
         .current_dir(path)
         .output()
         .await
@@ -116,7 +125,9 @@ pub async fn current_branch(path: &Path) -> Result<String> {
         ));
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if s.is_empty() { return Err(anyhow!("not on a branch (detached HEAD?)")); }
+    if s.is_empty() {
+        return Err(anyhow!("not on a branch (detached HEAD?)"));
+    }
     Ok(s)
 }
 
@@ -159,7 +170,9 @@ pub async fn list_remotes(path: &Path) -> Result<Vec<(String, String)>> {
     let mut out_remotes: Vec<(String, String)> = Vec::new();
     for line in stdout.lines() {
         // Each line: "<name>\t<url> (fetch|push)"
-        if !line.contains("(fetch)") { continue; }
+        if !line.contains("(fetch)") {
+            continue;
+        }
         let mut parts = line.split_whitespace();
         let Some(name) = parts.next() else { continue };
         let Some(url) = parts.next() else { continue };
@@ -190,11 +203,7 @@ pub async fn create_pr(
     };
     let out = Command::new("gh")
         .args([
-            "pr", "create",
-            "--base", base,
-            "--head", &head_ref,
-            "--title", title,
-            "--body", body,
+            "pr", "create", "--base", base, "--head", &head_ref, "--title", title, "--body", body,
         ])
         .current_dir(path)
         .output()
@@ -227,9 +236,11 @@ pub async fn create_pr(
 pub async fn add_reviewer(path: &Path, pr_number: u64, gh_handle: &str) -> Result<()> {
     let out = Command::new("gh")
         .args([
-            "pr", "edit",
+            "pr",
+            "edit",
             &pr_number.to_string(),
-            "--add-reviewer", gh_handle,
+            "--add-reviewer",
+            gh_handle,
         ])
         .current_dir(path)
         .output()
@@ -238,6 +249,24 @@ pub async fn add_reviewer(path: &Path, pr_number: u64, gh_handle: &str) -> Resul
     if !out.status.success() {
         return Err(anyhow!(
             "gh pr edit failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+pub async fn close_pr(repo: &str, pr_number: u64, comment: Option<&str>) -> Result<()> {
+    let mut cmd = Command::new("gh");
+    cmd.args(["pr", "close", &pr_number.to_string(), "-R", repo]);
+    if let Some(comment) = comment {
+        if !comment.trim().is_empty() {
+            cmd.args(["--comment", comment]);
+        }
+    }
+    let out = cmd.output().await.context("running gh pr close")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "gh pr close failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
@@ -257,17 +286,30 @@ pub async fn search_authored_open() -> Result<Vec<PrSummary>> {
 /// Some workflows assign reviewers via Jira comments rather than GitHub's
 /// review-request mechanism — once the user starts a review, this catches it.
 pub async fn search_review_requested() -> Result<Vec<PrSummary>> {
-    let mut prs = run_search(&["--review-requested", "@me"]).await.unwrap_or_default();
-    let extra = run_search(&["--reviewed-by", "@me"]).await.unwrap_or_default();
+    let mut prs = run_search(&["--review-requested", "@me"])
+        .await
+        .unwrap_or_default();
+    let extra = run_search(&["--reviewed-by", "@me"])
+        .await
+        .unwrap_or_default();
     // Dedupe by URL.
-    let mut seen: std::collections::HashSet<String> =
-        prs.iter().map(|p| p.url.clone()).collect();
+    let mut seen: std::collections::HashSet<String> = prs.iter().map(|p| p.url.clone()).collect();
     for p in extra {
         if seen.insert(p.url.clone()) {
             prs.push(p);
         }
     }
     Ok(prs)
+}
+
+/// Open PRs whose searchable text mentions `handle`. Caller should fetch the
+/// body and validate the exact context before treating them as actionable.
+pub async fn search_mentions_handle(handle: &str) -> Result<Vec<PrSummary>> {
+    let handle = handle.trim_start_matches('@');
+    if handle.is_empty() {
+        return Ok(Vec::new());
+    }
+    run_search(&[handle]).await
 }
 
 /// Run `gh search prs <qualifier> --state open --limit 50 --json ...` and
@@ -277,11 +319,18 @@ async fn run_search(qualifier: &[&str]) -> Result<Vec<PrSummary>> {
     let mut args: Vec<&str> = vec!["search", "prs"];
     args.extend_from_slice(qualifier);
     args.extend_from_slice(&[
-        "--state", "open",
-        "--limit", "50",
-        "--json", "number,title,url,repository,author",
+        "--state",
+        "open",
+        "--limit",
+        "50",
+        "--json",
+        "number,title,url,repository,author",
     ]);
-    let out = Command::new("gh").args(&args).output().await.context("running gh search prs")?;
+    let out = Command::new("gh")
+        .args(&args)
+        .output()
+        .await
+        .context("running gh search prs")?;
     if !out.status.success() {
         return Err(anyhow!(
             "gh search prs {qualifier:?} failed: {}",
@@ -302,12 +351,16 @@ async fn run_search(qualifier: &[&str]) -> Result<Vec<PrSummary>> {
         name_with_owner: String,
     }
     #[derive(Deserialize)]
-    struct HitAuthor { login: Option<String> }
-    let hits: Vec<Hit> = serde_json::from_slice(&out.stdout)
-        .context("parsing gh search prs JSON")?;
+    struct HitAuthor {
+        login: Option<String>,
+    }
+    let hits: Vec<Hit> =
+        serde_json::from_slice(&out.stdout).context("parsing gh search prs JSON")?;
     let mut prs = Vec::with_capacity(hits.len());
     for h in hits {
-        let head = pr_head_branch(&h.repository.name_with_owner, h.number).await.unwrap_or_default();
+        let head = pr_head_branch(&h.repository.name_with_owner, h.number)
+            .await
+            .unwrap_or_default();
         prs.push(PrSummary {
             number: h.number,
             title: h.title,
@@ -329,9 +382,13 @@ async fn pr_head_branch(repo: &str, number: u64) -> Result<String> {
 async fn pr_head_and_state(repo: &str, number: u64) -> Result<(String, String)> {
     let out = Command::new("gh")
         .args([
-            "pr", "view", &number.to_string(),
-            "-R", repo,
-            "--json", "headRefName,state",
+            "pr",
+            "view",
+            &number.to_string(),
+            "-R",
+            repo,
+            "--json",
+            "headRefName,state",
         ])
         .output()
         .await
@@ -343,9 +400,12 @@ async fn pr_head_and_state(repo: &str, number: u64) -> Result<(String, String)> 
         ));
     }
     #[derive(Deserialize)]
-    struct V { #[serde(rename = "headRefName")] head: String, state: String }
-    let v: V = serde_json::from_slice(&out.stdout)
-        .context("parsing gh pr view JSON")?;
+    struct V {
+        #[serde(rename = "headRefName")]
+        head: String,
+        state: String,
+    }
+    let v: V = serde_json::from_slice(&out.stdout).context("parsing gh pr view JSON")?;
     Ok((v.head, v.state))
 }
 
@@ -355,9 +415,11 @@ async fn pr_head_and_state(repo: &str, number: u64) -> Result<(String, String)> 
 pub async fn notifications() -> Result<Vec<PrSummary>> {
     let out = Command::new("gh")
         .args([
-            "api", "notifications",
+            "api",
+            "notifications",
             "--paginate",
-            "-q", "[.[] | select(.subject.type==\"PullRequest\")]",
+            "-q",
+            "[.[] | select(.subject.type==\"PullRequest\")]",
         ])
         .output()
         .await
@@ -374,7 +436,10 @@ pub async fn notifications() -> Result<Vec<PrSummary>> {
         repository: NoteRepo,
     }
     #[derive(Deserialize)]
-    struct Subject { title: String, url: String }
+    struct Subject {
+        title: String,
+        url: String,
+    }
     #[derive(Deserialize)]
     struct NoteRepo {
         #[serde(rename = "full_name")]
@@ -385,7 +450,9 @@ pub async fn notifications() -> Result<Vec<PrSummary>> {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut prs = Vec::new();
     for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
-        if chunk.is_empty() { continue; }
+        if chunk.is_empty() {
+            continue;
+        }
         let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
             chunk
         } else if chunk.starts_with('[') {
@@ -408,14 +475,21 @@ pub async fn notifications() -> Result<Vec<PrSummary>> {
                 .next()
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(0);
-            if pr_number == 0 { continue; }
+            if pr_number == 0 {
+                continue;
+            }
             let (head, state) = match pr_head_and_state(&n.repository.full_name, pr_number).await {
                 Ok(v) => v,
                 Err(_) => continue,
             };
             // Skip closed / merged PRs — user only cares about active reviews.
-            if !state.eq_ignore_ascii_case("OPEN") { continue; }
-            let url = format!("https://github.com/{}/pull/{}", n.repository.full_name, pr_number);
+            if !state.eq_ignore_ascii_case("OPEN") {
+                continue;
+            }
+            let url = format!(
+                "https://github.com/{}/pull/{}",
+                n.repository.full_name, pr_number
+            );
             prs.push(PrSummary {
                 number: pr_number,
                 title: n.subject.title,
@@ -445,14 +519,23 @@ pub async fn pr_comments(repo: &str, number: u64) -> Result<Vec<FetchedComment>>
         ));
     }
     #[derive(Deserialize)]
-    struct GhComment { id: u64, user: GhUser, created_at: String, body: String }
+    struct GhComment {
+        id: u64,
+        user: GhUser,
+        created_at: String,
+        body: String,
+    }
     #[derive(Deserialize)]
-    struct GhUser { login: String }
+    struct GhUser {
+        login: String,
+    }
     // `--paginate` concatenates JSON arrays; split on `][` like in notifications().
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut all: Vec<FetchedComment> = Vec::new();
     for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
-        if chunk.is_empty() { continue; }
+        if chunk.is_empty() {
+            continue;
+        }
         let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
             chunk
         } else if chunk.starts_with('[') {
@@ -511,11 +594,15 @@ pub async fn pr_review_comments(repo: &str, number: u64) -> Result<Vec<FetchedCo
         in_reply_to_id: Option<u64>,
     }
     #[derive(Deserialize)]
-    struct GhUser { login: String }
+    struct GhUser {
+        login: String,
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut all: Vec<FetchedComment> = Vec::new();
     for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
-        if chunk.is_empty() { continue; }
+        if chunk.is_empty() {
+            continue;
+        }
         let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
             chunk
         } else if chunk.starts_with('[') {
@@ -577,11 +664,15 @@ pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<FetchedComment>> 
         state: String,
     }
     #[derive(Deserialize)]
-    struct GhUser { login: String }
+    struct GhUser {
+        login: String,
+    }
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut all: Vec<FetchedComment> = Vec::new();
     for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
-        if chunk.is_empty() { continue; }
+        if chunk.is_empty() {
+            continue;
+        }
         let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
             chunk
         } else if chunk.starts_with('[') {
@@ -596,7 +687,9 @@ pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<FetchedComment>> 
             Err(_) => continue,
         };
         for r in reviews {
-            if r.body.trim().is_empty() { continue; }
+            if r.body.trim().is_empty() {
+                continue;
+            }
             let Some(user) = r.user else { continue };
             let when = r.submitted_at.unwrap_or_default();
             let tag = if r.state.is_empty() {
@@ -622,10 +715,15 @@ pub async fn pr_reviews(repo: &str, number: u64) -> Result<Vec<FetchedComment>> 
 pub async fn pr_body(repo: &str, number: u64) -> Result<String> {
     let out = Command::new("gh")
         .args([
-            "pr", "view", &number.to_string(),
-            "-R", repo,
-            "--json", "body",
-            "-q", ".body",
+            "pr",
+            "view",
+            &number.to_string(),
+            "-R",
+            repo,
+            "--json",
+            "body",
+            "-q",
+            ".body",
         ])
         .output()
         .await
@@ -643,10 +741,15 @@ pub async fn pr_body(repo: &str, number: u64) -> Result<String> {
 pub async fn pr_author_login(repo: &str, number: u64) -> Result<String> {
     let out = Command::new("gh")
         .args([
-            "pr", "view", &number.to_string(),
-            "-R", repo,
-            "--json", "author",
-            "-q", ".author.login",
+            "pr",
+            "view",
+            &number.to_string(),
+            "-R",
+            repo,
+            "--json",
+            "author",
+            "-q",
+            ".author.login",
         ])
         .output()
         .await
@@ -665,10 +768,7 @@ pub async fn pr_author_login(repo: &str, number: u64) -> Result<String> {
 /// trailing hyphens). Falls back to the login if the user has no name set.
 pub async fn user_first_name_remote_safe(login: &str) -> Result<String> {
     let out = Command::new("gh")
-        .args([
-            "api", &format!("users/{login}"),
-            "-q", ".name",
-        ])
+        .args(["api", &format!("users/{login}"), "-q", ".name"])
         .output()
         .await
         .context("running gh api users/<login>")?;
@@ -700,16 +800,24 @@ fn sanitize_remote_name(s: &str) -> String {
         }
     }
     let trimmed = out.trim_matches('-').to_string();
-    if trimmed.is_empty() { "contributor".to_string() } else { trimmed }
+    if trimmed.is_empty() {
+        "contributor".to_string()
+    } else {
+        trimmed
+    }
 }
 
 /// Post an issue-level comment on a PR (`gh pr comment`).
 pub async fn post_pr_comment(repo: &str, number: u64, body: &str) -> Result<()> {
     let out = Command::new("gh")
         .args([
-            "pr", "comment", &number.to_string(),
-            "-R", repo,
-            "--body", body,
+            "pr",
+            "comment",
+            &number.to_string(),
+            "-R",
+            repo,
+            "--body",
+            body,
         ])
         .output()
         .await
@@ -729,10 +837,14 @@ pub async fn post_pr_comment(repo: &str, number: u64, body: &str) -> Result<()> 
 pub async fn add_pr_reaction(repo: &str, number: u64, content: &str) -> Result<()> {
     let out = Command::new("gh")
         .args([
-            "api", "-X", "POST",
-            "-H", "Accept: application/vnd.github+json",
+            "api",
+            "-X",
+            "POST",
+            "-H",
+            "Accept: application/vnd.github+json",
             &format!("repos/{repo}/issues/{number}/reactions"),
-            "-f", &format!("content={content}"),
+            "-f",
+            &format!("content={content}"),
         ])
         .output()
         .await
@@ -755,7 +867,8 @@ pub async fn review_thread_resolution_map(
     repo: &str,
     number: u64,
 ) -> Result<std::collections::HashMap<String, bool>> {
-    let (owner, name) = repo.split_once('/')
+    let (owner, name) = repo
+        .split_once('/')
         .ok_or_else(|| anyhow!("repo must be `<owner>/<name>`, got: {repo}"))?;
     let query = format!(
         "query {{ repository(owner: \"{owner}\", name: \"{name}\") {{ \
@@ -778,26 +891,43 @@ pub async fn review_thread_resolution_map(
         ));
     }
     #[derive(Deserialize)]
-    struct Resp { data: Data }
+    struct Resp {
+        data: Data,
+    }
     #[derive(Deserialize)]
-    struct Data { repository: Repo }
+    struct Data {
+        repository: Repo,
+    }
     #[derive(Deserialize)]
-    struct Repo { #[serde(rename = "pullRequest")] pull_request: Pr }
+    struct Repo {
+        #[serde(rename = "pullRequest")]
+        pull_request: Pr,
+    }
     #[derive(Deserialize)]
-    struct Pr { #[serde(rename = "reviewThreads")] review_threads: Threads }
+    struct Pr {
+        #[serde(rename = "reviewThreads")]
+        review_threads: Threads,
+    }
     #[derive(Deserialize)]
-    struct Threads { nodes: Vec<Thread> }
+    struct Threads {
+        nodes: Vec<Thread>,
+    }
     #[derive(Deserialize)]
     struct Thread {
-        #[serde(rename = "isResolved")] is_resolved: bool,
+        #[serde(rename = "isResolved")]
+        is_resolved: bool,
         comments: ThreadComments,
     }
     #[derive(Deserialize)]
-    struct ThreadComments { nodes: Vec<ThreadComment> }
+    struct ThreadComments {
+        nodes: Vec<ThreadComment>,
+    }
     #[derive(Deserialize)]
-    struct ThreadComment { #[serde(rename = "databaseId")] database_id: Option<i64> }
-    let resp: Resp = serde_json::from_slice(&out.stdout)
-        .context("parsing reviewThreads JSON")?;
+    struct ThreadComment {
+        #[serde(rename = "databaseId")]
+        database_id: Option<i64>,
+    }
+    let resp: Resp = serde_json::from_slice(&out.stdout).context("parsing reviewThreads JSON")?;
     let mut map = std::collections::HashMap::new();
     for t in resp.data.repository.pull_request.review_threads.nodes {
         for c in t.comments.nodes {
@@ -817,14 +947,12 @@ pub async fn review_thread_resolution_map(
 /// GraphQL: query the PR's `reviewThreads`, find the thread whose comments
 /// contain the given REST `databaseId`, then call `resolveReviewThread`
 /// with that thread's GraphQL node id.
-pub async fn resolve_review_thread(
-    repo: &str,
-    number: u64,
-    comment_id: &str,
-) -> Result<()> {
-    let (owner, name) = repo.split_once('/')
+pub async fn resolve_review_thread(repo: &str, number: u64, comment_id: &str) -> Result<()> {
+    let (owner, name) = repo
+        .split_once('/')
         .ok_or_else(|| anyhow!("repo must be `<owner>/<name>`, got: {repo}"))?;
-    let target_db_id: i64 = comment_id.parse()
+    let target_db_id: i64 = comment_id
+        .parse()
         .with_context(|| format!("comment_id must be numeric, got: {comment_id}"))?;
     // 1. List threads. Single query is enough for normal PRs (<100 threads).
     let query = format!(
@@ -848,30 +976,57 @@ pub async fn resolve_review_thread(
         ));
     }
     #[derive(Deserialize)]
-    struct Resp { data: Data }
+    struct Resp {
+        data: Data,
+    }
     #[derive(Deserialize)]
-    struct Data { repository: Repo }
+    struct Data {
+        repository: Repo,
+    }
     #[derive(Deserialize)]
-    struct Repo { #[serde(rename = "pullRequest")] pull_request: Pr }
+    struct Repo {
+        #[serde(rename = "pullRequest")]
+        pull_request: Pr,
+    }
     #[derive(Deserialize)]
-    struct Pr { #[serde(rename = "reviewThreads")] review_threads: Threads }
+    struct Pr {
+        #[serde(rename = "reviewThreads")]
+        review_threads: Threads,
+    }
     #[derive(Deserialize)]
-    struct Threads { nodes: Vec<Thread> }
+    struct Threads {
+        nodes: Vec<Thread>,
+    }
     #[derive(Deserialize)]
     struct Thread {
         id: String,
-        #[serde(rename = "isResolved")] is_resolved: bool,
+        #[serde(rename = "isResolved")]
+        is_resolved: bool,
         comments: ThreadComments,
     }
     #[derive(Deserialize)]
-    struct ThreadComments { nodes: Vec<ThreadComment> }
+    struct ThreadComments {
+        nodes: Vec<ThreadComment>,
+    }
     #[derive(Deserialize)]
-    struct ThreadComment { #[serde(rename = "databaseId")] database_id: Option<i64> }
-    let resp: Resp = serde_json::from_slice(&out.stdout)
-        .context("parsing reviewThreads JSON")?;
-    let thread = resp.data.repository.pull_request.review_threads.nodes
+    struct ThreadComment {
+        #[serde(rename = "databaseId")]
+        database_id: Option<i64>,
+    }
+    let resp: Resp = serde_json::from_slice(&out.stdout).context("parsing reviewThreads JSON")?;
+    let thread = resp
+        .data
+        .repository
+        .pull_request
+        .review_threads
+        .nodes
         .into_iter()
-        .find(|t| t.comments.nodes.iter().any(|c| c.database_id == Some(target_db_id)));
+        .find(|t| {
+            t.comments
+                .nodes
+                .iter()
+                .any(|c| c.database_id == Some(target_db_id))
+        });
     let Some(thread) = thread else {
         return Err(anyhow!(
             "no review thread contains comment {comment_id} (not a review comment?)"
@@ -910,14 +1065,20 @@ pub async fn post_review_comment_reply(
     parent_id: &str,
     body: &str,
 ) -> Result<()> {
-    let path = format!("repos/{}/pulls/{}/comments/{}/replies", repo, number, parent_id);
+    let path = format!(
+        "repos/{}/pulls/{}/comments/{}/replies",
+        repo, number, parent_id
+    );
     let out = Command::new("gh")
         .args([
             "api",
-            "--method", "POST",
-            "-H", "Accept: application/vnd.github+json",
+            "--method",
+            "POST",
+            "-H",
+            "Accept: application/vnd.github+json",
             &path,
-            "-f", &format!("body={body}"),
+            "-f",
+            &format!("body={body}"),
         ])
         .output()
         .await
@@ -958,12 +1119,16 @@ pub async fn my_latest_review_state(
         submitted_at: Option<String>,
     }
     #[derive(Deserialize)]
-    struct ReviewUser { login: String }
+    struct ReviewUser {
+        login: String,
+    }
 
     let stdout = String::from_utf8_lossy(&out.stdout);
     let mut latest: Option<(String, String)> = None;
     for chunk in stdout.split("][").map(|s| s.trim().to_string()) {
-        if chunk.is_empty() { continue; }
+        if chunk.is_empty() {
+            continue;
+        }
         let chunk = if chunk.starts_with('[') && chunk.ends_with(']') {
             chunk
         } else if chunk.starts_with('[') {
@@ -978,7 +1143,9 @@ pub async fn my_latest_review_state(
             Err(_) => continue,
         };
         for r in reviews {
-            if !r.user.login.eq_ignore_ascii_case(my_login) { continue; }
+            if !r.user.login.eq_ignore_ascii_case(my_login) {
+                continue;
+            }
             // Track the chronologically last one. submitted_at is RFC3339 so
             // string comparison is fine.
             let when = r.submitted_at.unwrap_or_default();

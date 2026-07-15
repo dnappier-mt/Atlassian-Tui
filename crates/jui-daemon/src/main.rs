@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
-use tracing_subscriber::fmt::writer::MakeWriterExt;
 use clap::Parser;
 use jui_core::cache::Cache;
-use jui_core::confluence_api::ConfluenceApi;
 use jui_core::config::GlobalConfig;
+use jui_core::confluence_api::ConfluenceApi;
 use jui_core::ipc::{
     read_frame, write_frame, DaemonStatus, NotificationItem, ProjectStatus, Request, Response,
     StartWorkReply, TicketProjectEntry,
@@ -20,6 +19,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, RwLock};
 use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
+use tracing_subscriber::fmt::writer::MakeWriterExt;
 
 #[derive(Parser)]
 #[command(name = "jui-daemon", about = "Jui background daemon")]
@@ -71,8 +71,9 @@ async fn main() -> Result<()> {
     let (file_writer, _guard) = tracing_appender::non_blocking(file);
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,jui_daemon=debug,jui_core=debug")),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new("info,jui_daemon=debug,jui_core=debug")
+            }),
         )
         .with_writer(file_writer.and(std::io::stderr))
         .with_ansi(false)
@@ -181,8 +182,8 @@ async fn main() -> Result<()> {
         tokio::spawn(async move { tmux_status_loop(state).await });
     }
 
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("binding {}", socket.display()))?;
+    let listener =
+        UnixListener::bind(&socket).with_context(|| format!("binding {}", socket.display()))?;
     info!(path = %socket.display(), "daemon listening");
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -228,10 +229,138 @@ fn sanity_check_projects(cfg: &GlobalConfig) {
 }
 
 fn project_kind(path: &Path) -> &'static str {
-    if !path.exists() { return "missing"; }
-    if path.join(".git").exists() { return "git"; }
-    if path.join(".svn").exists() { return "svn"; }
+    if !path.exists() {
+        return "missing";
+    }
+    if path.join(".git").exists() {
+        return "git";
+    }
+    if path.join(".svn").exists() {
+        return "svn";
+    }
     "missing"
+}
+
+fn existing_ticket_worktree(
+    cfg: &GlobalConfig,
+    ticket: &Ticket,
+    extra_roots: &[PathBuf],
+) -> Option<(PathBuf, String, Option<PathBuf>)> {
+    let slug = ticket.branch_slug();
+    let mut candidates: Vec<PathBuf> = cfg.projects.iter().map(|p| p.path.clone()).collect();
+    candidates.extend(extra_roots.iter().cloned());
+    let mut seen = HashSet::new();
+    for path in candidates {
+        let key = path.display().to_string();
+        if !seen.insert(key) {
+            continue;
+        }
+        let repo = scm::detect(&path);
+        if !matches!(repo.kind, scm::ScmKind::Git) {
+            continue;
+        }
+        match scm::find_existing_worktree_for_key(&repo.root, &ticket.key, &slug) {
+            Ok(Some((path, branch))) => return Some((path, branch, Some(repo.root))),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(path = %path.display(), key = %ticket.key, "worktree scan failed: {e:#}")
+            }
+        }
+    }
+    None
+}
+
+fn resolve_ticket_work_dir(
+    cfg: &GlobalConfig,
+    ticket: &Ticket,
+    linked_paths: &[PathBuf],
+) -> Option<PathBuf> {
+    existing_ticket_worktree(cfg, ticket, linked_paths)
+        .map(|(path, _, _)| path)
+        .or_else(|| {
+            linked_paths.first().and_then(|project_path| {
+                jui_core::scm::worktree_path_for_slug(project_path, &ticket.branch_slug())
+                    .filter(|w| w.exists())
+            })
+        })
+        .or_else(|| linked_paths.first().cloned())
+}
+
+async fn get_ticket_for_key(state: &State, key: &str) -> Result<Ticket> {
+    match state.jira.view(key).await {
+        Ok(t) => Ok(t),
+        Err(_) => state
+            .cache
+            .lock()
+            .await
+            .get_ticket(key)?
+            .ok_or_else(|| anyhow::anyhow!("no such ticket {key}")),
+    }
+}
+
+async fn start_work_from_anchor(
+    state: &State,
+    key: &str,
+    cwd: PathBuf,
+    slug: &str,
+    location: scm::WorkLocation,
+) -> Result<StartWorkReply> {
+    // Prefer the ticket's first confirmed linked project as the SCM anchor —
+    // guarantees the worktree lands next to the repo the ticket targets, even
+    // when the user launched jui from outside that repo. Fall back to cwd when
+    // no linked project is recorded.
+    let scm_anchor = state
+        .cache
+        .lock()
+        .await
+        .linked_paths(key)?
+        .into_iter()
+        .next()
+        .unwrap_or(cwd);
+    let repo = scm::detect(&scm_anchor);
+    let outcome = scm::start_work(&repo, key, slug, location)?;
+    Ok(match outcome {
+        scm::StartWorkOutcome::GitWorktree {
+            branch,
+            path,
+            created_branch,
+            attached_existing_worktree,
+        } => StartWorkReply::GitWorktree {
+            branch,
+            path,
+            created_branch,
+            attached_existing_worktree,
+        },
+        scm::StartWorkOutcome::GitBranchInRepo {
+            branch,
+            path,
+            created_branch,
+            already_on_branch,
+        } => StartWorkReply::GitBranchInRepo {
+            branch,
+            path,
+            created_branch,
+            already_on_branch,
+        },
+        scm::StartWorkOutcome::SvnExport { value } => StartWorkReply::SvnExport { value },
+        scm::StartWorkOutcome::NoScm => StartWorkReply::NoScm,
+    })
+}
+
+async fn start_work_slug(ticket: &Ticket, cfg: &GlobalConfig) -> String {
+    let default_slug = ticket.branch_slug();
+    if default_slug.matches('-').count() <= 2 {
+        return default_slug;
+    }
+    match jui_core::claude::short_branch_slug(ticket, &default_slug, &cfg.workflow.code_assistant)
+        .await
+    {
+        Ok(slug) => slug,
+        Err(e) => {
+            warn!(key = %ticket.key, "short branch name failed, using default slug: {e:#}");
+            default_slug
+        }
+    }
 }
 
 async fn handle_client(
@@ -243,7 +372,9 @@ async fn handle_client(
     let req: Request = serde_json::from_slice(&raw)?;
     let resp = match dispatch(req, state.clone(), &shutdown).await {
         Ok(r) => r,
-        Err(e) => Response::Err { message: format!("{e:#}") },
+        Err(e) => Response::Err {
+            message: format!("{e:#}"),
+        },
     };
     let body = serde_json::to_vec(&resp)?;
     write_frame(&mut stream, &body).await?;
@@ -275,7 +406,9 @@ async fn dispatch(
                 }
                 Err(e) => {
                     if custom_jql {
-                        return Ok(Response::Err { message: format!("search failed: {e:#}") });
+                        return Ok(Response::Err {
+                            message: format!("search failed: {e:#}"),
+                        });
                     }
                     warn!("live search failed, falling back to cache: {e:#}");
                     let cache = state.cache.lock().await;
@@ -284,7 +417,11 @@ async fn dispatch(
             };
             // Decorate with confirmed local-project links for sort/display.
             let keys: Vec<String> = tickets.iter().map(|t| t.key.clone()).collect();
-            let map = state.cache.lock().await.confirmed_projects_for_tickets(&keys)?;
+            let map = state
+                .cache
+                .lock()
+                .await
+                .confirmed_projects_for_tickets(&keys)?;
             for t in &mut tickets {
                 if let Some(paths) = map.get(&t.key) {
                     t.linked_projects = paths.clone();
@@ -299,22 +436,23 @@ async fn dispatch(
             Ok(Response::Tickets { items })
         }
 
-        Request::GetTicket { key } => {
-            match state.jira.view(&key).await {
-                Ok(t) => {
-                    let mut cache = state.cache.lock().await;
-                    cache.upsert_tickets(std::slice::from_ref(&t)).ok();
-                    Ok(Response::Ticket { ticket: t })
-                }
-                Err(_) => {
-                    let cache = state.cache.lock().await;
-                    match cache.get_ticket(&key)? {
-                        Some(t) => Ok(Response::Ticket { ticket: t }),
-                        None => Ok(Response::Err { message: format!("no such ticket {key}") }),
-                    }
+        Request::GetTicket { key } => match state.jira.view(&key).await {
+            Ok(t) => {
+                let mut cache = state.cache.lock().await;
+                cache.upsert_tickets(std::slice::from_ref(&t)).ok();
+                Ok(Response::Ticket { ticket: t })
+            }
+            Err(e) => {
+                warn!(%key, "live ticket fetch failed, returning cache: {e:#}");
+                let cache = state.cache.lock().await;
+                match cache.get_ticket(&key)? {
+                    Some(t) => Ok(Response::Ticket { ticket: t }),
+                    None => Ok(Response::Err {
+                        message: format!("no such ticket {key}"),
+                    }),
                 }
             }
-        }
+        },
 
         Request::Refresh { jql } => {
             let q = jql.unwrap_or_else(|| state.config.jira.my_jql.clone());
@@ -330,58 +468,34 @@ async fn dispatch(
             Ok(Response::Ok)
         }
 
-        Request::StartWork { key, cwd, location } => {
-            let ticket = match state.jira.view(&key).await {
-                Ok(t) => t,
-                Err(_) => state
-                    .cache
-                    .lock()
-                    .await
-                    .get_ticket(&key)?
-                    .ok_or_else(|| anyhow::anyhow!("no such ticket {key}"))?,
+        Request::StartWork {
+            key,
+            cwd,
+            slug,
+            location,
+        } => {
+            let ticket = get_ticket_for_key(&state, &key).await?;
+            let cfg = GlobalConfig::load().unwrap_or_default();
+            let slug = match slug {
+                Some(slug) => slug,
+                None => start_work_slug(&ticket, &cfg).await,
             };
-            let slug = ticket.branch_slug();
-            // Prefer the ticket's first confirmed linked project as the SCM
-            // anchor — guarantees the worktree lands next to the repo the
-            // ticket actually targets, even when the user launched jui from
-            // outside that repo. Falls back to the caller-supplied cwd
-            // (typically the TUI's working dir) when no linked project is
-            // recorded.
-            let scm_anchor = state
-                .cache
-                .lock()
-                .await
-                .linked_paths(&key)?
-                .into_iter()
-                .next()
-                .unwrap_or(cwd);
-            let repo = scm::detect(&scm_anchor);
-            let outcome = scm::start_work(&repo, &key, &slug, location)?;
-            let reply = match outcome {
-                scm::StartWorkOutcome::GitWorktree {
-                    branch,
-                    path,
-                    created_branch,
-                    attached_existing_worktree,
-                } => StartWorkReply::GitWorktree {
-                    branch,
-                    path,
-                    created_branch,
-                    attached_existing_worktree,
-                },
-                scm::StartWorkOutcome::GitBranchInRepo {
-                    branch,
-                    path,
-                    created_branch,
-                    already_on_branch,
-                } => StartWorkReply::GitBranchInRepo {
-                    branch,
-                    path,
-                    created_branch,
-                    already_on_branch,
-                },
-                scm::StartWorkOutcome::SvnExport { value } => StartWorkReply::SvnExport { value },
-                scm::StartWorkOutcome::NoScm => StartWorkReply::NoScm,
+            let linked_paths = state.cache.lock().await.linked_paths(&key)?;
+            let reply = if matches!(location, scm::WorkLocation::Worktree) {
+                if let Some((path, branch, _repo)) =
+                    existing_ticket_worktree(&cfg, &ticket, &linked_paths)
+                {
+                    StartWorkReply::GitWorktree {
+                        branch,
+                        path,
+                        created_branch: false,
+                        attached_existing_worktree: true,
+                    }
+                } else {
+                    start_work_from_anchor(&state, &key, cwd, &slug, location).await?
+                }
+            } else {
+                start_work_from_anchor(&state, &key, cwd, &slug, location).await?
             };
             // Rules engine: StartWork trigger. The user invoking the daemon
             // is by definition "me", so `actor_is_me` is true; we don't pay
@@ -393,7 +507,8 @@ async fn dispatch(
             let status = ticket.status.clone();
             let project = ticket.key.split('-').next().map(str::to_string);
             let issue_type = ticket.issue_type.clone();
-            let has_linked = !state.cache.lock().await.linked_paths(&k2).unwrap_or_default().is_empty();
+            let has_linked =
+                !linked_paths.is_empty() || matches!(&reply, StartWorkReply::GitWorktree { .. });
             tokio::spawn(async move {
                 fire_rules(
                     &s2,
@@ -418,12 +533,7 @@ async fn dispatch(
             // Mirror the TUI's old stop-work flow but server-side so the rules
             // engine has a single fire point. Transition to a Backlog
             // transition (first matching), then append the optional comment.
-            let prior_status = state
-                .cache
-                .lock()
-                .await
-                .get_ticket(&key)?
-                .map(|t| t.status);
+            let prior_status = state.cache.lock().await.get_ticket(&key)?.map(|t| t.status);
             let api = JiraApi::from_jira_cli_config()?;
             let transitions = api.list_transitions(&key).await.unwrap_or_default();
             let target = transitions
@@ -472,7 +582,7 @@ async fn dispatch(
                     },
                 )
                 .await;
-                refresh_ticket_after_mutation(&s2, &k2).await;
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
             });
             Ok(Response::Ok)
         }
@@ -482,7 +592,9 @@ async fn dispatch(
             // Async refresh of the affected ticket's comments + view.
             let s2 = state.clone();
             let k2 = key.clone();
-            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            tokio::spawn(async move {
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
 
@@ -510,7 +622,9 @@ async fn dispatch(
                 // Spawn a background refresh so the *next* read is fresh.
                 let s2 = state.clone();
                 let k2 = key.clone();
-                tokio::spawn(async move { refresh_comments(&s2, &k2).await; });
+                tokio::spawn(async move {
+                    refresh_comments(&s2, &k2).await;
+                });
                 Ok(Response::Comments { items: cached })
             }
         }
@@ -520,7 +634,9 @@ async fn dispatch(
             api.delete_comment(&key, &comment_id).await?;
             let s2 = state.clone();
             let k2 = key.clone();
-            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            tokio::spawn(async move {
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
 
@@ -564,13 +680,22 @@ async fn dispatch(
                 });
             }
             if stale {
-                let s2 = state.clone();
-                tokio::spawn(async move {
-                    refresh_my_mentions(&s2).await;
-                    let _ = refresh_github_mentions(&s2).await;
+                refresh_my_mentions(&state).await;
+                let _ = refresh_github_mentions(&state).await;
+                let cache = state.cache.lock().await;
+                return Ok(Response::MyMentions {
+                    reviewing: cache.get_mentions("reviewer")?,
+                    mentioned: cache.get_mentions("mentioned")?,
+                    github: cache.get_mentions("github")?,
+                    authored: cache.get_mention_keys("authored")?,
                 });
             }
-            Ok(Response::MyMentions { reviewing, mentioned, github, authored })
+            Ok(Response::MyMentions {
+                reviewing,
+                mentioned,
+                github,
+                authored,
+            })
         }
 
         Request::SetGithubHandle { account_id, handle } => {
@@ -597,7 +722,10 @@ async fn dispatch(
             Ok(Response::PrComments { items, pr_link })
         }
 
-        Request::ResolvePrComment { ticket_key, comment_id } => {
+        Request::ResolvePrComment {
+            ticket_key,
+            comment_id,
+        } => {
             let (repo, number) = {
                 let cache = state.cache.lock().await;
                 match cache.get_ticket_pr_meta(&ticket_key)? {
@@ -609,19 +737,30 @@ async fn dispatch(
                     }
                 }
             };
-            if let Err(e) = jui_core::github::resolve_review_thread(&repo, number, &comment_id).await {
-                return Ok(Response::Err { message: format!("{e:#}") });
+            if let Err(e) =
+                jui_core::github::resolve_review_thread(&repo, number, &comment_id).await
+            {
+                return Ok(Response::Err {
+                    message: format!("{e:#}"),
+                });
             }
             // Async refresh — resolved threads still appear in REST, so the
             // pane content doesn't change yet, but a refresh keeps things
             // consistent (replies you might have added land too).
             let s2 = state.clone();
             let k2 = ticket_key.clone();
-            tokio::spawn(async move { refresh_pr_comments_for_ticket(&s2, &k2).await; });
+            tokio::spawn(async move {
+                refresh_pr_comments_for_ticket(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
 
-        Request::ReplyToPrComment { ticket_key, parent_kind, parent_id, body } => {
+        Request::ReplyToPrComment {
+            ticket_key,
+            parent_kind,
+            parent_id,
+            body,
+        } => {
             // Resolve repo + number for the ticket. Prefer the canonical
             // ticket_prs row; fall back to scanning cached pr_comments for a
             // matching ticket so older data still routes.
@@ -646,18 +785,24 @@ async fn dispatch(
                 jui_core::github::post_pr_comment(&repo, number, &body).await
             };
             if let Err(e) = result {
-                return Ok(Response::Err { message: format!("{e:#}") });
+                return Ok(Response::Err {
+                    message: format!("{e:#}"),
+                });
             }
             // Async refresh so the next ListPrComments call surfaces the new row.
             let s2 = state.clone();
             let k2 = ticket_key.clone();
-            tokio::spawn(async move { refresh_pr_comments_for_ticket(&s2, &k2).await; });
+            tokio::spawn(async move {
+                refresh_pr_comments_for_ticket(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
         Request::FindDevQaWorktree { ticket_key } => {
             match find_existing_devqa_worktree(&state, &ticket_key) {
                 Some((path, branch)) => Ok(Response::DevQaWorktree { path, branch }),
-                None => Ok(Response::Err { message: format!("no DevQA worktree for {ticket_key}") }),
+                None => Ok(Response::Err {
+                    message: format!("no DevQA worktree for {ticket_key}"),
+                }),
             }
         }
         Request::CleanupDevQaWorktree { ticket_key, force } => {
@@ -675,8 +820,14 @@ async fn dispatch(
                 }
             };
             match cleanup_devqa_worktree(&state, &ticket_key, &repo, number, force) {
-                Ok((removed, dirty, message)) => Ok(Response::DevQaCleanup { removed, dirty, message }),
-                Err(e) => Ok(Response::Err { message: format!("{e:#}") }),
+                Ok((removed, dirty, message)) => Ok(Response::DevQaCleanup {
+                    removed,
+                    dirty,
+                    message,
+                }),
+                Err(e) => Ok(Response::Err {
+                    message: format!("{e:#}"),
+                }),
             }
         }
         Request::ResolveDevQaPr { ticket_key } => {
@@ -693,26 +844,43 @@ async fn dispatch(
                     });
                 }
             };
-            if let Err(e) = jui_core::github::post_pr_comment(&repo, number, "DevQA: Passed").await {
-                return Ok(Response::Err { message: format!("post DevQA comment: {e:#}") });
+            if let Err(e) = jui_core::github::post_pr_comment(&repo, number, "DevQA: Passed").await
+            {
+                return Ok(Response::Err {
+                    message: format!("post DevQA comment: {e:#}"),
+                });
             }
             if let Err(e) = jui_core::github::add_pr_reaction(&repo, number, "rocket").await {
                 // The comment already landed; report the partial failure so the
                 // user can add the reaction manually rather than retry the comment.
-                return Ok(Response::Err { message: format!("rocket reaction (comment posted): {e:#}") });
+                return Ok(Response::Err {
+                    message: format!("rocket reaction (comment posted): {e:#}"),
+                });
             }
             let s2 = state.clone();
             let k2 = ticket_key.clone();
-            tokio::spawn(async move { refresh_pr_comments_for_ticket(&s2, &k2).await; });
+            tokio::spawn(async move {
+                refresh_pr_comments_for_ticket(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
 
-        Request::SetupDevQaWorktree { ticket_key, repo, pr_number, worktree } => {
-            setup_devqa_worktree(&state, &ticket_key, &repo, pr_number, worktree).await
-        }
+        Request::SetupDevQaWorktree {
+            ticket_key,
+            repo,
+            pr_number,
+            worktree,
+        } => setup_devqa_worktree(&state, &ticket_key, &repo, pr_number, worktree).await,
 
-        Request::SetPrUserState { ticket_key, state: pr_state } => {
-            state.cache.lock().await.set_pr_state(&ticket_key, &pr_state)?;
+        Request::SetPrUserState {
+            ticket_key,
+            state: pr_state,
+        } => {
+            state
+                .cache
+                .lock()
+                .await
+                .set_pr_state(&ticket_key, &pr_state)?;
             Ok(Response::Ok)
         }
 
@@ -741,6 +909,8 @@ async fn dispatch(
             .await
         }
 
+        Request::ResetPullRequest { ticket_key } => reset_pull_request(&state, &ticket_key).await,
+
         Request::ListProjects => {
             // Re-read config every call so external edits show up.
             let cfg = GlobalConfig::load().unwrap_or_default();
@@ -763,7 +933,9 @@ async fn dispatch(
         Request::AddProject { path, nickname } => {
             let mut cfg = GlobalConfig::load().unwrap_or_default();
             if !cfg.add_project(path, nickname) {
-                return Ok(Response::Err { message: "project already in config".into() });
+                return Ok(Response::Err {
+                    message: "project already in config".into(),
+                });
             }
             cfg.save()?;
             // Re-suggest for every ticket the user hasn't already confirmed a project on.
@@ -776,7 +948,10 @@ async fn dispatch(
                 for k in keys {
                     let _ = state.suggest_tx.send(k).await;
                 }
-                info!(re_suggesting = queue, "queued re-suggestion after project add");
+                info!(
+                    re_suggesting = queue,
+                    "queued re-suggestion after project add"
+                );
             }
             Ok(Response::Ok)
         }
@@ -787,40 +962,63 @@ async fn dispatch(
                 cfg.save()?;
                 Ok(Response::Ok)
             } else {
-                Ok(Response::Err { message: "project not in config".into() })
+                Ok(Response::Err {
+                    message: "project not in config".into(),
+                })
             }
         }
 
-        Request::LinkProject { ticket_key, project_path } => {
+        Request::LinkProject {
+            ticket_key,
+            project_path,
+        } => {
             let canonical = std::fs::canonicalize(&project_path).unwrap_or(project_path);
-            state.cache.lock().await.link_project(&ticket_key, &canonical.display().to_string())?;
+            state
+                .cache
+                .lock()
+                .await
+                .link_project(&ticket_key, &canonical.display().to_string())?;
             let _ = state.impl_tx.send(ticket_key).await;
             Ok(Response::Ok)
         }
 
-        Request::UnlinkProject { ticket_key, project_path } => {
+        Request::UnlinkProject {
+            ticket_key,
+            project_path,
+        } => {
             let canonical = std::fs::canonicalize(&project_path).unwrap_or(project_path);
-            state.cache.lock().await.unlink_project(&ticket_key, &canonical.display().to_string())?;
+            state
+                .cache
+                .lock()
+                .await
+                .unlink_project(&ticket_key, &canonical.display().to_string())?;
             Ok(Response::Ok)
         }
 
         Request::ListTicketProjects { ticket_key } => {
             let cfg = GlobalConfig::load().unwrap_or_default();
             use std::collections::HashMap;
-            let states: HashMap<String, String> = state
-                .cache
-                .lock()
-                .await
-                .projects_for_ticket(&ticket_key)?
-                .into_iter()
+            let ticket = match state.jira.view(&ticket_key).await {
+                Ok(t) => Some(t),
+                Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
+            };
+            let rows = state.cache.lock().await.projects_for_ticket(&ticket_key)?;
+            let linked_paths: Vec<PathBuf> = rows
+                .iter()
+                .filter(|(_, s)| s == "confirmed" || s == "suggested")
+                .filter_map(|(p, _)| (p != "(none)").then(|| PathBuf::from(p)))
                 .collect();
+            let states: HashMap<String, String> = rows.into_iter().collect();
             let mut items: Vec<TicketProjectEntry> = cfg
                 .projects
                 .iter()
                 .map(|p| {
                     let kind = project_kind(&p.path);
                     let path_str = p.path.display().to_string();
-                    let state = states.get(&path_str).cloned().unwrap_or_else(|| "none".into());
+                    let state = states
+                        .get(&path_str)
+                        .cloned()
+                        .unwrap_or_else(|| "none".into());
                     TicketProjectEntry {
                         linked: state == "confirmed" || state == "suggested",
                         state,
@@ -833,9 +1031,38 @@ async fn dispatch(
                     }
                 })
                 .collect();
+            if let Some(ticket) = &ticket {
+                if let Some((path, _branch, _repo)) =
+                    existing_ticket_worktree(&cfg, ticket, &linked_paths)
+                {
+                    let path_str = path.display().to_string();
+                    if !items
+                        .iter()
+                        .any(|i| i.project.path.display().to_string() == path_str)
+                    {
+                        items.insert(
+                            0,
+                            TicketProjectEntry {
+                                linked: true,
+                                state: "worktree".into(),
+                                project: ProjectStatus {
+                                    path,
+                                    nickname: Some("worktree".into()),
+                                    available: true,
+                                    kind: "git-worktree".into(),
+                                },
+                            },
+                        );
+                    }
+                }
+            }
             // Synthetic "no clear match" row, present whenever the suggester ran but
             // didn't pick a project. Surfaced so the user can see claude was attempted.
-            if states.get("(none)").map(|s| s == "no_match").unwrap_or(false) {
+            if states
+                .get("(none)")
+                .map(|s| s == "no_match")
+                .unwrap_or(false)
+            {
                 items.push(TicketProjectEntry {
                     linked: true,
                     state: "no_match".into(),
@@ -850,16 +1077,30 @@ async fn dispatch(
             Ok(Response::TicketProjects { items })
         }
 
-        Request::ConfirmSuggestion { ticket_key, project_path } => {
+        Request::ConfirmSuggestion {
+            ticket_key,
+            project_path,
+        } => {
             let canonical = std::fs::canonicalize(&project_path).unwrap_or(project_path);
-            state.cache.lock().await.confirm_suggestion(&ticket_key, &canonical.display().to_string())?;
+            state
+                .cache
+                .lock()
+                .await
+                .confirm_suggestion(&ticket_key, &canonical.display().to_string())?;
             let _ = state.impl_tx.send(ticket_key).await;
             Ok(Response::Ok)
         }
 
-        Request::RejectSuggestion { ticket_key, project_path } => {
+        Request::RejectSuggestion {
+            ticket_key,
+            project_path,
+        } => {
             let canonical = std::fs::canonicalize(&project_path).unwrap_or(project_path);
-            state.cache.lock().await.reject_suggestion(&ticket_key, &canonical.display().to_string())?;
+            state
+                .cache
+                .lock()
+                .await
+                .reject_suggestion(&ticket_key, &canonical.display().to_string())?;
             Ok(Response::Ok)
         }
 
@@ -875,7 +1116,9 @@ async fn dispatch(
                     project_paths,
                     updated_at,
                 }),
-                None => Ok(Response::Err { message: "no implementation cached yet".into() }),
+                None => Ok(Response::Err {
+                    message: "no implementation cached yet".into(),
+                }),
             }
         }
 
@@ -884,13 +1127,40 @@ async fn dispatch(
             Ok(Response::Queued)
         }
 
-        Request::GetClaudeSession { ticket_key } => {
-            let id = state.cache.lock().await.get_claude_session(&ticket_key)?;
-            Ok(Response::ClaudeSession { session_id: id })
+        Request::GetAssistantSession {
+            ticket_key,
+            assistant,
+        } => {
+            let id = state
+                .cache
+                .lock()
+                .await
+                .get_assistant_session(&ticket_key, &assistant)?;
+            Ok(Response::AssistantSession { session_id: id })
         }
 
-        Request::SaveClaudeSession { ticket_key, session_id } => {
-            state.cache.lock().await.set_claude_session(&ticket_key, &session_id)?;
+        Request::SaveAssistantSession {
+            ticket_key,
+            assistant,
+            session_id,
+        } => {
+            state
+                .cache
+                .lock()
+                .await
+                .set_assistant_session(&ticket_key, &assistant, &session_id)?;
+            Ok(Response::Ok)
+        }
+
+        Request::ClearAssistantSession {
+            ticket_key,
+            assistant,
+        } => {
+            state
+                .cache
+                .lock()
+                .await
+                .clear_assistant_session(&ticket_key, &assistant)?;
             Ok(Response::Ok)
         }
 
@@ -902,9 +1172,10 @@ async fn dispatch(
             };
             // Run in a blocking thread because file walks can be slow on big trees.
             let depth = max_depth.max(1) as usize;
-            let items = tokio::task::spawn_blocking(move || jui_core::scm::find_repos(&root, depth))
-                .await
-                .map_err(|e| anyhow::anyhow!("scan task failed: {e}"))?;
+            let items =
+                tokio::task::spawn_blocking(move || jui_core::scm::find_repos(&root, depth))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("scan task failed: {e}"))?;
             Ok(Response::Repos { items })
         }
 
@@ -912,12 +1183,8 @@ async fn dispatch(
             // Snapshot the pre-transition status so the rules engine can fire
             // with both `from_status` and `to_status` populated. Cache-only
             // read — a live Jira fetch would race the transition itself.
-            let prior_status = state
-                .cache
-                .lock()
-                .await
-                .get_ticket(&key)?
-                .map(|t| t.status);
+            let prior_status = state.cache.lock().await.get_ticket(&key)?.map(|t| t.status);
+            info!(%key, transition = %to, prior = ?prior_status, "firing jira transition (by name)");
             state.jira.transition(&key, &to).await?;
             let s2 = state.clone();
             let k2 = key.clone();
@@ -937,14 +1204,60 @@ async fn dispatch(
                         ticket_project_key: project,
                         from_status: prior,
                         to_status: Some(to_clone),
-                        has_linked_repo: !s2.cache.lock().await.linked_paths(&k2).unwrap_or_default().is_empty(),
+                        has_linked_repo: !s2
+                            .cache
+                            .lock()
+                            .await
+                            .linked_paths(&k2)
+                            .unwrap_or_default()
+                            .is_empty(),
                         actor_is_me: true,
                         ..Default::default()
                     },
                 )
                 .await;
-                refresh_ticket_after_mutation(&s2, &k2).await;
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
             });
+            Ok(Response::Ok)
+        }
+
+        Request::TransitionToStatus { key, status } => {
+            let prior_status = state.cache.lock().await.get_ticket(&key)?.map(|t| t.status);
+            let changed = transition_toward_status(&state, &key, &status).await?;
+            if changed {
+                let s2 = state.clone();
+                let k2 = key.clone();
+                let project = key.split('-').next().map(str::to_string);
+                let prior = prior_status.clone();
+                let status_clone = status.clone();
+                tokio::spawn(async move {
+                    fire_rules(
+                        &s2,
+                        jui_core::rules::Trigger::TicketStatusChanged {
+                            from: prior.clone(),
+                            to: Some(status_clone.clone()),
+                        },
+                        jui_core::rules::RuleContext {
+                            ticket_key: Some(k2.clone()),
+                            ticket_status: Some(status_clone.clone()),
+                            ticket_project_key: project,
+                            from_status: prior,
+                            to_status: Some(status_clone),
+                            has_linked_repo: !s2
+                                .cache
+                                .lock()
+                                .await
+                                .linked_paths(&k2)
+                                .unwrap_or_default()
+                                .is_empty(),
+                            actor_is_me: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    let _ = refresh_ticket_after_mutation(&s2, &k2).await;
+                });
+            }
             Ok(Response::Ok)
         }
 
@@ -975,7 +1288,11 @@ async fn dispatch(
             Ok(Response::PrDraft { draft })
         }
         Request::SavePrDraft { ticket_key, draft } => {
-            state.cache.lock().await.upsert_pr_draft(&ticket_key, &draft)?;
+            state
+                .cache
+                .lock()
+                .await
+                .upsert_pr_draft(&ticket_key, &draft)?;
             Ok(Response::Ok)
         }
         Request::DeletePrDraft { ticket_key } => {
@@ -985,41 +1302,45 @@ async fn dispatch(
 
         Request::ListWorktreeRemotes { ticket_key } => {
             // Resolve worktree (with project-root fallback, like /review).
-            let project_path = {
+            let linked_paths = {
                 let cache = state.cache.lock().await;
-                cache.linked_paths(&ticket_key)?.into_iter().next()
+                cache.linked_paths(&ticket_key)?
             };
-            let Some(project_path) = project_path else {
+            if linked_paths.is_empty() {
                 return Ok(Response::Err {
                     message: format!("no linked project for {ticket_key}"),
                 });
-            };
+            }
             let ticket = match state.jira.view(&ticket_key).await {
                 Ok(t) => Some(t),
                 Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
             };
+            let cfg = GlobalConfig::load().unwrap_or_default();
             let path = ticket
                 .as_ref()
-                .and_then(|t| jui_core::scm::worktree_path_for_slug(&project_path, &t.branch_slug()))
-                .filter(|w| w.exists())
-                .unwrap_or(project_path);
+                .and_then(|t| resolve_ticket_work_dir(&cfg, t, &linked_paths))
+                .or_else(|| linked_paths.first().cloned())
+                .expect("linked_paths checked non-empty");
             let items = jui_core::github::list_remotes(&path).await?;
             Ok(Response::Remotes { items })
         }
 
         Request::GetPushRemote { ticket_key } => {
-            let project_path = {
+            let linked_paths = {
                 let cache = state.cache.lock().await;
-                cache.linked_paths(&ticket_key)?.into_iter().next()
+                cache.linked_paths(&ticket_key)?
             };
-            let Some(p) = project_path else {
+            let Some(p) = linked_paths.into_iter().next() else {
                 return Ok(Response::PushRemote { name: None });
             };
             let name = state.cache.lock().await.get_push_remote(&p)?;
             Ok(Response::PushRemote { name })
         }
 
-        Request::SetPushRemote { ticket_key, remote_name } => {
+        Request::SetPushRemote {
+            ticket_key,
+            remote_name,
+        } => {
             let project_path = {
                 let cache = state.cache.lock().await;
                 cache.linked_paths(&ticket_key)?.into_iter().next()
@@ -1039,38 +1360,42 @@ async fn dispatch(
             // is missing so `/review` still works on tickets the user hasn't
             // explicitly `s`-started (or whose summary changed after the
             // worktree was created and no longer matches the slug).
-            let project_path = {
+            let linked_paths = {
                 let cache = state.cache.lock().await;
-                cache.linked_paths(&ticket_key)?.into_iter().next()
+                cache.linked_paths(&ticket_key)?
             };
             let ticket = match state.jira.view(&ticket_key).await {
                 Ok(t) => Some(t),
                 Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
             };
-            let Some(project_path) = project_path else {
+            if linked_paths.is_empty() {
                 return Ok(Response::Err {
-                    message: format!(
-                        "no linked project for {ticket_key} — link a repo (L) first"
-                    ),
+                    message: format!("no linked project for {ticket_key} — link a repo (L) first"),
                 });
-            };
+            }
+            let cfg = GlobalConfig::load().unwrap_or_default();
             let worktree = ticket
                 .as_ref()
-                .and_then(|t| jui_core::scm::worktree_path_for_slug(&project_path, &t.branch_slug()))
-                .filter(|w| w.exists())
-                .unwrap_or(project_path);
+                .and_then(|t| resolve_ticket_work_dir(&cfg, t, &linked_paths))
+                .or_else(|| linked_paths.first().cloned())
+                .expect("linked_paths checked non-empty");
             // Reuse the ticket's Claude session so the review turn lands in
             // the same conversation history fix-sessions resume into.
-            let (session_id, resume) = match state.cache.lock().await.get_claude_session(&ticket_key)? {
-                Some(id) => (id, true),
-                None => {
-                    let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
-                    state.cache.lock().await.set_claude_session(&ticket_key, &new_id)?;
-                    (new_id, false)
-                }
-            };
+            let (session_id, resume) =
+                match state.cache.lock().await.get_claude_session(&ticket_key)? {
+                    Some(id) => (id, true),
+                    None => {
+                        let new_id = std::fs::read_to_string("/proc/sys/kernel/random/uuid")
+                            .map(|s| s.trim().to_string())
+                            .unwrap_or_else(|_| chrono::Utc::now().timestamp_micros().to_string());
+                        state
+                            .cache
+                            .lock()
+                            .await
+                            .set_claude_session(&ticket_key, &new_id)?;
+                        (new_id, false)
+                    }
+                };
             let markdown = jui_core::claude::code_review(&session_id, resume, &worktree).await?;
             Ok(Response::ReviewOutput { markdown })
         }
@@ -1081,28 +1406,38 @@ async fn dispatch(
             // otherwise falls back to the linked project root so downstream
             // flows (PR-comment chat, fix-sessions) still have a sensible
             // cwd to spawn Claude in.
-            let project_path = {
+            let linked_paths = {
                 let cache = state.cache.lock().await;
-                cache.linked_paths(&ticket_key)?.into_iter().next()
+                cache.linked_paths(&ticket_key)?
             };
             let ticket = match state.jira.view(&ticket_key).await {
                 Ok(t) => Some(t),
                 Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
             };
-            let path = project_path.map(|p| {
-                ticket
-                    .as_ref()
-                    .and_then(|t| jui_core::scm::worktree_path_for_slug(&p, &t.branch_slug()))
-                    .filter(|w| w.exists())
-                    .unwrap_or(p)
-            });
+            let cfg = GlobalConfig::load().unwrap_or_default();
+            let path = ticket
+                .as_ref()
+                .and_then(|t| resolve_ticket_work_dir(&cfg, t, &linked_paths))
+                .or_else(|| linked_paths.first().cloned());
             Ok(Response::TicketWorktree { path })
         }
 
-        Request::CreateTicket { project, issue_type, summary, body, parent } => {
+        Request::CreateTicket {
+            project,
+            issue_type,
+            summary,
+            body,
+            parent,
+        } => {
             let key = state
                 .jira
-                .create(&project, &issue_type, &summary, body.as_deref(), parent.as_deref())
+                .create(
+                    &project,
+                    &issue_type,
+                    &summary,
+                    body.as_deref(),
+                    parent.as_deref(),
+                )
                 .await?;
             // Pull the new ticket into cache + refresh the parent's view so its
             // subtasks list updates without waiting for the next poll tick.
@@ -1110,9 +1445,9 @@ async fn dispatch(
             let k2 = key.clone();
             let parent_key = parent.clone();
             tokio::spawn(async move {
-                refresh_ticket_after_mutation(&s2, &k2).await;
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
                 if let Some(p) = parent_key {
-                    refresh_ticket_after_mutation(&s2, &p).await;
+                    let _ = refresh_ticket_after_mutation(&s2, &p).await;
                 }
             });
             Ok(Response::Created { key })
@@ -1132,7 +1467,15 @@ async fn dispatch(
             // List the ticket's transitions, pick the first archive-like one, fire it.
             let api = JiraApi::from_jira_cli_config()?;
             let items = api.list_transitions(&key).await?;
-            let prefs = ["archive", "won't do", "wont do", "cancelled", "canceled", "closed", "done"];
+            let prefs = [
+                "archive",
+                "won't do",
+                "wont do",
+                "cancelled",
+                "canceled",
+                "closed",
+                "done",
+            ];
             let target = prefs.iter().find_map(|want| {
                 items.iter().find(|tr| {
                     tr.to_status
@@ -1143,9 +1486,10 @@ async fn dispatch(
                 })
             });
             let Some(tr) = target else {
-                let names: Vec<String> = items.iter().map(|t| {
-                    format!("{} → {}", t.name, t.to_status.clone().unwrap_or_default())
-                }).collect();
+                let names: Vec<String> = items
+                    .iter()
+                    .map(|t| format!("{} → {}", t.name, t.to_status.clone().unwrap_or_default()))
+                    .collect();
                 return Ok(Response::Err {
                     message: format!(
                         "no archive-like transition for {key}. available: {}",
@@ -1224,18 +1568,39 @@ async fn dispatch(
                     },
                 )
                 .await;
-                refresh_ticket_after_mutation(&s2, &k2).await;
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
             });
             Ok(Response::Ok)
         }
 
         Request::SetReviewer { key, assignee_id } => {
             let api = JiraApi::from_jira_cli_config()?;
-            api.set_reviewer(&key, &assignee_id, &state.config.jira.reviewer_customfield).await?;
+            api.set_reviewer(&key, &assignee_id, &state.config.jira.reviewer_customfield)
+                .await?;
             let s2 = state.clone();
             let k2 = key.clone();
             tokio::spawn(async move {
-                refresh_ticket_after_mutation(&s2, &k2).await;
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
+                refresh_my_mentions(&s2).await;
+            });
+            Ok(Response::Ok)
+        }
+
+        Request::SetDevQa { key, assignee_id } => {
+            let field = state.config.jira.devqa_customfield.trim();
+            if field.is_empty() {
+                return Ok(Response::Err {
+                    message:
+                        "jira.devqa_customfield is empty - set it in ~/.config/jui/config.toml"
+                            .into(),
+                });
+            }
+            let api = JiraApi::from_jira_cli_config()?;
+            api.set_reviewer(&key, &assignee_id, field).await?;
+            let s2 = state.clone();
+            let k2 = key.clone();
+            tokio::spawn(async move {
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
                 refresh_my_mentions(&s2).await;
             });
             Ok(Response::Ok)
@@ -1243,47 +1608,50 @@ async fn dispatch(
 
         Request::EditSummary { key, summary } => {
             state.jira.edit_summary(&key, &summary).await?;
-            let s2 = state.clone();
-            let k2 = key.clone();
-            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            refresh_ticket_after_mutation(&state, &key).await?;
             Ok(Response::Ok)
         }
 
         Request::EditDescription { key, body } => {
-            state.jira.edit_description(&key, &body).await?;
-            let s2 = state.clone();
-            let k2 = key.clone();
-            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            let api = JiraApi::from_jira_cli_config()?;
+            api.set_description(&key, &body).await?;
+            refresh_ticket_after_mutation(&state, &key).await?;
             Ok(Response::Ok)
         }
 
         Request::ImproveDescription { summary, body } => {
-            info!(summary_len = summary.len(), body_len = body.len(), "claude tighten requested");
+            info!(
+                summary_len = summary.len(),
+                body_len = body.len(),
+                "claude tighten requested"
+            );
             let improved = jui_core::claude::improve_description(&summary, &body).await?;
             info!(out_len = improved.len(), "claude tighten done");
             Ok(Response::Improved { body: improved })
         }
 
-        Request::ImprovePrBody { ticket_key, title, body } => {
+        Request::ImprovePrBody {
+            ticket_key,
+            title,
+            body,
+        } => {
             // Resolve a working dir for the diff: per-ticket worktree if it
             // exists, otherwise the first linked project root. Empty `diff`
             // falls through to a diff-less prompt rather than erroring — user
             // still gets a tighten, just without ground truth.
-            let project_path = {
+            let linked_paths = {
                 let cache = state.cache.lock().await;
-                cache.linked_paths(&ticket_key)?.into_iter().next()
+                cache.linked_paths(&ticket_key)?
             };
             let ticket = match state.jira.view(&ticket_key).await {
                 Ok(t) => Some(t),
                 Err(_) => state.cache.lock().await.get_ticket(&ticket_key)?,
             };
-            let work_dir: Option<std::path::PathBuf> = project_path.map(|p| {
-                ticket
-                    .as_ref()
-                    .and_then(|t| jui_core::scm::worktree_path_for_slug(&p, &t.branch_slug()))
-                    .filter(|w| w.exists())
-                    .unwrap_or(p)
-            });
+            let cfg = GlobalConfig::load().unwrap_or_default();
+            let work_dir: Option<std::path::PathBuf> = ticket
+                .as_ref()
+                .and_then(|t| resolve_ticket_work_dir(&cfg, t, &linked_paths))
+                .or_else(|| linked_paths.first().cloned());
             let diff = work_dir
                 .as_deref()
                 .and_then(|d| pr_diff_against_default(d).ok())
@@ -1306,7 +1674,9 @@ async fn dispatch(
             api.set_priority(&key, &priority).await?;
             let s2 = state.clone();
             let k2 = key.clone();
-            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            tokio::spawn(async move {
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
 
@@ -1316,17 +1686,37 @@ async fn dispatch(
             Ok(Response::Priorities { items })
         }
 
-        Request::SetEstimate { key, original, remaining } => {
+        Request::SetEstimate {
+            key,
+            original,
+            remaining,
+        } => {
             let api = JiraApi::from_jira_cli_config()?;
-            api.set_estimate(&key, original.as_deref(), remaining.as_deref()).await?;
+            api.set_estimate(&key, original.as_deref(), remaining.as_deref())
+                .await?;
             let s2 = state.clone();
             let k2 = key.clone();
-            tokio::spawn(async move { refresh_ticket_after_mutation(&s2, &k2).await; });
+            tokio::spawn(async move {
+                let _ = refresh_ticket_after_mutation(&s2, &k2).await;
+            });
             Ok(Response::Ok)
         }
 
-        Request::LogWork { key, time_spent, comment, new_estimate } => {
-            state.jira.worklog_add(&key, &time_spent, comment.as_deref(), new_estimate.as_deref()).await?;
+        Request::LogWork {
+            key,
+            time_spent,
+            comment,
+            new_estimate,
+        } => {
+            state
+                .jira
+                .worklog_add(
+                    &key,
+                    &time_spent,
+                    comment.as_deref(),
+                    new_estimate.as_deref(),
+                )
+                .await?;
             Ok(Response::Ok)
         }
 
@@ -1339,12 +1729,14 @@ async fn dispatch(
         Request::Status => {
             let cache = state.cache.lock().await;
             let count = cache.known_keys().map(|v| v.len()).unwrap_or(0);
-            Ok(Response::Status { status: DaemonStatus {
-                pid: std::process::id(),
-                started_at: state.started_at.to_rfc3339(),
-                last_poll_at: state.last_poll.read().await.map(|t| t.to_rfc3339()),
-                cached_tickets: count,
-            } })
+            Ok(Response::Status {
+                status: DaemonStatus {
+                    pid: std::process::id(),
+                    started_at: state.started_at.to_rfc3339(),
+                    last_poll_at: state.last_poll.read().await.map(|t| t.to_rfc3339()),
+                    cached_tickets: count,
+                },
+            })
         }
 
         Request::Shutdown => {
@@ -1364,7 +1756,10 @@ async fn dispatch(
 
         Request::ListTeams => {
             let raw = state.cache.lock().await.list_teams()?;
-            let items = raw.into_iter().map(|(name, members)| jui_core::ipc::TeamEntry { name, members }).collect();
+            let items = raw
+                .into_iter()
+                .map(|(name, members)| jui_core::ipc::TeamEntry { name, members })
+                .collect();
             Ok(Response::Teams { items })
         }
 
@@ -1383,7 +1778,10 @@ async fn dispatch(
                 let api = ConfluenceApi::from_jira_config()?;
                 let spaces = api.list_spaces().await?;
                 state.cache.lock().await.upsert_confluence_spaces(&spaces)?;
-                return Ok(Response::ConfluenceSpaces { items: spaces, from_cache: false });
+                return Ok(Response::ConfluenceSpaces {
+                    items: spaces,
+                    from_cache: false,
+                });
             }
 
             // Serve cache immediately; refresh in background if stale.
@@ -1397,14 +1795,28 @@ async fn dispatch(
                     }
                 });
             }
-            Ok(Response::ConfluenceSpaces { items: cached, from_cache: true })
+            Ok(Response::ConfluenceSpaces {
+                items: cached,
+                from_cache: true,
+            })
         }
 
-        Request::ConfluenceListPages { space_key, parent_id } => {
+        Request::ConfluenceListPages {
+            space_key,
+            parent_id,
+        } => {
             const STALE_SECS: u64 = 900;
             let pid = parent_id.as_deref();
-            let cached = state.cache.lock().await.get_confluence_pages(&space_key, pid)?;
-            let age = state.cache.lock().await.confluence_pages_age_secs(&space_key, pid)?;
+            let cached = state
+                .cache
+                .lock()
+                .await
+                .get_confluence_pages(&space_key, pid)?;
+            let age = state
+                .cache
+                .lock()
+                .await
+                .confluence_pages_age_secs(&space_key, pid)?;
 
             if cached.is_empty() {
                 let api = ConfluenceApi::from_jira_config()?;
@@ -1412,8 +1824,15 @@ async fn dispatch(
                     Some(id) => api.get_children(id).await?,
                     None => api.list_pages(&space_key).await?,
                 };
-                state.cache.lock().await.upsert_confluence_pages(&space_key, pid, &pages)?;
-                return Ok(Response::ConfluencePages { items: pages, from_cache: false });
+                state
+                    .cache
+                    .lock()
+                    .await
+                    .upsert_confluence_pages(&space_key, pid, &pages)?;
+                return Ok(Response::ConfluencePages {
+                    items: pages,
+                    from_cache: false,
+                });
             }
 
             if age.map(|a| a > STALE_SECS).unwrap_or(true) {
@@ -1428,12 +1847,19 @@ async fn dispatch(
                             None => api.list_pages(&sk).await,
                         };
                         if let Ok(pages) = result {
-                            let _ = state2.cache.lock().await.upsert_confluence_pages(&sk, pid2, &pages);
+                            let _ = state2
+                                .cache
+                                .lock()
+                                .await
+                                .upsert_confluence_pages(&sk, pid2, &pages);
                         }
                     }
                 });
             }
-            Ok(Response::ConfluencePages { items: cached, from_cache: true })
+            Ok(Response::ConfluencePages {
+                items: cached,
+                from_cache: true,
+            })
         }
     }
 }
@@ -1441,11 +1867,17 @@ async fn dispatch(
 async fn warm_confluence_cache(state: &State) {
     let api = match ConfluenceApi::from_jira_config() {
         Ok(a) => a,
-        Err(e) => { warn!("confluence config missing, skipping warmup: {e:#}"); return; }
+        Err(e) => {
+            warn!("confluence config missing, skipping warmup: {e:#}");
+            return;
+        }
     };
     let spaces = match api.list_spaces().await {
         Ok(s) => s,
-        Err(e) => { warn!("confluence spaces warmup failed: {e:#}"); return; }
+        Err(e) => {
+            warn!("confluence spaces warmup failed: {e:#}");
+            return;
+        }
     };
     if let Err(e) = state.cache.lock().await.upsert_confluence_spaces(&spaces) {
         warn!("storing confluence spaces: {e:#}");
@@ -1463,27 +1895,41 @@ async fn warm_confluence_cache(state: &State) {
                 continue;
             }
         };
-        if let Err(e) = state.cache.lock().await.upsert_confluence_pages(&space.key, None, &roots) {
+        if let Err(e) = state
+            .cache
+            .lock()
+            .await
+            .upsert_confluence_pages(&space.key, None, &roots)
+        {
             warn!(space = %space.key, "storing root pages: {e:#}");
             continue;
         }
         let mut total = roots.len();
-        let mut frontier: Vec<(String, usize)> =
-            roots.iter().filter(|p| p.has_children).map(|p| (p.id.clone(), 1)).collect();
+        let mut frontier: Vec<(String, usize)> = roots
+            .iter()
+            .filter(|p| p.has_children)
+            .map(|p| (p.id.clone(), 1))
+            .collect();
         while let Some((pid, depth)) = frontier.pop() {
-            if depth > MAX_DEPTH { continue; }
+            if depth > MAX_DEPTH {
+                continue;
+            }
             tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             match api.get_children(&pid).await {
                 Ok(children) => {
-                    if let Err(e) = state.cache.lock().await
-                        .upsert_confluence_pages(&space.key, Some(&pid), &children)
-                    {
+                    if let Err(e) = state.cache.lock().await.upsert_confluence_pages(
+                        &space.key,
+                        Some(&pid),
+                        &children,
+                    ) {
                         warn!(parent = %pid, "storing children: {e:#}");
                         continue;
                     }
                     total += children.len();
                     for c in &children {
-                        if c.has_children { frontier.push((c.id.clone(), depth + 1)); }
+                        if c.has_children {
+                            frontier.push((c.id.clone(), depth + 1));
+                        }
                     }
                 }
                 Err(e) => warn!(parent = %pid, "fetching children failed: {e:#}"),
@@ -1503,7 +1949,10 @@ async fn warm_ticket_ancestors(state: &State) {
     // is a cache hit. Then walk parent chains for ancestors.
     let initial = match state.cache.lock().await.list_tickets(10_000) {
         Ok(t) => t,
-        Err(e) => { warn!("ancestor warmup: list_tickets failed: {e:#}"); return; }
+        Err(e) => {
+            warn!("ancestor warmup: list_tickets failed: {e:#}");
+            return;
+        }
     };
     let initial_keys: Vec<String> = initial.iter().map(|t| t.key.clone()).collect();
     let mut seen: HashSet<String> = initial_keys.iter().cloned().collect();
@@ -1515,13 +1964,22 @@ async fn warm_ticket_ancestors(state: &State) {
         match state.jira.view(&key).await {
             Ok(t) => {
                 let next = t.parent_key.clone();
-                if let Err(e) = state.cache.lock().await.upsert_tickets(std::slice::from_ref(&t)) {
+                if let Err(e) = state
+                    .cache
+                    .lock()
+                    .await
+                    .upsert_tickets(std::slice::from_ref(&t))
+                {
                     warn!(key = %key, "cache upsert failed: {e:#}");
                 }
                 fetched += 1;
-                if !was_initial { ancestors_added += 1; }
+                if !was_initial {
+                    ancestors_added += 1;
+                }
                 if let Some(n) = next {
-                    if seen.insert(n.clone()) { queue.push(n); }
+                    if seen.insert(n.clone()) {
+                        queue.push(n);
+                    }
                 }
             }
             Err(e) => warn!(key = %key, "view failed: {e:#}"),
@@ -1534,13 +1992,118 @@ async fn warm_ticket_ancestors(state: &State) {
 
 /// Re-fetch a single ticket's view + comments from Jira and update the cache.
 /// Used after mutations so the next cache read sees fresh data.
-async fn refresh_ticket_after_mutation(state: &State, key: &str) {
-    if let Ok(t) = state.jira.view(key).await {
-        if let Err(e) = state.cache.lock().await.upsert_tickets(std::slice::from_ref(&t)) {
-            warn!(%key, "post-mutation ticket upsert: {e:#}");
-        }
-    }
+async fn refresh_ticket_after_mutation(state: &State, key: &str) -> Result<()> {
+    let t = state.jira.view(key).await?;
+    state
+        .cache
+        .lock()
+        .await
+        .upsert_tickets(std::slice::from_ref(&t))?;
     refresh_comments(state, key).await;
+    Ok(())
+}
+
+/// Exact (case-insensitive) match on the transition's destination status.
+/// This is the strict match the web UI semantically uses: clicking the
+/// "In Progress" button fires a transition whose `to_status` is exactly
+/// "In Progress", not one that merely contains the substring.
+fn transition_matches_exact(tr: &jui_core::jira_api::TransitionOption, target: &str) -> bool {
+    tr.to_status
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case(target))
+        .unwrap_or(false)
+}
+
+/// Loose match: substring on `to_status` or on the transition `name`.
+/// Used only as a fallback when no exact `to_status` candidate exists,
+/// for workflows that name their destinations oddly.
+fn transition_matches_fuzzy(tr: &jui_core::jira_api::TransitionOption, target: &str) -> bool {
+    let needle = target.to_ascii_lowercase();
+    tr.to_status
+        .as_deref()
+        .map(|s| s.to_ascii_lowercase().contains(&needle))
+        .unwrap_or(false)
+        || tr.name.to_ascii_lowercase().contains(&needle)
+}
+
+/// Pick the best transition for `target` from `transitions`.
+///
+/// Resolution order:
+///   1. Transitions whose `to_status` equals `target` (case-insensitive).
+///      Among these, prefer the one whose `name` equals `target`, then
+///      one whose `name` equals its own `to_status` (e.g. a transition
+///      named "In Progress" landing on "In Progress"). This avoids
+///      grabbing a sibling transition like "Restart Work" that lands
+///      on the same status but has different server-side post-functions
+///      (Jira automations) wired up to it.
+///   2. Fuzzy `contains` match as a last resort.
+///
+/// Logs all candidates at WARN when more than one exact match exists so
+/// the user can see in `/tmp/jui.log` which transition jui picked vs.
+/// what the web UI would have picked.
+fn pick_transition<'a>(
+    transitions: &'a [jui_core::jira_api::TransitionOption],
+    target: &str,
+    ticket_key: &str,
+) -> Option<&'a jui_core::jira_api::TransitionOption> {
+    let exact: Vec<&jui_core::jira_api::TransitionOption> = transitions
+        .iter()
+        .filter(|tr| transition_matches_exact(tr, target))
+        .collect();
+    if exact.len() > 1 {
+        let names: Vec<&str> = exact.iter().map(|tr| tr.name.as_str()).collect();
+        warn!(
+            %ticket_key,
+            %target,
+            candidates = ?names,
+            "multiple transitions land on target status; picking the most natural one"
+        );
+    }
+    if let Some(tr) = exact.iter().find(|tr| tr.name.eq_ignore_ascii_case(target)) {
+        return Some(*tr);
+    }
+    if let Some(tr) = exact.iter().find(|tr| {
+        tr.to_status
+            .as_deref()
+            .map(|s| tr.name.eq_ignore_ascii_case(s))
+            .unwrap_or(false)
+    }) {
+        return Some(*tr);
+    }
+    if let Some(tr) = exact.first() {
+        return Some(*tr);
+    }
+    transitions
+        .iter()
+        .find(|tr| transition_matches_fuzzy(tr, target))
+}
+
+async fn transition_toward_status(state: &State, ticket_key: &str, target: &str) -> Result<bool> {
+    let api = JiraApi::from_jira_cli_config()?;
+    let target = target.trim();
+    if target.is_empty() {
+        return Ok(false);
+    }
+    for step in 0..5 {
+        let transitions = api.list_transitions(ticket_key).await.unwrap_or_default();
+        if let Some(tr) = pick_transition(&transitions, target, ticket_key) {
+            state.jira.transition(ticket_key, &tr.name).await?;
+            info!(%ticket_key, %target, transition = %tr.name, to = ?tr.to_status, step, "transitioned toward target");
+            return Ok(true);
+        }
+        let Some(next) = transitions
+            .iter()
+            .find(|tr| tr.name.eq_ignore_ascii_case("Next"))
+        else {
+            warn!(%ticket_key, %target, available = ?transitions, "no matching transition available");
+            return Ok(false);
+        };
+        state.jira.transition(ticket_key, &next.name).await?;
+        info!(%ticket_key, %target, to = ?next.to_status, step, "advanced via Next while seeking target");
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    warn!(%ticket_key, %target, "gave up seeking transition target after step limit");
+    Ok(false)
 }
 
 /// Re-fetch the three PR comment surfaces for a ticket and persist the
@@ -1550,7 +2113,10 @@ async fn refresh_pr_comments_for_ticket(state: &State, ticket_key: &str) {
     let meta = match state.cache.lock().await.get_ticket_pr_meta(ticket_key) {
         Ok(Some(m)) => m,
         Ok(None) => return,
-        Err(e) => { warn!(%ticket_key, "pr_meta lookup: {e:#}"); return; }
+        Err(e) => {
+            warn!(%ticket_key, "pr_meta lookup: {e:#}");
+            return;
+        }
     };
     let (repo, number) = meta;
     let mut merged: Vec<jui_core::github::FetchedComment> = Vec::new();
@@ -1575,13 +2141,20 @@ async fn refresh_pr_comments_for_ticket(state: &State, ticket_key: &str) {
     merged.sort_by(|a, b| a.created.cmp(&b.created));
     // We need the pr_url to satisfy upsert_pr_comments — pull it from the
     // ticket_prs row written when the PR was created.
-    let pr_url = state.cache.lock().await.get_ticket_pr_url(ticket_key)
-        .ok().flatten().unwrap_or_else(|| {
-            format!("https://github.com/{repo}/pull/{number}")
-        });
-    if let Err(e) = state.cache.lock().await.upsert_pr_comments(
-        ticket_key, &pr_url, number, &repo, &merged,
-    ) {
+    let pr_url = state
+        .cache
+        .lock()
+        .await
+        .get_ticket_pr_url(ticket_key)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| format!("https://github.com/{repo}/pull/{number}"));
+    if let Err(e) = state
+        .cache
+        .lock()
+        .await
+        .upsert_pr_comments(ticket_key, &pr_url, number, &repo, &merged)
+    {
         warn!(%ticket_key, "pr comments upsert after reply: {e:#}");
     }
 }
@@ -1603,7 +2176,10 @@ async fn refresh_comments(state: &State, key: &str) {
 async fn warm_comments(state: &State) {
     let keys: Vec<String> = match state.cache.lock().await.list_tickets(10_000) {
         Ok(t) => t.into_iter().map(|x| x.key).collect(),
-        Err(e) => { warn!("comment warmup: list_tickets failed: {e:#}"); return; }
+        Err(e) => {
+            warn!("comment warmup: list_tickets failed: {e:#}");
+            return;
+        }
     };
     let total = keys.len();
     let mut fetched = 0usize;
@@ -1622,11 +2198,17 @@ async fn warm_comments(state: &State) {
 async fn refresh_my_mentions(state: &State) {
     let api = match JiraApi::from_jira_cli_config() {
         Ok(a) => a,
-        Err(e) => { warn!("mentions refresh: api config: {e:#}"); return; }
+        Err(e) => {
+            warn!("mentions refresh: api config: {e:#}");
+            return;
+        }
     };
     let me = match api.myself().await {
         Ok(m) => m,
-        Err(e) => { warn!("mentions refresh: myself: {e:#}"); return; }
+        Err(e) => {
+            warn!("mentions refresh: myself: {e:#}");
+            return;
+        }
     };
     let display = me.display_name.replace('"', "\\\"");
     let cf_id = state
@@ -1639,11 +2221,18 @@ async fn refresh_my_mentions(state: &State) {
     let reviewer_jql = format!(
         "cf[{cf_id}] = currentUser() AND assignee != currentUser() AND statusCategory != Done"
     );
-    let mention_jql = format!(
-        "text ~ \"@{display}\" AND assignee != currentUser() AND statusCategory != Done"
-    );
-    let reviewing = state.jira.search(&reviewer_jql, 50).await.unwrap_or_default();
-    let mut mentioned = state.jira.search(&mention_jql, 50).await.unwrap_or_default();
+    let mention_jql =
+        format!("text ~ \"@{display}\" AND assignee != currentUser() AND statusCategory != Done");
+    let reviewing = state
+        .jira
+        .search(&reviewer_jql, 50)
+        .await
+        .unwrap_or_default();
+    let mut mentioned = state
+        .jira
+        .search(&mention_jql, 50)
+        .await
+        .unwrap_or_default();
     let reviewer_keys: std::collections::HashSet<String> =
         reviewing.iter().map(|t| t.key.clone()).collect();
     mentioned.retain(|t| !reviewer_keys.contains(&t.key));
@@ -1659,7 +2248,11 @@ async fn refresh_my_mentions(state: &State) {
         let _ = cache.upsert_mentions("reviewer", &r_keys);
         let _ = cache.upsert_mentions("mentioned", &m_keys);
     }
-    info!(reviewing = reviewing.len(), mentioned = mentioned.len(), "mentions refreshed");
+    info!(
+        reviewing = reviewing.len(),
+        mentioned = mentioned.len(),
+        "mentions refreshed"
+    );
 }
 
 /// End-to-end PR open: discover worktree → push → gh pr create → request
@@ -1676,15 +2269,17 @@ async fn create_pull_request(
     use jui_core::github;
     use jui_core::users_map::UsersMap;
 
-    // 1. Look up the worktree path. The ticket's branch_slug() drives the
-    //    canonical path. We fall back to scanning git worktrees if that path
-    //    doesn't exist (in case the user changed the slug).
+    // 1. Look up the worktree path. Prefer a registered git worktree for this
+    //    ticket (including edited branch names), then fall back to the linked repo.
     let ticket = match state.jira.view(ticket_key).await {
         Ok(t) => t,
-        Err(_) => state.cache.lock().await.get_ticket(ticket_key)?
+        Err(_) => state
+            .cache
+            .lock()
+            .await
+            .get_ticket(ticket_key)?
             .ok_or_else(|| anyhow::anyhow!("ticket {ticket_key} not found"))?,
     };
-    let slug = ticket.branch_slug();
     // We need a base "repo root" to compute the worktree path. Pull it from
     // the user's linked projects for this ticket; daemon-side we can't rely
     // on the TUI's cwd.
@@ -1697,12 +2292,12 @@ async fn create_pull_request(
             "no linked project for {ticket_key}; link a repo first (P pane in detail)"
         ));
     };
-    // Prefer the per-ticket worktree when it exists; otherwise fall back to
-    // the linked project root and push from whatever branch is checked out
-    // there. Matches the /review-side fallback so a ticket the user never
-    // explicitly `s`-started still produces a PR.
-    let worktree = jui_core::scm::worktree_path_for_slug(&project_path, &slug)
-        .filter(|w| w.exists())
+    // Prefer any registered per-ticket worktree. This handles edited branch
+    // names and older worktree locations; falling back to the linked project
+    // root is only for tickets never started in a worktree.
+    let cfg = GlobalConfig::load().unwrap_or_default();
+    let linked_paths = state.cache.lock().await.linked_paths(ticket_key)?;
+    let worktree = resolve_ticket_work_dir(&cfg, &ticket, &linked_paths)
         .unwrap_or_else(|| project_path.clone());
 
     // 2. Discover repo + branch via gh.
@@ -1780,7 +2375,11 @@ async fn create_pull_request(
     .await?;
     info!(%ticket_key, url = pr.url, number = pr.number, "PR created");
     if let Ok(repo) = github::repo_slug(&worktree).await {
-        let _ = state.cache.lock().await.upsert_ticket_pr(ticket_key, &pr.url, pr.number, &repo);
+        let _ = state
+            .cache
+            .lock()
+            .await
+            .upsert_ticket_pr(ticket_key, &pr.url, pr.number, &repo);
     }
 
     // 5. Request reviewer on GitHub side.
@@ -1794,8 +2393,12 @@ async fn create_pull_request(
     // because Jira ADF collapses single newlines into a space — each
     // logical line needs its own paragraph break to render separately.
     let mut comment = format!("PR: {}\n\n", pr.url);
-    if let Some(h) = &reviewer_gh { comment.push_str(&format!("Reviewer: @{h}\n\n")); }
-    if let Some(h) = &devqa_gh { comment.push_str(&format!("DevQA: @{h}\n\n")); }
+    if let Some(h) = &reviewer_gh {
+        comment.push_str(&format!("Reviewer: @{h}\n\n"));
+    }
+    if let Some(h) = &devqa_gh {
+        comment.push_str(&format!("DevQA: @{h}\n\n"));
+    }
     if !body.trim().is_empty() {
         comment.push_str(body);
     }
@@ -1808,30 +2411,10 @@ async fn create_pull_request(
     //    case-insensitive match on `to_status`, then a substring fallback so
     //    older configs ("code review") still resolve.
     let cfg = GlobalConfig::load().unwrap_or_default();
-    let api = JiraApi::from_jira_cli_config()?;
     let target_status = cfg.workflow.pr_submit_status.trim();
     if !target_status.is_empty() {
-        let transitions = api.list_transitions(ticket_key).await.unwrap_or_default();
-        let target = transitions
-            .iter()
-            .find(|tr| {
-                tr.to_status
-                    .as_deref()
-                    .map(|s| s.eq_ignore_ascii_case(target_status))
-                    .unwrap_or(false)
-            })
-            .or_else(|| {
-                let needle = target_status.to_ascii_lowercase();
-                transitions
-                    .iter()
-                    .find(|tr| tr.name.to_ascii_lowercase().contains(&needle))
-            });
-        if let Some(tr) = target {
-            if let Err(e) = state.jira.transition(ticket_key, &tr.name).await {
-                warn!(%ticket_key, %target_status, "transition failed: {e:#}");
-            }
-        } else {
-            warn!(%ticket_key, %target_status, "no matching transition available");
+        if let Err(e) = transition_toward_status(state, ticket_key, target_status).await {
+            warn!(%ticket_key, %target_status, "transition failed: {e:#}");
         }
     }
 
@@ -1841,6 +2424,7 @@ async fn create_pull_request(
     let devqa_field = cfg.jira.devqa_customfield.trim();
     if !devqa_field.is_empty() {
         if let Some(qid) = devqa_account_id {
+            let api = JiraApi::from_jira_cli_config()?;
             if let Err(e) = api.set_reviewer(ticket_key, qid, devqa_field).await {
                 warn!(%ticket_key, %devqa_field, "set DevQA on Jira failed: {e:#}");
             } else {
@@ -1886,10 +2470,69 @@ async fn create_pull_request(
             },
         )
         .await;
-        refresh_ticket_after_mutation(&s2, &k2).await;
+        let _ = refresh_ticket_after_mutation(&s2, &k2).await;
     });
 
-    Ok(Response::PullRequestCreated { url: pr.url, number: pr.number })
+    Ok(Response::PullRequestCreated {
+        url: pr.url,
+        number: pr.number,
+    })
+}
+
+async fn reset_pull_request(state: &Arc<State>, ticket_key: &str) -> Result<Response> {
+    let (meta, pr_url) = {
+        let cache = state.cache.lock().await;
+        let meta = if let Some(meta) = cache.get_ticket_pr_meta(ticket_key)? {
+            Some(meta)
+        } else {
+            cache
+                .get_pr_comments(ticket_key)?
+                .into_iter()
+                .next()
+                .map(|c| (c.repo, c.pr_number))
+        };
+        let pr_url = cache.get_ticket_pr_url(ticket_key)?;
+        (meta, pr_url)
+    };
+    let Some((repo, pr_number)) = meta else {
+        return Ok(Response::Err {
+            message: format!("no PR on file for {ticket_key}"),
+        });
+    };
+
+    jui_core::github::close_pr(
+        &repo,
+        pr_number,
+        Some("Closed from jui: resetting ticket for a new PR."),
+    )
+    .await?;
+    let pr_url = pr_url.unwrap_or_else(|| format!("https://github.com/{repo}/pull/{pr_number}"));
+    if let Ok(api) = JiraApi::from_jira_cli_config() {
+        if let Ok(me) = api.myself().await {
+            match state.jira.comments(ticket_key).await {
+                Ok(comments) => {
+                    for c in comments {
+                        if c.account_id.as_deref() == Some(me.account_id.as_str())
+                            && c.body.contains(&pr_url)
+                        {
+                            if let Some(id) = c.id.as_deref() {
+                                if let Err(e) = api.delete_comment(ticket_key, id).await {
+                                    warn!(%ticket_key, comment_id = %id, "delete PR Jira comment failed: {e:#}");
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => warn!(%ticket_key, "fetch comments for PR reset failed: {e:#}"),
+            }
+        }
+    }
+    state.cache.lock().await.clear_ticket_pr(ticket_key)?;
+    if let Err(e) = transition_toward_status(state, ticket_key, "In Progress").await {
+        warn!(%ticket_key, "reset PR transition failed: {e:#}");
+    }
+    refresh_ticket_after_mutation(state, ticket_key).await?;
+    Ok(Response::Ok)
 }
 
 /// Walk `git remote` for the clone, return the name of any remote whose URL
@@ -1921,7 +2564,9 @@ async fn ensure_remote_for_repo(
         // Format: "<name>\t<url> (fetch|push)"
         let mut parts = line.split_whitespace();
         if let (Some(name), Some(url)) = (parts.next(), parts.next()) {
-            existing.entry(name.to_string()).or_insert_with(|| url.to_string());
+            existing
+                .entry(name.to_string())
+                .or_insert_with(|| url.to_string());
         }
     }
 
@@ -1944,7 +2589,14 @@ async fn ensure_remote_for_repo(
     };
     if existing.contains_key(&name) {
         let out = std::process::Command::new("git")
-            .args(["-C", clone.to_str().unwrap(), "remote", "set-url", &name, &url])
+            .args([
+                "-C",
+                clone.to_str().unwrap(),
+                "remote",
+                "set-url",
+                &name,
+                &url,
+            ])
             .output()
             .context("git remote set-url")?;
         if !out.status.success() {
@@ -1994,13 +2646,9 @@ async fn setup_devqa_worktree(
 
     // Local branch name + worktree path.
     let local_branch = format!("devqa-pr-{pr_number}");
-    let repo_name = clone
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("repo");
-    let parent = clone.parent().unwrap_or(&clone);
-    let worktrees_root = parent.join(format!("{}-worktrees", repo_name));
+    let worktrees_root = clone.join("worktrees");
     std::fs::create_dir_all(&worktrees_root)?;
+    jui_core::scm::ensure_worktrees_excluded(&clone)?;
     let worktree_path = worktrees_root.join(format!("{ticket_key}-devqa"));
 
     // 1. Find (or add) a remote that points at the PR's upstream repo so we
@@ -2012,18 +2660,27 @@ async fn setup_devqa_worktree(
     //    remote that resolves to `repo` (the PR's upstream slug). When we have
     //    to add one, name it after the PR author's first name so the user can
     //    eyeball whose contribution they're reviewing.
-    let author_login = jui_core::github::pr_author_login(repo, pr_number).await
+    let author_login = jui_core::github::pr_author_login(repo, pr_number)
+        .await
         .unwrap_or_default();
     let desired_name = if author_login.is_empty() {
         "contributor".to_string()
     } else {
-        jui_core::github::user_first_name_remote_safe(&author_login).await
+        jui_core::github::user_first_name_remote_safe(&author_login)
+            .await
             .unwrap_or_else(|_| author_login.clone())
     };
     let remote = ensure_remote_for_repo(&clone, repo, &desired_name).await?;
     let refspec = format!("pull/{pr_number}/head:{local_branch}");
     let out = std::process::Command::new("git")
-        .args(["-C", clone.to_str().unwrap(), "fetch", "--force", &remote, &refspec])
+        .args([
+            "-C",
+            clone.to_str().unwrap(),
+            "fetch",
+            "--force",
+            &remote,
+            &refspec,
+        ])
         .output()
         .context("git fetch pull/<n>/head")?;
     if !out.status.success() {
@@ -2040,8 +2697,10 @@ async fn setup_devqa_worktree(
         if !worktree_path.exists() {
             let out = std::process::Command::new("git")
                 .args([
-                    "-C", clone.to_str().unwrap(),
-                    "worktree", "add",
+                    "-C",
+                    clone.to_str().unwrap(),
+                    "worktree",
+                    "add",
                     worktree_path.to_str().unwrap(),
                     &local_branch,
                 ])
@@ -2089,23 +2748,25 @@ async fn setup_devqa_worktree(
 }
 
 /// Find an existing DevQA worktree for `ticket_key` by checking each configured
-/// clone's deterministic `<repo>-worktrees/<ticket_key>-devqa` path. Returns the
+/// clone's deterministic `<repo>/worktrees/<ticket_key>-devqa` path. Returns the
 /// worktree path + its current branch. Independent of any cached PR, so it works
 /// even after the daemon has forgotten the ticket↔PR link.
-fn find_existing_devqa_worktree(state: &Arc<State>, ticket_key: &str) -> Option<(std::path::PathBuf, String)> {
+fn find_existing_devqa_worktree(
+    state: &Arc<State>,
+    ticket_key: &str,
+) -> Option<(std::path::PathBuf, String)> {
     for p in &state.config.projects {
         let clone = &p.path;
-        let repo_name = clone.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        if repo_name.is_empty() {
-            continue;
-        }
-        let parent = clone.parent().unwrap_or(clone);
-        let wt = parent
-            .join(format!("{repo_name}-worktrees"))
-            .join(format!("{ticket_key}-devqa"));
+        let wt = clone.join("worktrees").join(format!("{ticket_key}-devqa"));
         if wt.exists() {
             let branch = std::process::Command::new("git")
-                .args(["-C", wt.to_str().unwrap(), "rev-parse", "--abbrev-ref", "HEAD"])
+                .args([
+                    "-C",
+                    wt.to_str().unwrap(),
+                    "rev-parse",
+                    "--abbrev-ref",
+                    "HEAD",
+                ])
                 .output()
                 .ok()
                 .filter(|o| o.status.success())
@@ -2139,11 +2800,7 @@ fn cleanup_devqa_worktree(
         .collect();
     let clone = jui_core::scm::find_clone_for_gh_repo(repo, &candidates)
         .ok_or_else(|| anyhow::anyhow!("no local clone matches {repo}"))?;
-    let repo_name = clone.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
-    let parent = clone.parent().unwrap_or(&clone);
-    let worktree_path = parent
-        .join(format!("{}-worktrees", repo_name))
-        .join(format!("{ticket_key}-devqa"));
+    let worktree_path = clone.join("worktrees").join(format!("{ticket_key}-devqa"));
 
     if !worktree_path.exists() {
         return Ok((false, false, "no DevQA worktree to remove".to_string()));
@@ -2154,8 +2811,12 @@ fn cleanup_devqa_worktree(
     // created by WORKTREE_SETUP.md don't read as "uncommitted work".
     let status = std::process::Command::new("git")
         .args([
-            "-C", worktree_path.to_str().unwrap(),
-            "status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all",
+            "-C",
+            worktree_path.to_str().unwrap(),
+            "status",
+            "--porcelain",
+            "--untracked-files=no",
+            "--ignore-submodules=all",
         ])
         .output()
         .context("git status (dirty check)")?;
@@ -2171,8 +2832,11 @@ fn cleanup_devqa_worktree(
 
     let out = std::process::Command::new("git")
         .args([
-            "-C", clone.to_str().unwrap(),
-            "worktree", "remove", "--force",
+            "-C",
+            clone.to_str().unwrap(),
+            "worktree",
+            "remove",
+            "--force",
             worktree_path.to_str().unwrap(),
         ])
         .output()
@@ -2193,7 +2857,11 @@ fn cleanup_devqa_worktree(
         .output();
 
     info!(%ticket_key, %repo, path = %worktree_path.display(), "DevQA worktree removed");
-    Ok((true, dirty, format!("removed worktree {}", worktree_path.display())))
+    Ok((
+        true,
+        dirty,
+        format!("removed worktree {}", worktree_path.display()),
+    ))
 }
 
 /// Pull GitHub PRs the current user has been requested to review (or
@@ -2204,6 +2872,29 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
     use jui_core::github;
     let mut prs = github::search_review_requested().await.unwrap_or_default();
     prs.extend(github::notifications().await.unwrap_or_default());
+    if let Ok(my_login) = github::whoami().await {
+        let devqa_candidates = github::search_mentions_handle(&my_login)
+            .await
+            .unwrap_or_default();
+        for pr in devqa_candidates {
+            let body = match github::pr_body(&pr.repo, pr.number).await {
+                Ok(body) => body,
+                Err(e) => {
+                    warn!(repo = %pr.repo, number = pr.number, "DevQA PR body fetch failed: {e:#}");
+                    continue;
+                }
+            };
+            let Some(handle) = parse_devqa_handle(&body) else {
+                continue;
+            };
+            if handle.eq_ignore_ascii_case(&my_login) {
+                info!(repo = %pr.repo, number = pr.number, handle = %my_login, "DevQA PR mention matched current user");
+                prs.push(pr);
+            } else {
+                info!(repo = %pr.repo, number = pr.number, %handle, current = %my_login, "DevQA PR mention for different user");
+            }
+        }
+    }
     // Dedupe by URL.
     let mut seen = std::collections::HashSet::new();
     prs.retain(|p| seen.insert(p.url.clone()));
@@ -2212,7 +2903,12 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
     // boards that don't use plain "Closed"/"Done" still get filtered.
     let extra_excluded = GlobalConfig::load()
         .ok()
-        .map(|c| c.workflow.all_mine_exclude_status.trim().to_ascii_lowercase())
+        .map(|c| {
+            c.workflow
+                .all_mine_exclude_status
+                .trim()
+                .to_ascii_lowercase()
+        })
         .filter(|s| !s.is_empty());
 
     let mut keys: Vec<String> = Vec::new();
@@ -2223,7 +2919,9 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
         let Some(key) = jui_core::scm::extract_ticket_key(&pr.head_branch) else {
             continue;
         };
-        if keys.contains(&key) { continue; }
+        if keys.contains(&key) {
+            continue;
+        }
         // Pull (or fetch) the ticket and skip closed-state tickets.
         let ticket = match state.cache.lock().await.get_ticket(&key)? {
             Some(t) => Some(t),
@@ -2233,9 +2931,19 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
         let status_lc = t.status.to_ascii_lowercase();
         let closed = matches!(
             status_lc.as_str(),
-            "done" | "resolved" | "closed" | "archive" | "archived" | "won't do" | "wont do" | "cancelled" | "canceled"
+            "done"
+                | "resolved"
+                | "closed"
+                | "archive"
+                | "archived"
+                | "won't do"
+                | "wont do"
+                | "cancelled"
+                | "canceled"
         ) || extra_excluded.as_deref() == Some(status_lc.as_str());
-        if closed { continue; }
+        if closed {
+            continue;
+        }
         // Cache the freshly-viewed ticket if we just fetched it.
         if state.cache.lock().await.get_ticket(&key)?.is_none() {
             tickets_to_cache.push(t);
@@ -2372,22 +3080,30 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
         }
         merged.sort_by(|a, b| a.created.cmp(&b.created));
         total_comments += merged.len();
-        let _ = state.cache.lock().await.upsert_pr_comments(
-            ticket_key,
-            &pr.url,
-            pr.number,
-            &pr.repo,
-            &merged,
-        );
+        let _ = state
+            .cache
+            .lock()
+            .await
+            .upsert_pr_comments(ticket_key, &pr.url, pr.number, &pr.repo, &merged);
 
         if let Some(login) = &my_login {
             if let Ok(Some(state_str)) =
                 jui_core::github::my_latest_review_state(&pr.repo, pr.number, login).await
             {
                 if state_str.eq_ignore_ascii_case("APPROVED") {
-                    let current = state.cache.lock().await.get_pr_state(ticket_key).ok().flatten();
+                    let current = state
+                        .cache
+                        .lock()
+                        .await
+                        .get_pr_state(ticket_key)
+                        .ok()
+                        .flatten();
                     if current.as_deref() != Some("completed") {
-                        let _ = state.cache.lock().await.set_pr_state(ticket_key, "completed");
+                        let _ = state
+                            .cache
+                            .lock()
+                            .await
+                            .set_pr_state(ticket_key, "completed");
                         auto_completed += 1;
                         // Mark the ticket with a "DevQA complete" comment on
                         // both Jira and the PR. Only fires on the transition
@@ -2399,9 +3115,10 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
                         } else {
                             refresh_comments(state, ticket_key).await;
                         }
-                        if let Err(e) = jui_core::github::post_pr_comment(
-                            &pr.repo, pr.number, DEVQA_COMMENT,
-                        ).await {
+                        if let Err(e) =
+                            jui_core::github::post_pr_comment(&pr.repo, pr.number, DEVQA_COMMENT)
+                                .await
+                        {
                             warn!(repo = %pr.repo, number = pr.number,
                                   "auto DevQA-complete pr comment failed: {e:#}");
                         }
@@ -2501,20 +3218,25 @@ async fn poll_once(state: &State) -> Result<()> {
         let _ = state.suggest_tx.send(t.key.clone()).await;
     }
     *state.last_poll.write().await = Some(chrono::Utc::now());
-    info!(count = tickets.len(), new = new_assignments.len(), "poll complete");
+    info!(
+        count = tickets.len(),
+        new = new_assignments.len(),
+        "poll complete"
+    );
     Ok(())
 }
 
 fn send_desktop(summary: &str, body: &str) {
-    if let Err(e) = notify_rust::Notification::new().summary(summary).body(body).show() {
+    if let Err(e) = notify_rust::Notification::new()
+        .summary(summary)
+        .body(body)
+        .show()
+    {
         warn!("desktop notification failed: {e}");
     }
 }
 
-async fn implementation_worker(
-    state: Arc<State>,
-    mut rx: tokio::sync::mpsc::Receiver<String>,
-) {
+async fn implementation_worker(state: Arc<State>, mut rx: tokio::sync::mpsc::Receiver<String>) {
     while let Some(ticket_key) = rx.recv().await {
         if let Err(e) = process_implementation(&state, &ticket_key).await {
             warn!(ticket = %ticket_key, "implementation generation failed: {e:#}");
@@ -2543,9 +3265,13 @@ async fn process_implementation(state: &State, ticket_key: &str) -> Result<()> {
                     paths.push(pb);
                 }
             }
-            if paths.len() >= 3 { break; }
+            if paths.len() >= 3 {
+                break;
+            }
         }
-        if paths.len() >= 3 { break; }
+        if paths.len() >= 3 {
+            break;
+        }
     }
     if paths.is_empty() {
         return Ok(());
@@ -2553,15 +3279,16 @@ async fn process_implementation(state: &State, ticket_key: &str) -> Result<()> {
     info!(ticket = %ticket_key, projects = paths.len(), "asking claude for implementation");
     let markdown = jui_core::claude::propose_implementation(&ticket, &paths).await?;
     let project_strs: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-    state.cache.lock().await.set_implementation(ticket_key, &markdown, &project_strs)?;
+    state
+        .cache
+        .lock()
+        .await
+        .set_implementation(ticket_key, &markdown, &project_strs)?;
     info!(ticket = %ticket_key, "implementation saved");
     Ok(())
 }
 
-async fn suggestion_worker(
-    state: Arc<State>,
-    mut rx: tokio::sync::mpsc::Receiver<String>,
-) {
+async fn suggestion_worker(state: Arc<State>, mut rx: tokio::sync::mpsc::Receiver<String>) {
     while let Some(ticket_key) = rx.recv().await {
         if let Err(e) = process_suggestion(&state, &ticket_key).await {
             warn!(ticket = %ticket_key, "suggestion failed: {e:#}");
@@ -2593,7 +3320,11 @@ async fn process_suggestion(state: &State, ticket_key: &str) -> Result<()> {
     if picks.is_empty() {
         // Surfaced in the UI as a "no clear match" entry — user can dismiss it (which
         // promotes it to 'rejected' and silences future surfacing).
-        state.cache.lock().await.record_no_match(ticket_key, "claude")?;
+        state
+            .cache
+            .lock()
+            .await
+            .record_no_match(ticket_key, "claude")?;
         info!(ticket = %ticket_key, "claude found no clear match");
     } else {
         let cache = state.cache.lock().await;
@@ -2621,7 +3352,13 @@ async fn tmux_status_loop(state: Arc<State>) {
     let mut iv = interval(Duration::from_secs(5));
     loop {
         iv.tick().await;
-        let count = state.cache.lock().await.known_keys().map(|v| v.len()).unwrap_or(0);
+        let count = state
+            .cache
+            .lock()
+            .await
+            .known_keys()
+            .map(|v| v.len())
+            .unwrap_or(0);
         let pending = state.pending.lock().await.len();
         let s = if pending > 0 {
             format!("[jui {} | * {}]", count, pending)
@@ -2640,7 +3377,11 @@ fn _unused(_p: PathBuf) {}
 /// daemon restart, selects matching rules, then runs each rule's actions in
 /// sequence. Failures log via `tracing::warn!` and never bubble back to the
 /// caller — the primary mutation already succeeded.
-async fn fire_rules(state: &Arc<State>, fired: jui_core::rules::Trigger, ctx: jui_core::rules::RuleContext) {
+async fn fire_rules(
+    state: &Arc<State>,
+    fired: jui_core::rules::Trigger,
+    ctx: jui_core::rules::RuleContext,
+) {
     let cfg = GlobalConfig::load().unwrap_or_default();
     let matched = jui_core::rules::select(&cfg.rules, &fired, &ctx);
     if matched.is_empty() {
@@ -2678,7 +3419,13 @@ async fn fire_rules(state: &Arc<State>, fired: jui_core::rules::Trigger, ctx: ju
                 conditions_summary: if rule.conditions.is_empty() {
                     None
                 } else {
-                    Some(rule.conditions.iter().map(condition_kind_str).collect::<Vec<_>>().join(", "))
+                    Some(
+                        rule.conditions
+                            .iter()
+                            .map(condition_kind_str)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
                 },
                 status,
                 message,
@@ -2725,7 +3472,10 @@ fn action_kind_str(a: &jui_core::rules::Action) -> String {
     }
 }
 
-fn action_target_str(a: &jui_core::rules::Action, ctx: &jui_core::rules::RuleContext) -> Option<String> {
+fn action_target_str(
+    a: &jui_core::rules::Action,
+    ctx: &jui_core::rules::RuleContext,
+) -> Option<String> {
     use jui_core::rules::Action as A;
     let raw = match a {
         A::JiraTransition { to } => jui_core::rules::render(to, ctx),
@@ -2765,37 +3515,20 @@ async fn run_rule_action(
 ) -> Result<()> {
     use jui_core::rules::{render, Action};
     let Some(ticket_key) = ctx.ticket_key.as_deref() else {
-        return Err(anyhow::anyhow!("rule '{}' has no ticket_key in context", rule.name));
+        return Err(anyhow::anyhow!(
+            "rule '{}' has no ticket_key in context",
+            rule.name
+        ));
     };
     match action {
         Action::JiraTransition { to } => {
             let to_rendered = render(to, ctx);
-            let api = JiraApi::from_jira_cli_config()?;
-            let transitions = api.list_transitions(ticket_key).await.unwrap_or_default();
-            let needle = to_rendered.to_ascii_lowercase();
-            let target = transitions
-                .iter()
-                .find(|tr| {
-                    tr.to_status
-                        .as_deref()
-                        .map(|s| s.eq_ignore_ascii_case(&to_rendered))
-                        .unwrap_or(false)
-                })
-                .or_else(|| {
-                    transitions
-                        .iter()
-                        .find(|tr| tr.name.to_ascii_lowercase().contains(&needle))
-                });
-            match target {
-                Some(tr) => {
-                    state.jira.transition(ticket_key, &tr.name).await?;
-                    info!(rule = %rule.name, %ticket_key, to = %to_rendered, "rule: transitioned");
-                }
-                None => {
-                    return Err(anyhow::anyhow!(
-                        "no transition matching '{to_rendered}' for {ticket_key}"
-                    ));
-                }
+            if transition_toward_status(state, ticket_key, &to_rendered).await? {
+                info!(rule = %rule.name, %ticket_key, to = %to_rendered, "rule: transitioned");
+            } else {
+                return Err(anyhow::anyhow!(
+                    "no transition matching '{to_rendered}' for {ticket_key}"
+                ));
             }
         }
         Action::JiraComment { body } => {
@@ -2900,7 +3633,12 @@ fn pr_diff_against_default(repo: &std::path::Path) -> Result<String> {
 
     let default_via_origin_head = Command::new("git")
         .current_dir(repo)
-        .args(["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"])
+        .args([
+            "symbolic-ref",
+            "--quiet",
+            "--short",
+            "refs/remotes/origin/HEAD",
+        ])
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -2909,7 +3647,9 @@ fn pr_diff_against_default(repo: &std::path::Path) -> Result<String> {
 
     let candidates: Vec<String> = {
         let mut v = Vec::new();
-        if let Some(s) = default_via_origin_head { v.push(s); }
+        if let Some(s) = default_via_origin_head {
+            v.push(s);
+        }
         v.push("origin/develop".into());
         v.push("origin/main".into());
         v.push("origin/master".into());
@@ -2926,7 +3666,9 @@ fn pr_diff_against_default(repo: &std::path::Path) -> Result<String> {
             .unwrap_or(false)
     });
     let Some(base) = base else {
-        return Err(anyhow::anyhow!("no usable base branch (origin/HEAD, develop, main, master)"));
+        return Err(anyhow::anyhow!(
+            "no usable base branch (origin/HEAD, develop, main, master)"
+        ));
     };
 
     let range = format!("{base}...HEAD");

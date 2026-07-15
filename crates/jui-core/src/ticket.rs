@@ -90,11 +90,21 @@ pub fn fmt_seconds(secs: i64) -> String {
     rem %= HOUR;
     let mins = rem / MIN;
     let mut out = String::new();
-    if days > 0 { out.push_str(&format!("{days}d ")); }
-    if hours > 0 { out.push_str(&format!("{hours}h ")); }
-    if mins > 0 { out.push_str(&format!("{mins}m")); }
+    if days > 0 {
+        out.push_str(&format!("{days}d "));
+    }
+    if hours > 0 {
+        out.push_str(&format!("{hours}h "));
+    }
+    if mins > 0 {
+        out.push_str(&format!("{mins}m"));
+    }
     let s = out.trim().to_string();
-    if s.is_empty() { "0m".to_string() } else { s }
+    if s.is_empty() {
+        "0m".to_string()
+    } else {
+        s
+    }
 }
 
 impl Ticket {
@@ -138,18 +148,7 @@ impl Ticket {
     /// capped at 60 chars.
     pub fn branch_slug(&self) -> String {
         let raw = format!("{}-{}", self.key, self.summary);
-        let mut out = String::with_capacity(raw.len());
-        let mut last_dash = false;
-        for ch in raw.chars() {
-            if ch.is_ascii_alphanumeric() {
-                out.push(ch.to_ascii_lowercase());
-                last_dash = false;
-            } else if !last_dash {
-                out.push('-');
-                last_dash = true;
-            }
-        }
-        let trimmed = out.trim_matches('-').to_string();
+        let trimmed = slugify(&raw);
         if trimmed.len() > 60 {
             let cut = trimmed[..60].trim_end_matches('-').to_string();
             cut
@@ -157,6 +156,35 @@ impl Ticket {
             trimmed
         }
     }
+}
+
+pub fn slugify(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    out.trim_matches('-').to_string()
+}
+
+pub fn normalized_ticket_key(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_lowercase())
+        .collect()
+}
+
+pub fn normalized_ticket_key_upper(key: &str) -> String {
+    key.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(|ch| ch.to_uppercase())
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -205,11 +233,20 @@ pub fn parse_reply<'a>(body: &'a str) -> Option<ParsedReply<'a>> {
         Some((e, r)) => (e, r.trim_start_matches('\n')),
         None => (after, ""),
     };
-    Some(ParsedReply { quoted_author, quoted_excerpt: excerpt, reply_text: reply })
+    Some(ParsedReply {
+        quoted_author,
+        quoted_excerpt: excerpt,
+        reply_text: reply,
+    })
 }
 
 /// Build a reply body with the visible quote marker.
-pub fn build_reply_body(parent_author: &str, parent_date: &str, parent_body: &str, reply: &str) -> String {
+pub fn build_reply_body(
+    parent_author: &str,
+    parent_date: &str,
+    parent_body: &str,
+    reply: &str,
+) -> String {
     let excerpt: String = parent_body
         .split('\n')
         .find(|l| !l.trim().is_empty())
@@ -263,12 +300,18 @@ mod tests {
 
     #[test]
     fn slug_basic() {
-        assert_eq!(t("PROJ-123", "Add login button!").branch_slug(), "proj-123-add-login-button");
+        assert_eq!(
+            t("PROJ-123", "Add login button!").branch_slug(),
+            "proj-123-add-login-button"
+        );
     }
 
     #[test]
     fn slug_collapses_and_trims() {
-        assert_eq!(t("X-1", "  Hello   World  ").branch_slug(), "x-1-hello-world");
+        assert_eq!(
+            t("X-1", "  Hello   World  ").branch_slug(),
+            "x-1-hello-world"
+        );
     }
 
     #[test]
@@ -276,5 +319,11 @@ mod tests {
         let s = t("AB-1", &"a".repeat(200)).branch_slug();
         assert!(s.len() <= 60);
         assert!(!s.ends_with('-'));
+    }
+
+    #[test]
+    fn normalized_ticket_key_removes_punctuation() {
+        assert_eq!(normalized_ticket_key("PROJ-123"), "proj123");
+        assert_eq!(normalized_ticket_key_upper("PROJ-123"), "PROJ123");
     }
 }

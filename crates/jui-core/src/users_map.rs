@@ -24,11 +24,12 @@ fn config_path() -> Result<PathBuf> {
 impl UsersMap {
     pub fn load() -> Result<Self> {
         let path = config_path()?;
-        if !path.exists() { return Ok(Self::default()); }
+        if !path.exists() {
+            return Ok(Self::default());
+        }
         let raw = std::fs::read_to_string(&path)
             .with_context(|| format!("reading {}", path.display()))?;
-        Ok(toml::from_str(&raw)
-            .with_context(|| format!("parsing {}", path.display()))?)
+        Ok(toml::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?)
     }
 
     pub fn save(&self) -> Result<()> {
