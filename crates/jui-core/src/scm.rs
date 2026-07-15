@@ -150,6 +150,47 @@ pub fn find_existing_worktree_for_key(
     Ok(None)
 }
 
+/// Find a separate registered git worktree whose checked-out branch exactly
+/// matches `branch`. The main repository checkout is deliberately excluded.
+pub fn find_existing_worktree_for_branch(
+    root: &Path,
+    branch_name: &str,
+) -> Result<Option<(PathBuf, String)>> {
+    let out = Command::new("git")
+        .current_dir(root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .context("running git worktree list")?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+
+    let repo_root = detect(root).root.canonicalize().ok();
+    let mut path: Option<PathBuf> = None;
+    let mut branch: Option<String> = None;
+    for line in String::from_utf8_lossy(&out.stdout).lines().chain([""]) {
+        if line.is_empty() {
+            if let (Some(p), Some(b)) = (path.take(), branch.take()) {
+                let is_main_repo = repo_root
+                    .as_ref()
+                    .and_then(|root| p.canonicalize().ok().map(|canon| canon == *root))
+                    .unwrap_or(false);
+                if !is_main_repo && p.exists() && b == branch_name {
+                    return Ok(Some((p, b)));
+                }
+            }
+            branch = None;
+            continue;
+        }
+        if let Some(raw) = line.strip_prefix("worktree ") {
+            path = Some(PathBuf::from(raw));
+        } else if let Some(raw) = line.strip_prefix("branch ") {
+            branch = Some(raw.strip_prefix("refs/heads/").unwrap_or(raw).to_string());
+        }
+    }
+    Ok(None)
+}
+
 fn worktree_matches_ticket(path: &Path, branch: &str, key: &str, slug: &str) -> bool {
     let key = key.to_ascii_lowercase();
     let normalized_key = crate::ticket::normalized_ticket_key(&key);

@@ -605,6 +605,51 @@ impl Cache {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Ticket keys whose cached PR comments include unresolved inline Copilot
+    /// review threads. Issue comments / review wrappers are intentionally
+    /// ignored because only inline review threads have a GitHub resolved state.
+    pub fn tickets_with_unresolved_copilot_comments(
+        &self,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT DISTINCT ticket_key, author
+               FROM pr_comments
+               WHERE kind = 'review' AND is_resolved = 0"#,
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut out = std::collections::HashSet::new();
+        for row in rows {
+            let (ticket_key, author) = row?;
+            if crate::github::is_copilot_author(&author) {
+                out.insert(ticket_key);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn has_unresolved_copilot_comments(&self, ticket_key: &str) -> Result<bool> {
+        let mut stmt = self.conn.prepare(
+            r#"SELECT author
+               FROM pr_comments
+               WHERE ticket_key = ?1 AND kind = 'review' AND is_resolved = 0"#,
+        )?;
+        let rows = stmt.query_map([ticket_key], |r| r.get::<_, String>(0))?;
+        for author in rows {
+            if crate::github::is_copilot_author(&author?) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn decorate_unresolved_copilot_flags(&self, tickets: &mut [Ticket]) -> Result<()> {
+        let keys = self.tickets_with_unresolved_copilot_comments()?;
+        for t in tickets {
+            t.has_unresolved_copilot_comments = keys.contains(&t.key);
+        }
+        Ok(())
+    }
+
     pub fn clear_ticket_pr(&self, ticket_key: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM ticket_prs WHERE ticket_key = ?1", [ticket_key])?;
@@ -1633,5 +1678,6 @@ fn row_to_ticket(r: &rusqlite::Row) -> rusqlite::Result<Ticket> {
         grandparent_summary: r.get(18)?,
         linked_projects: vec![],
         subtasks: vec![],
+        has_unresolved_copilot_comments: false,
     })
 }

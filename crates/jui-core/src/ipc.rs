@@ -32,6 +32,10 @@ pub enum Request {
     /// comments — and is *not* the assignee. Daemon issues both queries and
     /// returns them tagged so the TUI can render `[R]` vs `[@]` badges.
     ListMyMentions,
+    /// Open, authored GitHub PRs for the current user. The daemon maps branch
+    /// names back to Jira tickets when possible and annotates rows with cached
+    /// unresolved Copilot state + exact-branch git worktree paths.
+    ListMyPullRequests,
     /// Open a GitHub PR for the worktree associated with `ticket_key`.
     /// Reviewer + DevQA are Jira account ids; daemon resolves them to GitHub
     /// handles via the persistent users map. Submits the PR, requests the
@@ -401,6 +405,9 @@ pub enum Response {
         #[serde(default)]
         authored: Vec<String>,
     },
+    PullRequests {
+        items: Vec<PullRequestItem>,
+    },
     /// Reply for `CreatePullRequest`.
     PullRequestCreated {
         url: String,
@@ -542,6 +549,24 @@ pub enum Response {
     Teams {
         items: Vec<TeamEntry>,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PullRequestItem {
+    pub ticket_key: Option<String>,
+    pub title: String,
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
+    pub head_branch: String,
+    #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
+    pub has_unresolved_copilot_comments: bool,
+    #[serde(default)]
+    pub worktree_path: Option<PathBuf>,
+    #[serde(default)]
+    pub worktree_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

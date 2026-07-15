@@ -1,6 +1,6 @@
 use crate::app::{
-    App, AssignPurpose, DetailFocus, DetailLinkedProject, MentionRole, Mode, PageLine,
-    PendingDelete, PrUserState, TicketOptionAction, TreeForm, TreeNode,
+    App, AssignPurpose, CopilotFixStatus, DetailFocus, DetailLinkedProject, MentionRole, Mode,
+    PageLine, PendingDelete, PrUserState, TicketOptionAction, TreeForm, TreeNode,
 };
 use jui_core::ticket::{fmt_date, fmt_seconds, parse_reply, priority_rank, Comment};
 use ratatui::layout::Alignment;
@@ -42,6 +42,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Mode::DevQaCleanupConfirm(_) => draw_devqa_cleanup_confirm(f, chunks[1], app),
         Mode::Implementation(_) => draw_implementation(f, chunks[1], app),
         Mode::Projects(_) => draw_projects(f, chunks[1], app),
+        Mode::PullRequests(_) => draw_pull_requests(f, chunks[1], app),
+        Mode::CopilotFixRun(_) => draw_copilot_fix_run(f, chunks[1], app),
         Mode::ProjectsAdd(_) => draw_projects_add(f, chunks[1], app),
         Mode::TicketProjects(_) => draw_ticket_projects(f, chunks[1], app),
         Mode::ConfluenceSpaces(_) => draw_confluence_spaces(f, chunks[1], app),
@@ -108,6 +110,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &App) {
         Mode::DevQaCleanupConfirm(_) => "remove dev qa worktree",
         Mode::Implementation(_) => "implementation",
         Mode::Projects(_) => "projects",
+        Mode::PullRequests(_) => "pull requests",
+        Mode::CopilotFixRun(_) => "copilot fix",
         Mode::ProjectsAdd(_) => "projects/add",
         Mode::TicketProjects(_) => "ticket projects",
         Mode::PageView(form) => {
@@ -257,6 +261,7 @@ fn draw_list_active(f: &mut Frame, area: Rect, app: &App) {
                 format!("{:<width$} ", t.key, width = key_width),
                 Style::default().fg(Color::Yellow),
             ));
+            spans.push(copilot_icon_span(t.has_unresolved_copilot_comments));
             let status_width = 14 + status_grow;
             spans.push(Span::styled(
                 format!(
@@ -379,6 +384,7 @@ fn draw_list_mentioned(f: &mut Frame, area: Rect, app: &App) {
                 format!("{:<12} ", t.key),
                 Style::default().fg(Color::Yellow),
             ));
+            spans.push(copilot_icon_span(t.has_unresolved_copilot_comments));
             // Status column auto-sizes to the longest visible status, capped
             // at 28 chars so workflow names like "Firmware Dev QA In Progress"
             // fit and the priority + summary aren't pushed under it.
@@ -490,6 +496,19 @@ fn role_badge(role: MentionRole) -> (&'static str, Style) {
             "[@]",
             Style::default().fg(blue).add_modifier(Modifier::BOLD),
         ),
+    }
+}
+
+fn copilot_icon_span(active: bool) -> Span<'static> {
+    if active {
+        Span::styled(
+            "🤖 ",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::raw("  ")
     }
 }
 
@@ -3449,6 +3468,203 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
     f.render_stateful_widget(list, inner, &mut state);
 }
 
+fn draw_pull_requests(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::PullRequests(form) = &app.mode else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" unmerged PRs ({}) ", form.items.len()));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if form.loading {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "loading authored open PRs…",
+                Style::default().fg(Color::DarkGray),
+            )),
+            inner,
+        );
+        return;
+    }
+    if let Some(err) = &form.error {
+        f.render_widget(
+            Paragraph::new(format!("err: {err}")).style(Style::default().fg(Color::Red)),
+            inner,
+        );
+        return;
+    }
+    if form.items.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "no authored open PRs found",
+                Style::default().fg(Color::DarkGray),
+            )),
+            inner,
+        );
+        return;
+    }
+
+    let items: Vec<ListItem> = form
+        .items
+        .iter()
+        .map(|pr| {
+            let key = pr.ticket_key.as_deref().unwrap_or("—");
+            let worktree = pr
+                .worktree_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "no worktree".to_string());
+            let worktree_style = if pr.worktree_path.is_some() {
+                Style::default().fg(Color::Green)
+            } else if pr.has_unresolved_copilot_comments {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let mut spans: Vec<Span> = vec![
+                Span::raw(" "),
+                copilot_icon_span(pr.has_unresolved_copilot_comments),
+                Span::styled(
+                    format!("{:<12} ", key),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:<28} ", format!("{}#{}", pr.repo, pr.number)),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("{:<22} ", truncate(&pr.head_branch, 22)),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(format!("{:<36} ", truncate(&worktree, 36)), worktree_style),
+                Span::raw(pr.title.clone()),
+            ];
+            if pr.has_unresolved_copilot_comments && pr.worktree_path.is_some() {
+                spans.push(Span::styled(
+                    "  F:fix",
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(form.selected.min(form.items.len() - 1)));
+    let list = List::new(items)
+        .highlight_style(
+            Style::default()
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        )
+        .highlight_symbol("▶ ");
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
+fn draw_copilot_fix_run(f: &mut Frame, area: Rect, app: &App) {
+    let Mode::CopilotFixRun(form) = &app.mode else {
+        return;
+    };
+    let Some(job) = app.copilot_fix_job.as_ref() else {
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(" copilot fixer ");
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        f.render_widget(
+            Paragraph::new("no Copilot fixer has been started")
+                .style(Style::default().fg(Color::DarkGray)),
+            inner,
+        );
+        return;
+    };
+
+    let status = match &job.status {
+        CopilotFixStatus::Running => format!("running {}", app.spinner_glyph()),
+        CopilotFixStatus::KillRequested => "kill requested".to_string(),
+        CopilotFixStatus::Exited(Some(code)) => format!("exited {code}"),
+        CopilotFixStatus::Exited(None) => "exited by signal".to_string(),
+        CopilotFixStatus::Failed(err) => format!("failed: {err}"),
+    };
+    let status_style = match &job.status {
+        CopilotFixStatus::Running => Style::default().fg(Color::Green),
+        CopilotFixStatus::KillRequested => Style::default().fg(Color::Yellow),
+        CopilotFixStatus::Exited(Some(0)) => Style::default().fg(Color::Green),
+        CopilotFixStatus::Exited(_) | CopilotFixStatus::Failed(_) => {
+            Style::default().fg(Color::Red)
+        }
+    };
+    let block = Block::default().borders(Borders::ALL).title(format!(
+        " copilot fixer {}#{} — {status} ",
+        job.repo, job.number
+    ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let header = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(status, status_style),
+        ]),
+        Line::from(vec![
+            Span::styled("worktree: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(job.worktree_path.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("command: ", Style::default().fg(Color::DarkGray)),
+            Span::raw(job.command.clone()),
+        ]),
+    ]);
+    f.render_widget(header, chunks[0]);
+
+    let height = chunks[1].height.max(1) as usize;
+    let len = job.output.len();
+    let tail_start = len.saturating_sub(height);
+    let max_scroll = tail_start;
+    let scroll = form.scroll_from_bottom.min(max_scroll);
+    let start = tail_start.saturating_sub(scroll);
+    let end = (start + height).min(len);
+    let lines: Vec<Line> = if start < end {
+        job.output[start..end]
+            .iter()
+            .map(|line| Line::from(Span::raw(line.clone())))
+            .collect()
+    } else {
+        vec![Line::from(Span::styled(
+            "waiting for output…",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    };
+    let output = Paragraph::new(lines)
+        .block(Block::default().borders(Borders::ALL).title(" output "))
+        .wrap(Wrap { trim: false });
+    f.render_widget(output, chunks[1]);
+
+    let tail = if scroll == 0 {
+        "following live output".to_string()
+    } else {
+        format!("scrolled {scroll} lines above live tail — End/G to follow")
+    };
+    f.render_widget(
+        Paragraph::new(tail).style(Style::default().fg(Color::DarkGray)),
+        chunks[2],
+    );
+}
+
 fn draw_projects_add(f: &mut Frame, area: Rect, app: &App) {
     let Mode::ProjectsAdd(form) = &app.mode else {
         return;
@@ -4160,6 +4376,19 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("r", "refresh"),
             ("esc", "back"),
         ],
+        Mode::PullRequests(_) => vec![
+            ("j/k", "move"),
+            ("enter", "open ticket"),
+            ("F", "fix Copilot"),
+            ("r", "refresh"),
+            ("esc", "back"),
+        ],
+        Mode::CopilotFixRun(_) => vec![
+            ("K/Ctrl-C", "kill"),
+            ("esc/q/b", "back, keep running"),
+            ("PgUp/PgDn", "scroll"),
+            ("End/G", "follow"),
+        ],
         Mode::ProjectsAdd(_) => vec![
             ("type", "filter"),
             ("j/k", "move"),
@@ -4483,7 +4712,7 @@ fn mode_hints(app: &App) -> Vec<Hint> {
             ("esc", "back"),
         ],
         Mode::Home(_) => vec![
-            ("1-8", "open view"),
+            ("1-9", "open view"),
             ("tab", "menu / feed"),
             ("j/k", "move"),
             ("enter", "open"),

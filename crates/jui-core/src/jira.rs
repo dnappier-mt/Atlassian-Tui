@@ -483,6 +483,7 @@ fn parse_issue(v: &Value) -> Option<Ticket> {
         original_estimate_seconds,
         remaining_estimate_seconds,
         time_spent_seconds,
+        has_unresolved_copilot_comments: false,
     })
 }
 

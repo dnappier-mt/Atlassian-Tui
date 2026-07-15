@@ -48,6 +48,11 @@ pub struct Ticket {
     pub remaining_estimate_seconds: Option<i64>,
     #[serde(default)]
     pub time_spent_seconds: Option<i64>,
+    /// True when the ticket's linked PR has at least one unresolved inline
+    /// Copilot review thread. Populated from daemon cache joins; not persisted
+    /// on the Jira ticket row.
+    #[serde(default)]
+    pub has_unresolved_copilot_comments: bool,
 }
 
 /// Numeric rank for a priority name. Lower = more urgent (sorts first). Unknown
@@ -133,6 +138,7 @@ impl Ticket {
             original_estimate_seconds: None,
             remaining_estimate_seconds: None,
             time_spent_seconds: None,
+            has_unresolved_copilot_comments: false,
         }
     }
 
@@ -295,6 +301,7 @@ mod tests {
             original_estimate_seconds: None,
             remaining_estimate_seconds: None,
             time_spent_seconds: None,
+            has_unresolved_copilot_comments: false,
         }
     }
 

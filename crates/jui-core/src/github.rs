@@ -78,6 +78,25 @@ pub struct PrSummary {
     pub author: Option<String>,
 }
 
+pub fn is_copilot_author(author: &str) -> bool {
+    let login = author
+        .trim()
+        .trim_start_matches('@')
+        .trim_end_matches("[bot]")
+        .trim_end_matches("-bot")
+        .to_ascii_lowercase();
+    matches!(
+        login.as_str(),
+        "copilot-pull-request-reviewer" | "github-copilot" | "copilot"
+    ) || login.contains("copilot-pull-request-reviewer")
+}
+
+pub fn has_unresolved_copilot_comments(items: &[FetchedComment]) -> bool {
+    items
+        .iter()
+        .any(|c| c.kind == "review" && !c.is_resolved && is_copilot_author(&c.author))
+}
+
 /// Result of a successful `gh pr create`.
 #[derive(Debug, Clone)]
 pub struct CreatedPr {

@@ -4,8 +4,8 @@ use jui_core::cache::Cache;
 use jui_core::config::GlobalConfig;
 use jui_core::confluence_api::ConfluenceApi;
 use jui_core::ipc::{
-    read_frame, write_frame, DaemonStatus, NotificationItem, ProjectStatus, Request, Response,
-    StartWorkReply, TicketProjectEntry,
+    read_frame, write_frame, DaemonStatus, NotificationItem, ProjectStatus, PullRequestItem,
+    Request, Response, StartWorkReply, TicketProjectEntry,
 };
 use jui_core::jira::JiraCli;
 use jui_core::jira_api::JiraApi;
@@ -286,6 +286,102 @@ fn resolve_ticket_work_dir(
         .or_else(|| linked_paths.first().cloned())
 }
 
+fn decorate_unresolved_copilot(cache: &Cache, tickets: &mut [Ticket]) {
+    if let Err(e) = cache.decorate_unresolved_copilot_flags(tickets) {
+        warn!("copilot flag decoration failed: {e:#}");
+    }
+}
+
+async fn fetch_pr_comment_surfaces(
+    repo: &str,
+    number: u64,
+) -> Vec<jui_core::github::FetchedComment> {
+    let mut merged: Vec<jui_core::github::FetchedComment> = Vec::new();
+    match jui_core::github::pr_comments(repo, number).await {
+        Ok(items) => merged.extend(items),
+        Err(e) => warn!(repo = %repo, number, "issue comments fetch: {e:#}"),
+    }
+    match jui_core::github::pr_review_comments(repo, number).await {
+        Ok(items) => merged.extend(items),
+        Err(e) => warn!(repo = %repo, number, "review comments fetch: {e:#}"),
+    }
+    match jui_core::github::pr_reviews(repo, number).await {
+        Ok(items) => merged.extend(items),
+        Err(e) => warn!(repo = %repo, number, "reviews fetch: {e:#}"),
+    }
+    if let Ok(map) = jui_core::github::review_thread_resolution_map(repo, number).await {
+        for c in merged.iter_mut() {
+            if c.kind == "review" {
+                if let Some(&resolved) = map.get(&c.id) {
+                    c.is_resolved = resolved;
+                }
+            }
+        }
+    }
+    merged.sort_by(|a, b| a.created.cmp(&b.created));
+    merged
+}
+
+async fn cache_pr_comments_for_pr(
+    state: &State,
+    ticket_key: &str,
+    pr_url: &str,
+    repo: &str,
+    number: u64,
+) -> usize {
+    let merged = fetch_pr_comment_surfaces(repo, number).await;
+    let count = merged.len();
+    if let Err(e) = state
+        .cache
+        .lock()
+        .await
+        .upsert_pr_comments(ticket_key, pr_url, number, repo, &merged)
+    {
+        warn!(%ticket_key, repo = %repo, number, "pr comments upsert: {e:#}");
+    }
+    count
+}
+
+async fn find_exact_branch_worktree(
+    cfg: &GlobalConfig,
+    repo_slug: &str,
+    branch: &str,
+) -> Option<(PathBuf, String)> {
+    let mut seen = HashSet::new();
+    for project in &cfg.projects {
+        let detected = scm::detect(&project.path);
+        if !matches!(detected.kind, scm::ScmKind::Git) {
+            continue;
+        }
+        let root_key = detected.root.display().to_string();
+        if !seen.insert(root_key) {
+            continue;
+        }
+        let remotes = match jui_core::github::list_remotes(&detected.root).await {
+            Ok(remotes) => remotes,
+            Err(e) => {
+                warn!(path = %detected.root.display(), "remote list failed during PR worktree scan: {e:#}");
+                continue;
+            }
+        };
+        let matches_repo = remotes
+            .iter()
+            .filter_map(|(_, url)| scm::parse_github_slug(url))
+            .any(|slug| slug.eq_ignore_ascii_case(repo_slug));
+        if !matches_repo {
+            continue;
+        }
+        match scm::find_existing_worktree_for_branch(&detected.root, branch) {
+            Ok(Some(found)) => return Some(found),
+            Ok(None) => {}
+            Err(e) => {
+                warn!(path = %detected.root.display(), %branch, "worktree branch scan failed: {e:#}")
+            }
+        }
+    }
+    None
+}
+
 async fn get_ticket_for_key(state: &State, key: &str) -> Result<Ticket> {
     match state.jira.view(key).await {
         Ok(t) => Ok(t),
@@ -369,11 +465,15 @@ async fn handle_client(
     shutdown: tokio::sync::mpsc::Sender<()>,
 ) -> Result<()> {
     let raw = read_frame(&mut stream).await?;
-    let req: Request = serde_json::from_slice(&raw)?;
-    let resp = match dispatch(req, state.clone(), &shutdown).await {
-        Ok(r) => r,
+    let resp = match serde_json::from_slice::<Request>(&raw) {
+        Ok(req) => match dispatch(req, state.clone(), &shutdown).await {
+            Ok(r) => r,
+            Err(e) => Response::Err {
+                message: format!("{e:#}"),
+            },
+        },
         Err(e) => Response::Err {
-            message: format!("{e:#}"),
+            message: format!("invalid request: {e:#}"),
         },
     };
     let body = serde_json::to_vec(&resp)?;
@@ -417,36 +517,39 @@ async fn dispatch(
             };
             // Decorate with confirmed local-project links for sort/display.
             let keys: Vec<String> = tickets.iter().map(|t| t.key.clone()).collect();
-            let map = state
-                .cache
-                .lock()
-                .await
-                .confirmed_projects_for_tickets(&keys)?;
+            let cache = state.cache.lock().await;
+            let map = cache.confirmed_projects_for_tickets(&keys)?;
             for t in &mut tickets {
                 if let Some(paths) = map.get(&t.key) {
                     t.linked_projects = paths.clone();
                 }
             }
+            decorate_unresolved_copilot(&cache, &mut tickets);
             Ok(Response::Tickets { items: tickets })
         }
 
         Request::GetTicketsWithAncestors { keys } => {
             let cache = state.cache.lock().await;
-            let items = cache.tickets_with_ancestors(&keys)?;
+            let mut items = cache.tickets_with_ancestors(&keys)?;
+            decorate_unresolved_copilot(&cache, &mut items);
             Ok(Response::Tickets { items })
         }
 
         Request::GetTicket { key } => match state.jira.view(&key).await {
-            Ok(t) => {
+            Ok(mut t) => {
                 let mut cache = state.cache.lock().await;
                 cache.upsert_tickets(std::slice::from_ref(&t)).ok();
+                decorate_unresolved_copilot(&cache, std::slice::from_mut(&mut t));
                 Ok(Response::Ticket { ticket: t })
             }
             Err(e) => {
                 warn!(%key, "live ticket fetch failed, returning cache: {e:#}");
                 let cache = state.cache.lock().await;
                 match cache.get_ticket(&key)? {
-                    Some(t) => Ok(Response::Ticket { ticket: t }),
+                    Some(mut t) => {
+                        decorate_unresolved_copilot(&cache, std::slice::from_mut(&mut t));
+                        Ok(Response::Ticket { ticket: t })
+                    }
                     None => Ok(Response::Err {
                         message: format!("no such ticket {key}"),
                     }),
@@ -651,14 +754,18 @@ async fn dispatch(
             // GitHub side is refreshed by `refresh_github_mentions` on the same
             // cadence. Async refresh kicks off if any role is older than 5 min.
             const STALE: i64 = 300;
-            let (reviewing, mentioned, github, authored) = {
+            let (mut reviewing, mut mentioned, mut github, authored) = {
                 let cache = state.cache.lock().await;
-                (
+                let mut data = (
                     cache.get_mentions("reviewer")?,
                     cache.get_mentions("mentioned")?,
                     cache.get_mentions("github")?,
                     cache.get_mention_keys("authored")?,
-                )
+                );
+                decorate_unresolved_copilot(&cache, &mut data.0);
+                decorate_unresolved_copilot(&cache, &mut data.1);
+                decorate_unresolved_copilot(&cache, &mut data.2);
+                data
             };
             let age_r = state.cache.lock().await.mentions_age_secs("reviewer")?;
             let age_m = state.cache.lock().await.mentions_age_secs("mentioned")?;
@@ -672,10 +779,16 @@ async fn dispatch(
                 refresh_my_mentions(&state).await;
                 let _ = refresh_github_mentions(&state).await;
                 let cache = state.cache.lock().await;
+                reviewing = cache.get_mentions("reviewer")?;
+                mentioned = cache.get_mentions("mentioned")?;
+                github = cache.get_mentions("github")?;
+                decorate_unresolved_copilot(&cache, &mut reviewing);
+                decorate_unresolved_copilot(&cache, &mut mentioned);
+                decorate_unresolved_copilot(&cache, &mut github);
                 return Ok(Response::MyMentions {
-                    reviewing: cache.get_mentions("reviewer")?,
-                    mentioned: cache.get_mentions("mentioned")?,
-                    github: cache.get_mentions("github")?,
+                    reviewing,
+                    mentioned,
+                    github,
                     authored: cache.get_mention_keys("authored")?,
                 });
             }
@@ -683,10 +796,16 @@ async fn dispatch(
                 refresh_my_mentions(&state).await;
                 let _ = refresh_github_mentions(&state).await;
                 let cache = state.cache.lock().await;
+                reviewing = cache.get_mentions("reviewer")?;
+                mentioned = cache.get_mentions("mentioned")?;
+                github = cache.get_mentions("github")?;
+                decorate_unresolved_copilot(&cache, &mut reviewing);
+                decorate_unresolved_copilot(&cache, &mut mentioned);
+                decorate_unresolved_copilot(&cache, &mut github);
                 return Ok(Response::MyMentions {
-                    reviewing: cache.get_mentions("reviewer")?,
-                    mentioned: cache.get_mentions("mentioned")?,
-                    github: cache.get_mentions("github")?,
+                    reviewing,
+                    mentioned,
+                    github,
                     authored: cache.get_mention_keys("authored")?,
                 });
             }
@@ -696,6 +815,51 @@ async fn dispatch(
                 github,
                 authored,
             })
+        }
+
+        Request::ListMyPullRequests => {
+            let cfg = GlobalConfig::load().unwrap_or_default();
+            let mut prs = jui_core::github::search_authored_open().await?;
+            let mut seen = std::collections::HashSet::new();
+            prs.retain(|pr| seen.insert(pr.url.clone()));
+            let mut items = Vec::with_capacity(prs.len());
+            for pr in prs {
+                let ticket_key = jui_core::scm::extract_ticket_key(&pr.head_branch);
+                let merged = fetch_pr_comment_surfaces(&pr.repo, pr.number).await;
+                let unresolved = jui_core::github::has_unresolved_copilot_comments(&merged);
+                if let Some(key) = &ticket_key {
+                    {
+                        let mut cache = state.cache.lock().await;
+                        let _ = cache.upsert_ticket_pr(key, &pr.url, pr.number, &pr.repo);
+                    }
+                    if let Err(e) = state
+                        .cache
+                        .lock()
+                        .await
+                        .upsert_pr_comments(key, &pr.url, pr.number, &pr.repo, &merged)
+                    {
+                        warn!(%key, repo = %pr.repo, number = pr.number, "pr comments upsert: {e:#}");
+                    }
+                }
+                let worktree = find_exact_branch_worktree(&cfg, &pr.repo, &pr.head_branch).await;
+                let (worktree_path, worktree_branch) = match worktree {
+                    Some((path, branch)) => (Some(path), Some(branch)),
+                    None => (None, None),
+                };
+                items.push(PullRequestItem {
+                    ticket_key,
+                    title: pr.title,
+                    repo: pr.repo,
+                    number: pr.number,
+                    url: pr.url,
+                    head_branch: pr.head_branch,
+                    author: pr.author,
+                    has_unresolved_copilot_comments: unresolved,
+                    worktree_path,
+                    worktree_branch,
+                });
+            }
+            Ok(Response::PullRequests { items })
         }
 
         Request::SetGithubHandle { account_id, handle } => {
@@ -2119,26 +2283,7 @@ async fn refresh_pr_comments_for_ticket(state: &State, ticket_key: &str) {
         }
     };
     let (repo, number) = meta;
-    let mut merged: Vec<jui_core::github::FetchedComment> = Vec::new();
-    if let Ok(items) = jui_core::github::pr_comments(&repo, number).await {
-        merged.extend(items);
-    }
-    if let Ok(items) = jui_core::github::pr_review_comments(&repo, number).await {
-        merged.extend(items);
-    }
-    if let Ok(items) = jui_core::github::pr_reviews(&repo, number).await {
-        merged.extend(items);
-    }
-    if let Ok(map) = jui_core::github::review_thread_resolution_map(&repo, number).await {
-        for c in merged.iter_mut() {
-            if c.kind == "review" {
-                if let Some(&resolved) = map.get(&c.id) {
-                    c.is_resolved = resolved;
-                }
-            }
-        }
-    }
-    merged.sort_by(|a, b| a.created.cmp(&b.created));
+    let merged = fetch_pr_comment_surfaces(&repo, number).await;
     // We need the pr_url to satisfy upsert_pr_comments — pull it from the
     // ticket_prs row written when the PR was created.
     let pr_url = state
@@ -3049,42 +3194,8 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
     let mut total_comments = 0usize;
     let mut auto_completed = 0usize;
     for (ticket_key, pr) in &pr_for_key {
-        // Fetch all three comment surfaces: top-level issue thread, inline
-        // review comments (where Copilot leaves its line-by-line feedback),
-        // and review summaries. Merge + sort oldest-first so they read as
-        // a single conversation in the pane.
-        let mut merged: Vec<jui_core::github::FetchedComment> = Vec::new();
-        match jui_core::github::pr_comments(&pr.repo, pr.number).await {
-            Ok(items) => merged.extend(items),
-            Err(e) => warn!(repo = %pr.repo, number = pr.number, "issue comments fetch: {e:#}"),
-        }
-        match jui_core::github::pr_review_comments(&pr.repo, pr.number).await {
-            Ok(items) => merged.extend(items),
-            Err(e) => warn!(repo = %pr.repo, number = pr.number, "review comments fetch: {e:#}"),
-        }
-        match jui_core::github::pr_reviews(&pr.repo, pr.number).await {
-            Ok(items) => merged.extend(items),
-            Err(e) => warn!(repo = %pr.repo, number = pr.number, "reviews fetch: {e:#}"),
-        }
-        // GraphQL pass — only the `review` kind comments belong to threads
-        // that can be resolved. Failures are non-fatal: comments still cache,
-        // just always marked unresolved.
-        if let Ok(map) = jui_core::github::review_thread_resolution_map(&pr.repo, pr.number).await {
-            for c in merged.iter_mut() {
-                if c.kind == "review" {
-                    if let Some(&resolved) = map.get(&c.id) {
-                        c.is_resolved = resolved;
-                    }
-                }
-            }
-        }
-        merged.sort_by(|a, b| a.created.cmp(&b.created));
-        total_comments += merged.len();
-        let _ = state
-            .cache
-            .lock()
-            .await
-            .upsert_pr_comments(ticket_key, &pr.url, pr.number, &pr.repo, &merged);
+        total_comments +=
+            cache_pr_comments_for_pr(state, ticket_key, &pr.url, &pr.repo, pr.number).await;
 
         if let Some(login) = &my_login {
             if let Ok(Some(state_str)) =
@@ -3128,6 +3239,18 @@ async fn refresh_github_mentions(state: &State) -> Result<()> {
                 }
             }
         }
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    let incoming_keys: std::collections::HashSet<String> = pr_for_key
+        .iter()
+        .map(|(ticket_key, _)| ticket_key.clone())
+        .collect();
+    for (ticket_key, pr) in &authored_pr_for_key {
+        if incoming_keys.contains(ticket_key) {
+            continue;
+        }
+        total_comments +=
+            cache_pr_comments_for_pr(state, ticket_key, &pr.url, &pr.repo, pr.number).await;
         tokio::time::sleep(std::time::Duration::from_millis(120)).await;
     }
     info!(

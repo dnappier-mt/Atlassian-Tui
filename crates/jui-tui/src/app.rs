@@ -13,7 +13,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::io;
 use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 
 /// Default issue type when creating a child of `parent`. Jira (classic) refuses to
 /// nest sub-tasks under sub-tasks — so when the parent is already a Sub-task, fall
@@ -265,6 +267,8 @@ pub enum Mode {
     DevQaCleanupConfirm(DevQaCleanupForm),
     Implementation(ImplementationForm),
     Projects(ProjectsForm),
+    PullRequests(PullRequestsForm),
+    CopilotFixRun(CopilotFixForm),
     ProjectsAdd(ProjectsAddForm),
     TicketProjects(TicketProjectsForm),
     ConfluenceSpaces(ConfluenceSpacesForm),
@@ -329,6 +333,7 @@ pub enum HomeTarget {
     Tree,
     Kanban,
     Archive,
+    PullRequests,
     Confluence,
     Settings,
     Rules,
@@ -361,26 +366,32 @@ pub const HOME_TARGETS: &[(HomeTarget, &str, &str, &str)] = &[
         "Archive — closed / cancelled tickets",
     ),
     (
-        HomeTarget::Confluence,
+        HomeTarget::PullRequests,
         "5",
+        "U",
+        "Unmerged PRs — authored open PRs",
+    ),
+    (
+        HomeTarget::Confluence,
+        "6",
         "C",
         "Confluence — spaces + pages",
     ),
     (
         HomeTarget::Settings,
-        "6",
+        "7",
         ",",
         "Settings — workflow + defaults",
     ),
     (
         HomeTarget::Rules,
-        "7",
+        "8",
         ":",
         "Rules engine — automations + log",
     ),
     (
         HomeTarget::Projects,
-        "8",
+        "9",
         "P",
         "Projects — manage linked repos",
     ),
@@ -929,6 +940,73 @@ pub struct ProjectsForm {
     pub pending_remove: Option<PathBuf>,
 }
 
+pub struct PullRequestsForm {
+    pub items: Vec<jui_core::ipc::PullRequestItem>,
+    pub selected: usize,
+    pub loading: bool,
+    pub error: Option<String>,
+}
+
+pub struct CopilotFixForm {
+    /// Lines above the live tail. Zero means follow the bottom as output arrives.
+    pub scroll_from_bottom: usize,
+}
+
+#[derive(Clone)]
+pub enum CopilotFixStatus {
+    Running,
+    KillRequested,
+    Exited(Option<i32>),
+    Failed(String),
+}
+
+enum CopilotFixEvent {
+    Line(String),
+}
+
+pub struct CopilotFixJob {
+    pub repo: String,
+    pub number: u64,
+    pub worktree_path: PathBuf,
+    pub command: String,
+    pub output: Vec<String>,
+    pub status: CopilotFixStatus,
+    child: Option<tokio::process::Child>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<CopilotFixEvent>,
+}
+
+impl CopilotFixJob {
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.status,
+            CopilotFixStatus::Running | CopilotFixStatus::KillRequested
+        )
+    }
+}
+
+fn spawn_copilot_output_reader<R>(
+    stream: R,
+    tx: tokio::sync::mpsc::UnboundedSender<CopilotFixEvent>,
+) where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let _ = tx.send(CopilotFixEvent::Line(line));
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    let _ = tx.send(CopilotFixEvent::Line(format!("[output read error: {e}]")));
+                    break;
+                }
+            }
+        }
+    });
+}
+
 pub struct ProjectsAddForm {
     pub query: String,
     pub repos: Vec<RepoEntry>,
@@ -1343,6 +1421,10 @@ pub struct App {
     /// In-flight `improve_pr_body` task. Drained from `main_loop` each tick;
     /// the result populates `PrCreateForm.suggestion`.
     pub pending_pr_body_improve: Option<tokio::sync::oneshot::Receiver<anyhow::Result<String>>>,
+    /// Live/background Copilot PR comment fixer launched from Unmerged PRs.
+    /// The child process keeps running when the user backs out of the output
+    /// screen; the screen can be reopened from the PR pane while it is active.
+    pub copilot_fix_job: Option<CopilotFixJob>,
     /// Frame counter advanced once per draw tick (~200 ms). Drives spinner
     /// animation for long-running tasks like `/review` and the body rewrite.
     pub spinner_tick: usize,
@@ -1466,6 +1548,7 @@ pub enum NavFrame {
     /// represents an in-progress "new rule" — we drop those when popping.
     RuleEdit(String),
     Projects,
+    PullRequests,
     Confluence,
     ActiveStatusConfig,
 }
@@ -1703,6 +1786,7 @@ impl App {
             pending_improve: None,
             pending_pr_review: None,
             pending_pr_body_improve: None,
+            copilot_fix_job: None,
             spinner_tick: 0,
             active_statuses: {
                 let cfg = jui_core::config::GlobalConfig::load().unwrap_or_default();
@@ -5846,6 +5930,7 @@ You are doing a DevQA pass on this pull request. The PR branch is already checke
                 f.original_id.clone().unwrap_or_default(),
             )),
             Mode::Projects(_) => Some(NavFrame::Projects),
+            Mode::PullRequests(_) => Some(NavFrame::PullRequests),
             Mode::ConfluenceSpaces(_) | Mode::ConfluencePages(_) | Mode::PageView(_) => {
                 Some(NavFrame::Confluence)
             }
@@ -5917,6 +6002,7 @@ You are doing a DevQA pass on this pull request. The PR branch is already checke
                 self.open_rules();
             }
             NavFrame::Projects => self.open_projects().await?,
+            NavFrame::PullRequests => self.open_pull_requests().await?,
             NavFrame::Confluence => self.open_confluence_spaces().await?,
             NavFrame::ActiveStatusConfig => self.open_active_status_config(),
         }
@@ -5977,6 +6063,9 @@ You are doing a DevQA pass on this pull request. The PR branch is already checke
             }
             HomeTarget::Archive => {
                 self.mode = Mode::Archive;
+            }
+            HomeTarget::PullRequests => {
+                self.open_pull_requests().await?;
             }
             HomeTarget::Confluence => {
                 self.open_confluence_spaces().await?;
@@ -6241,6 +6330,245 @@ You are doing a DevQA pass on this pull request. The PR branch is already checke
             selected: 0,
             pending_remove: None,
         });
+        Ok(())
+    }
+
+    pub async fn open_pull_requests(&mut self) -> Result<()> {
+        self.mode = Mode::PullRequests(PullRequestsForm {
+            items: Vec::new(),
+            selected: 0,
+            loading: true,
+            error: None,
+        });
+        self.refresh_pull_requests().await
+    }
+
+    pub async fn refresh_pull_requests(&mut self) -> Result<()> {
+        let resp = match ipc::connect().await {
+            Ok(mut s) => ipc::send_request(&mut s, &Request::ListMyPullRequests).await,
+            Err(e) => Err(e),
+        };
+        if let Mode::PullRequests(form) = &mut self.mode {
+            form.loading = false;
+            match resp {
+                Ok(Response::PullRequests { items }) => {
+                    form.items = items;
+                    form.selected = form.selected.min(form.items.len().saturating_sub(1));
+                    self.status = format!("{} open PRs", form.items.len());
+                }
+                Ok(Response::Err { message }) => form.error = Some(message),
+                Ok(_) => form.error = Some("unexpected response".into()),
+                Err(e) => {
+                    let message = format!(
+                        "PR list unavailable: {e:#}. If this started after an update, restart jui-daemon."
+                    );
+                    form.error = Some(message.clone());
+                    self.status = message;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn open_selected_pull_request_ticket(&mut self) -> Result<()> {
+        let key = match &self.mode {
+            Mode::PullRequests(form) => form
+                .items
+                .get(form.selected)
+                .and_then(|pr| pr.ticket_key.clone()),
+            _ => None,
+        };
+        let Some(key) = key else {
+            self.status = "selected PR branch has no Jira ticket key".into();
+            return Ok(());
+        };
+        self.push_current_view();
+        self.detail_origin = DetailOrigin::List;
+        self.detail_focus = DetailFocus::Info;
+        self.open_ticket_by_key(key).await?;
+        self.mode = Mode::Detail;
+        Ok(())
+    }
+
+    pub fn launch_copilot_fix_for_selected_pr_in_app(&mut self) -> Result<()> {
+        if self
+            .copilot_fix_job
+            .as_ref()
+            .map(|job| job.is_running())
+            .unwrap_or(false)
+        {
+            self.push_current_view();
+            self.mode = Mode::CopilotFixRun(CopilotFixForm {
+                scroll_from_bottom: 0,
+            });
+            self.status = "showing running Copilot fixer".into();
+            return Ok(());
+        }
+        let pr = match &self.mode {
+            Mode::PullRequests(form) => form.items.get(form.selected).cloned(),
+            _ => None,
+        };
+        let Some(pr) = pr else { return Ok(()) };
+        if !pr.has_unresolved_copilot_comments {
+            self.status = "selected PR has no unresolved Copilot comments".into();
+            return Ok(());
+        }
+        let Some(worktree) = pr.worktree_path.clone() else {
+            self.status =
+                "unresolved Copilot comments found, but no worktree for this branch".into();
+            return Ok(());
+        };
+        let script = PathBuf::from("/mnt/workspace/tools/opencode_pr_comment_autofix.py");
+        if !script.exists() {
+            self.status = format!("resolve script missing: {}", script.display());
+            return Ok(());
+        }
+
+        let worktree_arg = shell_escape(&worktree.display().to_string());
+        let script_arg = shell_escape(&script.display().to_string());
+        let cmd = format!("python3 -u {script_arg} --worktree {worktree_arg}");
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut child = tokio::process::Command::new("setsid")
+            .arg("script")
+            .arg("-q")
+            .arg("-e")
+            .arg("-f")
+            .arg("-c")
+            .arg(&cmd)
+            .arg("/dev/null")
+            .current_dir(&worktree)
+            .env("PYTHONUNBUFFERED", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+
+        if let Some(stdout) = child.stdout.take() {
+            spawn_copilot_output_reader(stdout, tx.clone());
+        }
+        if let Some(stderr) = child.stderr.take() {
+            spawn_copilot_output_reader(stderr, tx.clone());
+        }
+
+        let mut output = Vec::new();
+        output.push(format!("$ cd {}", worktree.display()));
+        output.push(format!("$ {cmd}"));
+        output.push(String::new());
+        self.copilot_fix_job = Some(CopilotFixJob {
+            repo: pr.repo,
+            number: pr.number,
+            worktree_path: worktree,
+            command: cmd,
+            output,
+            status: CopilotFixStatus::Running,
+            child: Some(child),
+            rx,
+        });
+        self.push_current_view();
+        self.mode = Mode::CopilotFixRun(CopilotFixForm {
+            scroll_from_bottom: 0,
+        });
+        self.status = "Copilot fixer running — K kills, Esc/q/b keeps running in background".into();
+        Ok(())
+    }
+
+    pub fn poll_copilot_fix_job(&mut self) {
+        let Some(job) = self.copilot_fix_job.as_mut() else {
+            return;
+        };
+        let mut saw_output = false;
+        while let Ok(event) = job.rx.try_recv() {
+            match event {
+                CopilotFixEvent::Line(line) => {
+                    job.output.push(line);
+                    saw_output = true;
+                }
+            }
+        }
+        if job.output.len() > 2_000 {
+            let drop = job.output.len() - 2_000;
+            job.output.drain(0..drop);
+        }
+        if !job.is_running() {
+            return;
+        }
+        let Some(child) = job.child.as_mut() else {
+            return;
+        };
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.code();
+                job.status = CopilotFixStatus::Exited(code);
+                job.child = None;
+                job.output.push(String::new());
+                job.output.push(match code {
+                    Some(code) => format!("[copilot fixer exited with status {code}]"),
+                    None => "[copilot fixer exited by signal]".to_string(),
+                });
+                self.status = match code {
+                    Some(0) => format!("Copilot fixer finished for {}#{}", job.repo, job.number),
+                    Some(code) => format!(
+                        "Copilot fixer exited with status {code} for {}#{}",
+                        job.repo, job.number
+                    ),
+                    None => format!("Copilot fixer stopped for {}#{}", job.repo, job.number),
+                };
+            }
+            Ok(None) => {
+                if saw_output && !matches!(self.mode, Mode::CopilotFixRun(_)) {
+                    self.status = format!(
+                        "Copilot fixer still running for {}#{}",
+                        job.repo, job.number
+                    );
+                }
+            }
+            Err(e) => {
+                job.status = CopilotFixStatus::Failed(format!("{e:#}"));
+                job.child = None;
+                job.output.push(format!("[failed to poll child: {e:#}]"));
+                self.status = format!("Copilot fixer poll failed: {e:#}");
+            }
+        }
+    }
+
+    pub fn kill_copilot_fix_job(&mut self) {
+        let Some(job) = self.copilot_fix_job.as_mut() else {
+            self.status = "no Copilot fixer is running".into();
+            return;
+        };
+        if !job.is_running() {
+            self.status = "Copilot fixer is not running".into();
+            return;
+        }
+        let Some(child) = job.child.as_mut() else {
+            self.status = "Copilot fixer child is gone".into();
+            return;
+        };
+        if let Some(pid) = child.id() {
+            let pgid = format!("-{pid}");
+            let _ = std::process::Command::new("kill")
+                .arg("-TERM")
+                .arg(&pgid)
+                .status();
+        }
+        let _ = child.start_kill();
+        job.status = CopilotFixStatus::KillRequested;
+        job.output.push("[kill requested]".into());
+        self.status = "kill requested for Copilot fixer".into();
+    }
+
+    pub async fn background_copilot_fix_job(&mut self) -> Result<()> {
+        let running = self
+            .copilot_fix_job
+            .as_ref()
+            .map(|job| job.is_running())
+            .unwrap_or(false);
+        self.pop_back_or_quit().await?;
+        self.status = if running {
+            "Copilot fixer is still running in the background".into()
+        } else {
+            "Copilot fixer output closed".into()
+        };
         Ok(())
     }
 
@@ -7801,6 +8129,7 @@ async fn main_loop<B: ratatui::backend::Backend>(
         app.poll_pending_improve();
         app.poll_pending_pr_review();
         app.poll_pending_pr_body_improve();
+        app.poll_copilot_fix_job();
         // Animate the spinner once per draw tick.
         app.spinner_tick = app.spinner_tick.wrapping_add(1);
         term.draw(|f| ui::draw(f, app))?;
@@ -8069,8 +8398,10 @@ async fn home_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result<
         // Number-key shortcuts always work regardless of focus — quicker than
         // moving the cursor.
         if let KeyCode::Char(c) = code {
-            for (i, (target, num, _hot, _desc)) in HOME_TARGETS.iter().enumerate() {
-                if c.to_string() == *num {
+            for (i, (target, num, hot, _desc)) in HOME_TARGETS.iter().enumerate() {
+                if c.to_string() == *num
+                    || c.eq_ignore_ascii_case(&hot.chars().next().unwrap_or('\0'))
+                {
                     open_target = Some(*target);
                     form.menu_selected = i;
                     break;
@@ -8177,6 +8508,74 @@ async fn rule_log_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Res
     }
     if do_refresh {
         app.open_rule_log().await?;
+    }
+    Ok(())
+}
+
+async fn pull_requests_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result<()> {
+    let mut refresh = false;
+    if let Mode::PullRequests(form) = &mut app.mode {
+        match code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !form.items.is_empty() {
+                    form.selected = (form.selected + 1).min(form.items.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                form.selected = form.selected.saturating_sub(1);
+            }
+            KeyCode::Char('g') => form.selected = 0,
+            KeyCode::Char('G') => form.selected = form.items.len().saturating_sub(1),
+            KeyCode::PageDown => {
+                form.selected = (form.selected + 10).min(form.items.len().saturating_sub(1));
+            }
+            KeyCode::PageUp => form.selected = form.selected.saturating_sub(10),
+            KeyCode::Char('r') => refresh = true,
+            KeyCode::Enter => app.open_selected_pull_request_ticket().await?,
+            KeyCode::Char('F') | KeyCode::Char('f') => {
+                app.launch_copilot_fix_for_selected_pr_in_app()?
+            }
+            _ => {}
+        }
+    }
+    if refresh {
+        app.refresh_pull_requests().await?;
+    }
+    Ok(())
+}
+
+async fn copilot_fix_keys(app: &mut App, code: KeyCode, _mods: KeyModifiers) -> Result<()> {
+    match code {
+        KeyCode::Char('K') | KeyCode::Char('k') => app.kill_copilot_fix_job(),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => {
+            app.background_copilot_fix_job().await?;
+        }
+        KeyCode::PageUp => {
+            if let Mode::CopilotFixRun(form) = &mut app.mode {
+                form.scroll_from_bottom = form.scroll_from_bottom.saturating_add(10);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Mode::CopilotFixRun(form) = &mut app.mode {
+                form.scroll_from_bottom = form.scroll_from_bottom.saturating_sub(10);
+            }
+        }
+        KeyCode::Home | KeyCode::Char('g') => {
+            if let Mode::CopilotFixRun(form) = &mut app.mode {
+                let lines = app
+                    .copilot_fix_job
+                    .as_ref()
+                    .map(|job| job.output.len())
+                    .unwrap_or(0);
+                form.scroll_from_bottom = lines;
+            }
+        }
+        KeyCode::End | KeyCode::Char('G') => {
+            if let Mode::CopilotFixRun(form) = &mut app.mode {
+                form.scroll_from_bottom = 0;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -9070,6 +9469,10 @@ async fn detail_projects_keys(app: &mut App, code: KeyCode) -> Result<()> {
 
 async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<()> {
     if matches!(code, KeyCode::Char('c')) && mods.contains(KeyModifiers::CONTROL) {
+        if matches!(&app.mode, Mode::CopilotFixRun(_)) {
+            app.kill_copilot_fix_job();
+            return Ok(());
+        }
         app.should_quit = true;
         return Ok(());
     }
@@ -9109,6 +9512,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
         app.show_help = true;
         return Ok(());
     }
+    if matches!(&app.mode, Mode::CopilotFixRun(_)) {
+        return copilot_fix_keys(app, code, mods).await;
+    }
     // Unified Q: every navigable view's `q` walks back through the nav
     // stack; when empty, the app exits. Esc keeps its per-mode semantics
     // (cancels modals, returns to parent of sub-modes, etc.) — only `q`
@@ -9122,6 +9528,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             | Mode::Archive
             | Mode::Kanban
             | Mode::Tree(_)
+            | Mode::PullRequests(_)
             | Mode::Projects(_)
             | Mode::ConfluenceSpaces(_)
             | Mode::Settings(_)
@@ -9152,6 +9559,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                 | Mode::Archive
                 | Mode::Kanban
                 | Mode::Tree(_)
+                | Mode::PullRequests(_)
                 | Mode::Projects(_)
                 | Mode::ConfluenceSpaces(_)
         )
@@ -9173,6 +9581,9 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
     }
     if matches!(&app.mode, Mode::RuleLog(_)) {
         return rule_log_keys(app, code, mods).await;
+    }
+    if matches!(&app.mode, Mode::PullRequests(_)) {
+        return pull_requests_keys(app, code, mods).await;
     }
     if matches!(&app.mode, Mode::Home(_)) {
         return home_keys(app, code, mods).await;
@@ -9751,6 +10162,7 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
                         NavFrame::RuleLog => app.open_rule_log().await?,
                         NavFrame::RuleEdit(_) => app.open_rules(),
                         NavFrame::Projects => app.open_projects().await?,
+                        NavFrame::PullRequests => app.open_pull_requests().await?,
                         NavFrame::Confluence => app.open_confluence_spaces().await?,
                         NavFrame::ActiveStatusConfig => app.open_active_status_config(),
                     }
@@ -11808,9 +12220,14 @@ async fn handle_key(app: &mut App, code: KeyCode, mods: KeyModifiers) -> Result<
             }
             _ => {}
         },
-        // Rules + RuleEdit + RuleLog + Home are routed via their own dispatch
+        // Rules + RuleEdit + RuleLog + PullRequests + CopilotFixRun + Home are routed via their own dispatch
         // (see handle_key top); these arms only exist for match exhaustiveness.
-        Mode::Rules(_) | Mode::RuleEdit(_) | Mode::RuleLog(_) | Mode::Home(_) => {}
+        Mode::Rules(_)
+        | Mode::RuleEdit(_)
+        | Mode::RuleLog(_)
+        | Mode::PullRequests(_)
+        | Mode::CopilotFixRun(_)
+        | Mode::Home(_) => {}
     }
     Ok(())
 }
